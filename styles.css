@@ -582,6 +582,36 @@ body {
   animation: pulse-red 1.2s infinite ease-in-out;
 }
 
+.recorder-filename-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.6rem;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px dashed rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  max-width: 240px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: all 0.2s ease;
+}
+
+.recorder-filename-pill i {
+  color: var(--secondary);
+}
+
+.recorder-filename-pill.active {
+  background: rgba(0, 242, 254, 0.12);
+  border: 1px solid var(--secondary);
+  color: var(--secondary);
+  font-weight: 600;
+  box-shadow: 0 0 10px rgba(0, 242, 254, 0.2);
+}
+
 .recorder-stats {
   display: flex;
   align-items: center;

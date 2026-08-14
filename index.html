@@ -227,12 +227,16 @@
           </div>
         </div>
         <div class="card-body flex-column">
-          <!-- Stream CSV Recorder Panel -->
+          <!-- Stream CSV / Direct File Recorder Panel -->
           <div class="recorder-bar" id="recorderBar">
             <div class="recorder-info">
               <div class="recorder-status-badge stopped" id="recorderBadge">
                 <span class="status-dot"></span>
                 <span id="recorderStatusText">REC IDLE</span>
+              </div>
+              <div class="recorder-filename-pill" id="recorderFilePill" title="Target recording file">
+                <i class="fa-solid fa-file-csv"></i>
+                <span id="recorderFilenameText">No file selected</span>
               </div>
               <div class="recorder-stats">
                 <span class="stat-timer" id="recorderTimer">00:00:00</span>
@@ -241,11 +245,14 @@
               </div>
             </div>
             <div class="recorder-controls">
-              <button id="btnRecordToggle" class="btn btn-sm btn-record">
+              <button id="btnRecordToggle" class="btn btn-sm btn-record" title="Choose file & start streaming incoming UART data directly to disk">
                 <i class="fa-solid fa-circle"></i> Start Recording
               </button>
-              <button id="btnExportCsv" class="btn btn-sm btn-secondary" disabled title="Export Recorded Data to CSV">
-                <i class="fa-solid fa-file-csv"></i> Export CSV
+              <button id="btnSimulateStream" class="btn btn-sm btn-secondary" title="Send simulated UART packets to test live recording">
+                <i class="fa-solid fa-flask"></i> Test Stream
+              </button>
+              <button id="btnExportCsv" class="btn btn-sm btn-secondary" disabled title="Export / Download Recorded Data to CSV">
+                <i class="fa-solid fa-download"></i> Export CSV
               </button>
               <button id="btnClearCsv" class="btn btn-sm btn-icon" title="Clear Recorded CSV Buffer">
                 <i class="fa-solid fa-trash-can"></i>

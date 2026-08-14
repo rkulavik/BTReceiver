@@ -75,13 +75,24 @@ const consoleCard = document.getElementById('consoleCard');
 
 // CSV Stream Recorder Elements
 const btnRecordToggle = document.getElementById('btnRecordToggle');
+const btnSimulateStream = document.getElementById('btnSimulateStream');
 const btnExportCsv = document.getElementById('btnExportCsv');
 const btnClearCsv = document.getElementById('btnClearCsv');
 const recorderBadge = document.getElementById('recorderBadge');
 const recorderStatusText = document.getElementById('recorderStatusText');
+const recorderFilePill = document.getElementById('recorderFilePill');
+const recorderFilenameText = document.getElementById('recorderFilenameText');
 const recorderTimer = document.getElementById('recorderTimer');
 const recorderCount = document.getElementById('recorderCount');
 const recorderSize = document.getElementById('recorderSize');
+
+// Live File System Handle & Stream State
+let fileHandle = null;
+let fileWritableStream = null;
+let activeRecordingFileName = '';
+let isSimulatorRunning = false;
+let simulatorInterval = null;
+let uartByteRingBuffer = new Uint8Array(0);
 
 // Standard & Custom BLE UUIDs
 const ENVIRONMENTAL_SENSING_SERVICE = 0x181a;
@@ -115,6 +126,7 @@ function setupEventListeners() {
 
   // CSV Recorder & Full Width Listeners
   if (btnRecordToggle) btnRecordToggle.addEventListener('click', toggleRecording);
+  if (btnSimulateStream) btnSimulateStream.addEventListener('click', toggleSimulatorStream);
   if (btnExportCsv) btnExportCsv.addEventListener('click', exportCsv);
   if (btnClearCsv) btnClearCsv.addEventListener('click', clearCsvBuffer);
   if (btnToggleFullWidth) btnToggleFullWidth.addEventListener('click', toggleFullWidthStream);
@@ -570,36 +582,58 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     addChartData(timeStr, ax, ay, az);
 
     logToConsole('rx', `[RX TAG] COW-${tagIdNum} | Lat:${lat.toFixed(5)} Lng:${lng.toFixed(5)} | Accel:(${ax}, ${ay}, ${az})g | Mode: ${actStr}`);
+
+    if (isRecording) {
+      writeRecordToFileAndBuffer({
+        timestamp_iso: new Date().toISOString(),
+        timestamp_local: new Date().toLocaleString(),
+        packet_number: packetCounter,
+        source: source,
+        tag_id: `COW-${tagIdNum}`,
+        data_type: 'BINARY_TAG_PACKET',
+        lat: lat.toFixed(6),
+        lng: lng.toFixed(6),
+        accel_x: ax,
+        accel_y: ay,
+        accel_z: az,
+        gyro_x: gx,
+        gyro_y: gy,
+        gyro_z: gz,
+        battery_v: battVolts,
+        activity_mode: actStr,
+        payload_text: '',
+        raw_hex: rawHexStr
+      });
+    }
   } else {
     parsed = { 'Raw Hex': rawHexStr, 'Length': `${dataView.byteLength} Bytes` };
     logToConsole('rx', `[RAW PAYLOAD] ${rawHexStr}`);
+
+    if (isRecording) {
+      writeRecordToFileAndBuffer({
+        timestamp_iso: new Date().toISOString(),
+        timestamp_local: new Date().toLocaleString(),
+        packet_number: packetCounter,
+        source: source,
+        tag_id: cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UNKNOWN',
+        data_type: 'RAW_BINARY',
+        lat: '',
+        lng: '',
+        accel_x: '',
+        accel_y: '',
+        accel_z: '',
+        gyro_x: '',
+        gyro_y: '',
+        gyro_z: '',
+        battery_v: '',
+        activity_mode: 'Raw Bytes',
+        payload_text: '',
+        raw_hex: rawHexStr
+      });
+    }
   }
 
   renderParsedFields(parsed);
-
-  // Store packet to CSV Recorder if recording is active
-  if (isRecording) {
-    const recordItem = {
-      timestamp_iso: new Date().toISOString(),
-      timestamp_local: new Date().toLocaleString(),
-      packet_number: packetCounter,
-      source: source,
-      tag_id: parsed['Ear Tag ID'] || (bleDevice && bleDevice.name ? bleDevice.name : 'COW-8492'),
-      lat: parsed['GPS Lat'] ? parsed['GPS Lat'].replace('°', '') : '',
-      lng: parsed['GPS Lng'] ? parsed['GPS Lng'].replace('°', '') : '',
-      accel_x: parsed['Accel X/Y/Z'] ? parsed['Accel X/Y/Z'].split(',')[0].replace('g', '').trim() : '',
-      accel_y: parsed['Accel X/Y/Z'] ? parsed['Accel X/Y/Z'].split(',')[1].replace('g', '').trim() : '',
-      accel_z: parsed['Accel X/Y/Z'] ? parsed['Accel X/Y/Z'].split(',')[2].replace('g', '').trim() : '',
-      gyro_x: parsed['Gyro X/Y/Z'] ? parsed['Gyro X/Y/Z'].split(',')[0].replace('°', '').trim() : '',
-      gyro_y: parsed['Gyro X/Y/Z'] ? parsed['Gyro X/Y/Z'].split(',')[1].replace('°', '').trim() : '',
-      gyro_z: parsed['Gyro X/Y/Z'] ? parsed['Gyro X/Y/Z'].split(',')[2].replace('°', '').trim() : '',
-      battery_v: parsed['Tag Battery'] ? parsed['Tag Battery'].replace('V', '').trim() : '',
-      activity_mode: parsed['Activity Mode'] || '',
-      raw_hex: rawHexStr
-    };
-    recordedPackets.push(recordItem);
-    updateRecorderStats();
-  }
 }
 
 /* ==========================================================================
@@ -638,7 +672,7 @@ function updateDeviceOverview(name, id, connected) {
   deviceNameEl.textContent = name;
   batteryValueEl.textContent = connected ? '3.88 V' : '-- V';
   rssiValueEl.textContent = connected ? '-58 dBm' : '-- dBm';
-  deviceTypeBadge.textContent = connected ? 'Active BLE Tag' : 'No Tag';
+  deviceTypeBadge.textContent = connected ? 'Active Device' : 'No Tag';
   deviceTypeBadge.className = connected ? 'badge pill-success' : 'badge';
 }
 
@@ -777,6 +811,102 @@ async function disconnectSerialPort() {
 }
 
 /**
+ * Parses ASCII text lines from serial stream to extract GPS, IMU, battery, or status
+ */
+function parseTextTelemetry(line) {
+  const res = {
+    tag_id: '',
+    lat: '',
+    lng: '',
+    accel_x: '',
+    accel_y: '',
+    accel_z: '',
+    gyro_x: '',
+    gyro_y: '',
+    gyro_z: '',
+    battery_v: '',
+    activity_mode: ''
+  };
+
+  if (!line || typeof line !== 'string') return res;
+
+  // 1. Check for NMEA $GPRMC or $GNRMC sentence
+  if (line.startsWith('$GPRMC') || line.startsWith('$GNRMC')) {
+    const parts = line.split(',');
+    if (parts.length >= 7 && parts[2] === 'A') {
+      const rawLat = parseFloat(parts[3]);
+      const latDir = parts[4];
+      const rawLng = parseFloat(parts[5]);
+      const lngDir = parts[6];
+
+      if (!isNaN(rawLat) && !isNaN(rawLng)) {
+        let latDeg = Math.floor(rawLat / 100) + (rawLat % 100) / 60;
+        if (latDir === 'S') latDeg = -latDeg;
+        let lngDeg = Math.floor(rawLng / 100) + (rawLng % 100) / 60;
+        if (lngDir === 'W') lngDeg = -lngDeg;
+
+        res.lat = latDeg.toFixed(6);
+        res.lng = lngDeg.toFixed(6);
+        updateGPSPosition(latDeg, lngDeg, 412, 1.5);
+      }
+    }
+    res.activity_mode = 'NMEA GPS Fix';
+    return res;
+  }
+
+  // 2. Check for Key-Value pairs (e.g., LAT: 31.968, LNG: -99.901, AX: 0.12, AY: -0.04, AZ: 0.98, BATT: 3.82V)
+  const latMatch = line.match(/lat(?:itude)?\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const lngMatch = line.match(/l(?:ng|on|ongitude)?\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const axMatch = line.match(/a(?:x|ccel_?x)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const ayMatch = line.match(/a(?:y|ccel_?y)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const azMatch = line.match(/a(?:z|ccel_?z)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const gxMatch = line.match(/g(?:x|yro_?x)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const gyMatch = line.match(/g(?:y|yro_?y)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const gzMatch = line.match(/g(?:z|yro_?z)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const battMatch = line.match(/bat(?:t|tery)?\s*[:=]\s*([+-]?\d+\.?\d*)/i);
+  const tagMatch = line.match(/tag(?:_?id)?\s*[:=]\s*([A-Za-z0-9_\-]+)/i);
+
+  if (latMatch) res.lat = parseFloat(latMatch[1]).toFixed(6);
+  if (lngMatch) res.lng = parseFloat(lngMatch[1]).toFixed(6);
+  if (axMatch) res.accel_x = parseFloat(axMatch[1]).toFixed(2);
+  if (ayMatch) res.accel_y = parseFloat(ayMatch[1]).toFixed(2);
+  if (azMatch) res.accel_z = parseFloat(azMatch[1]).toFixed(2);
+  if (gxMatch) res.gyro_x = parseFloat(gxMatch[1]).toFixed(1);
+  if (gyMatch) res.gyro_y = parseFloat(gyMatch[1]).toFixed(1);
+  if (gzMatch) res.gyro_z = parseFloat(gzMatch[1]).toFixed(1);
+  if (battMatch) res.battery_v = parseFloat(battMatch[1]).toFixed(2);
+  if (tagMatch) res.tag_id = tagMatch[1];
+
+  // 3. Fallback: Check comma-separated values (e.g., "31.968600, -99.901800, 0.05, -0.02, 0.99, 3.85")
+  if (!latMatch && !axMatch) {
+    const tokens = line.split(/[,\t]+/).map(t => t.trim());
+    if (tokens.length >= 3 && !isNaN(parseFloat(tokens[0])) && !isNaN(parseFloat(tokens[1]))) {
+      if (Math.abs(parseFloat(tokens[0])) <= 90 && Math.abs(parseFloat(tokens[1])) <= 180) {
+        res.lat = parseFloat(tokens[0]).toFixed(6);
+        res.lng = parseFloat(tokens[1]).toFixed(6);
+        if (tokens.length >= 5) {
+          res.accel_x = parseFloat(tokens[2]).toFixed(2);
+          res.accel_y = parseFloat(tokens[3]).toFixed(2);
+          res.accel_z = parseFloat(tokens[4]).toFixed(2);
+        }
+      }
+    }
+  }
+
+  // Update UI if we extracted GPS or IMU
+  if (res.lat && res.lng) {
+    updateGPSPosition(parseFloat(res.lat), parseFloat(res.lng), 412, 1.2);
+  }
+  if (res.accel_x && res.accel_y && res.accel_z) {
+    updateIMUGauges(res.accel_x, res.accel_y, res.accel_z, res.gyro_x || 0, res.gyro_y || 0, res.gyro_z || 0, 'Active UART');
+    const timeStr = new Date().toLocaleTimeString();
+    addChartData(timeStr, res.accel_x, res.accel_y, res.accel_z);
+  }
+
+  return res;
+}
+
+/**
  * Process Raw UART Data from Serial or BLE
  */
 function processRawUartChunk(chunkData, source = 'SERIAL') {
@@ -785,26 +915,27 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
   let textChunk = '';
   let hexBytes = [];
   let dataView = null;
+  let uint8Array = null;
 
   if (typeof chunkData === 'string') {
     textChunk = chunkData;
     const encoder = new TextEncoder();
-    const bytes = encoder.encode(chunkData);
-    for (let i = 0; i < bytes.length; i++) {
-      hexBytes.push(bytes[i].toString(16).padStart(2, '0').toUpperCase());
-    }
-  } else if (chunkData instanceof DataView || chunkData instanceof ArrayBuffer || ArrayBuffer.isView(chunkData)) {
-    if (chunkData instanceof DataView) {
-      dataView = chunkData;
-    } else {
-      dataView = new DataView(chunkData.buffer || chunkData, chunkData.byteOffset || 0, chunkData.byteLength);
-    }
-    const bytes = new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength);
+    uint8Array = encoder.encode(chunkData);
+  } else if (chunkData instanceof DataView) {
+    dataView = chunkData;
+    uint8Array = new Uint8Array(chunkData.buffer, chunkData.byteOffset, chunkData.byteLength);
     const decoder = new TextDecoder('utf-8', { fatal: false });
-    textChunk = decoder.decode(bytes);
+    textChunk = decoder.decode(uint8Array);
+  } else if (chunkData instanceof ArrayBuffer || ArrayBuffer.isView(chunkData)) {
+    uint8Array = new Uint8Array(chunkData.buffer || chunkData, chunkData.byteOffset || 0, chunkData.byteLength);
+    dataView = new DataView(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    textChunk = decoder.decode(uint8Array);
+  }
 
-    for (let i = 0; i < bytes.length; i++) {
-      hexBytes.push(bytes[i].toString(16).padStart(2, '0').toUpperCase());
+  if (uint8Array) {
+    for (let i = 0; i < uint8Array.length; i++) {
+      hexBytes.push(uint8Array[i].toString(16).padStart(2, '0').toUpperCase());
     }
   }
 
@@ -813,24 +944,80 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
 
   if (displayFormat === 'hex') {
     logToConsole('rx', `[RAW HEX ${source}] ${rawHexStr}`);
-  } else {
-    // Text feed line-buffering
+  }
+
+  // 1. Text Line Buffering & Recording
+  if (textChunk) {
     serialLineBuffer += textChunk;
     const lines = serialLineBuffer.split(/\r?\n/);
-    serialLineBuffer = lines.pop(); // keep trailing partial line
+    serialLineBuffer = lines.pop(); // keep partial line for next chunk
 
     for (const line of lines) {
-      if (line.length > 0) {
-        logToConsole('uart-text', `[${source}] ${line}`);
+      const trimmed = line.trim();
+      if (trimmed.length > 0) {
+        if (displayFormat !== 'hex') {
+          logToConsole('uart-text', `[${source}] ${trimmed}`);
+        }
+
+        packetCounter++;
+        packetCountEl.textContent = packetCounter;
+
+        const extracted = parseTextTelemetry(trimmed);
+
+        if (isRecording) {
+          writeRecordToFileAndBuffer({
+            timestamp_iso: new Date().toISOString(),
+            timestamp_local: new Date().toLocaleString(),
+            packet_number: packetCounter,
+            source: source,
+            tag_id: extracted.tag_id || (cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UART-FEED'),
+            data_type: 'UART_TEXT',
+            lat: extracted.lat || '',
+            lng: extracted.lng || '',
+            accel_x: extracted.accel_x || '',
+            accel_y: extracted.accel_y || '',
+            accel_z: extracted.accel_z || '',
+            gyro_x: extracted.gyro_x || '',
+            gyro_y: extracted.gyro_y || '',
+            gyro_z: extracted.gyro_z || '',
+            battery_v: extracted.battery_v || '',
+            activity_mode: extracted.activity_mode || 'UART Serial',
+            payload_text: trimmed,
+            raw_hex: rawHexStr
+          });
+        }
       }
     }
   }
 
-  // If binary DataView is present or header match exists, decode binary payload
-  if (dataView && dataView.byteLength >= 16) {
-    const header = dataView.getUint8(0);
-    if (header === 0xCB) {
-      decodeAndProcessPacket(dataView, source);
+  // 2. Binary Frame Buffer / Packet Detection (0xCB Header)
+  if (uint8Array && uint8Array.length > 0) {
+    // Append to binary frame accumulator
+    const newBuf = new Uint8Array(uartByteRingBuffer.length + uint8Array.length);
+    newBuf.set(uartByteRingBuffer);
+    newBuf.set(uint8Array, uartByteRingBuffer.length);
+    uartByteRingBuffer = newBuf;
+
+    // Search for 0xCB sync header and extract 20-byte packets
+    while (uartByteRingBuffer.length >= 20) {
+      let syncIdx = -1;
+      for (let i = 0; i <= uartByteRingBuffer.length - 20; i++) {
+        if (uartByteRingBuffer[i] === 0xCB) {
+          syncIdx = i;
+          break;
+        }
+      }
+
+      if (syncIdx === -1) {
+        // No 0xCB header in current buffer, keep last 19 bytes in case header spans chunk
+        uartByteRingBuffer = uartByteRingBuffer.slice(Math.max(0, uartByteRingBuffer.length - 19));
+        break;
+      }
+
+      const packetSlice = uartByteRingBuffer.slice(syncIdx, syncIdx + 20);
+      const packetView = new DataView(packetSlice.buffer, packetSlice.byteOffset, packetSlice.byteLength);
+      decodeAndProcessPacket(packetView, source);
+      uartByteRingBuffer = uartByteRingBuffer.slice(syncIdx + 20);
     }
   }
 }
@@ -862,7 +1049,7 @@ function toggleAutoScroll() {
 }
 
 /* ==========================================================================
-   Bluetooth Telemetry Stream CSV Recorder Logic
+   Telemetry Stream & Direct-to-File CSV Recorder
    ========================================================================== */
 function toggleRecording() {
   if (isRecording) {
@@ -872,26 +1059,108 @@ function toggleRecording() {
   }
 }
 
-function startRecording() {
+async function startRecording() {
+  if (isRecording) return;
+
+  const now = new Date();
+  const dateStr = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const defaultFilename = `ranchbot_uart_stream_${dateStr}.csv`;
+
+  // 1. Prompt user to select target file destination on disk
+  try {
+    if ('showSaveFilePicker' in window) {
+      logToConsole('system', 'Select recording file destination...');
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: defaultFilename,
+        types: [
+          {
+            description: 'CSV File (*.csv)',
+            accept: { 'text/csv': ['.csv'] }
+          },
+          {
+            description: 'Log / Text File (*.log, *.txt)',
+            accept: { 'text/plain': ['.log', '.txt'] }
+          }
+        ]
+      });
+
+      activeRecordingFileName = fileHandle.name;
+      fileWritableStream = await fileHandle.createWritable({ keepExistingData: false });
+      
+      // Write CSV headers immediately to file on disk
+      const headers = [
+        'Timestamp (ISO)',
+        'Timestamp (Local)',
+        'Packet #',
+        'Source',
+        'Cow Tag ID',
+        'Data Type',
+        'Latitude (°)',
+        'Longitude (°)',
+        'Accel X (g)',
+        'Accel Y (g)',
+        'Accel Z (g)',
+        'Gyro X (°/s)',
+        'Gyro Y (°/s)',
+        'Gyro Z (°/s)',
+        'Battery (V)',
+        'Activity Mode',
+        'Payload Text / Raw Line',
+        'Raw Hex Payload'
+      ];
+      await fileWritableStream.write(headers.join(',') + '\r\n');
+      logToConsole('system', `[LIVE DISK STREAM] Writing data directly to file: "${activeRecordingFileName}"`);
+    } else {
+      // Fallback for browsers without File System Access API
+      const userChoice = prompt('Enter a filename to record incoming telemetry to:', defaultFilename);
+      if (!userChoice) {
+        logToConsole('warn', 'Recording cancelled (no filename provided).');
+        return;
+      }
+      activeRecordingFileName = userChoice.trim().endsWith('.csv') ? userChoice.trim() : `${userChoice.trim()}.csv`;
+      fileHandle = null;
+      fileWritableStream = null;
+      logToConsole('system', `[BUFFER RECORDING] Recording to memory for "${activeRecordingFileName}" (auto-downloads on Stop).`);
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      logToConsole('warn', 'Recording cancelled by user.');
+      return;
+    }
+    logToConsole('warn', `Direct file access not available: ${err.message}. Using memory buffer.`);
+    const userChoice = prompt('Enter filename to record to:', defaultFilename);
+    if (!userChoice) return;
+    activeRecordingFileName = userChoice.trim();
+    fileHandle = null;
+    fileWritableStream = null;
+  }
+
   isRecording = true;
   recordingStartTime = Date.now();
-  
+
   recorderBadge.className = 'recorder-status-badge recording';
   recorderStatusText.textContent = 'RECORDING...';
+  if (recorderFilePill) {
+    recorderFilePill.classList.add('active');
+    recorderFilenameText.textContent = activeRecordingFileName;
+    recorderFilenameText.title = `Live Recording to: ${activeRecordingFileName}`;
+  }
+
   btnRecordToggle.className = 'btn btn-sm btn-record is-recording';
-  btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Recording';
-  
+  btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop & Save File';
   if (btnExportCsv) btnExportCsv.removeAttribute('disabled');
 
   recordingTimerInterval = setInterval(updateRecorderTimerDisplay, 1000);
   updateRecorderTimerDisplay();
   updateRecorderStats();
 
-  logToConsole('system', 'CSV Stream Recorder STARTED. Logging incoming BT packets...');
+  logToConsole('system', `CSV Stream Recorder ACTIVE. Capturing all incoming UART & BLE data...`);
 }
 
-function stopRecording() {
+async function stopRecording() {
+  if (!isRecording) return;
   isRecording = false;
+
   clearInterval(recordingTimerInterval);
   recordingTimerInterval = null;
 
@@ -900,7 +1169,64 @@ function stopRecording() {
   btnRecordToggle.className = 'btn btn-sm btn-record';
   btnRecordToggle.innerHTML = '<i class="fa-solid fa-circle"></i> Start Recording';
 
-  logToConsole('system', `CSV Stream Recorder STOPPED. Captured ${recordedPackets.length} total records.`);
+  // Flush and close live disk stream if open
+  if (fileWritableStream) {
+    try {
+      await fileWritableStream.close();
+      logToConsole('system', `✓ FILE CLOSED & SAVED: "${activeRecordingFileName}" written to disk (${recordedPackets.length} records).`);
+    } catch (e) {
+      logToConsole('error', `Error closing file stream: ${e.message}`);
+    }
+    fileWritableStream = null;
+  } else if (recordedPackets.length > 0) {
+    // If we used memory fallback, auto-download the file with the chosen name!
+    exportCsvWithFilename(activeRecordingFileName);
+  }
+
+  if (recorderFilePill) {
+    recorderFilePill.classList.remove('active');
+    recorderFilenameText.textContent = `Saved: ${activeRecordingFileName}`;
+  }
+
+  logToConsole('system', `Recording stopped. Total captured records: ${recordedPackets.length}`);
+}
+
+async function writeRecordToFileAndBuffer(recordItem) {
+  if (!isRecording) return;
+
+  recordedPackets.push(recordItem);
+  updateRecorderStats();
+
+  const row = [
+    escapeCsvField(recordItem.timestamp_iso),
+    escapeCsvField(recordItem.timestamp_local),
+    recordItem.packet_number,
+    escapeCsvField(recordItem.source),
+    escapeCsvField(recordItem.tag_id),
+    escapeCsvField(recordItem.data_type || 'TELEMETRY'),
+    recordItem.lat,
+    recordItem.lng,
+    recordItem.accel_x,
+    recordItem.accel_y,
+    recordItem.accel_z,
+    recordItem.gyro_x,
+    recordItem.gyro_y,
+    recordItem.gyro_z,
+    recordItem.battery_v,
+    escapeCsvField(recordItem.activity_mode),
+    escapeCsvField(recordItem.payload_text || ''),
+    escapeCsvField(recordItem.raw_hex || '')
+  ];
+
+  const csvLine = row.join(',') + '\r\n';
+
+  if (fileWritableStream) {
+    try {
+      await fileWritableStream.write(csvLine);
+    } catch (err) {
+      console.error('File stream write error:', err);
+    }
+  }
 }
 
 function updateRecorderTimerDisplay() {
@@ -920,7 +1246,6 @@ function updateRecorderStats() {
   const count = recordedPackets.length;
   recorderCount.textContent = `${count} record${count === 1 ? '' : 's'}`;
   
-  // Approximate CSV file size in KB (~220 bytes per row)
   const estBytes = count * 220;
   const estKb = (estBytes / 1024).toFixed(1);
   recorderSize.textContent = `(~${estKb} KB)`;
@@ -931,8 +1256,13 @@ function updateRecorderStats() {
 }
 
 function exportCsv() {
+  const defaultName = activeRecordingFileName || `ranchbot_uart_stream_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`;
+  exportCsvWithFilename(defaultName);
+}
+
+function exportCsvWithFilename(filename) {
   if (recordedPackets.length === 0) {
-    alert('No recorded Bluetooth telemetry stream data to export. Click "Start Recording" to capture data.');
+    alert('No recorded stream data to export. Click "Start Recording" to capture incoming data.');
     return;
   }
 
@@ -942,6 +1272,7 @@ function exportCsv() {
     'Packet #',
     'Source',
     'Cow Tag ID',
+    'Data Type',
     'Latitude (°)',
     'Longitude (°)',
     'Accel X (g)',
@@ -952,6 +1283,7 @@ function exportCsv() {
     'Gyro Z (°/s)',
     'Battery (V)',
     'Activity Mode',
+    'Payload Text / Raw Line',
     'Raw Hex Payload'
   ];
 
@@ -964,6 +1296,7 @@ function exportCsv() {
       p.packet_number,
       escapeCsvField(p.source),
       escapeCsvField(p.tag_id),
+      escapeCsvField(p.data_type || 'TELEMETRY'),
       p.lat,
       p.lng,
       p.accel_x,
@@ -974,6 +1307,7 @@ function exportCsv() {
       p.gyro_z,
       p.battery_v,
       escapeCsvField(p.activity_mode),
+      escapeCsvField(p.payload_text || ''),
       escapeCsvField(p.raw_hex)
     ];
     csvRows.push(row.join(','));
@@ -983,10 +1317,6 @@ function exportCsv() {
   const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   
-  const now = new Date();
-  const dateStr = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const filename = `ranchbot_bt_stream_${dateStr}.csv`;
-
   const link = document.createElement('a');
   link.setAttribute('href', url);
   link.setAttribute('download', filename);
@@ -1012,8 +1342,62 @@ function clearCsvBuffer() {
   recordingStartTime = null;
   updateRecorderTimerDisplay();
   updateRecorderStats();
+  if (recorderFilePill) {
+    recorderFilenameText.textContent = 'No file selected';
+  }
   if (btnExportCsv) btnExportCsv.setAttribute('disabled', 'true');
-  logToConsole('system', 'Recorded CSV telemetry buffer cleared.');
+  logToConsole('system', 'Recorded telemetry buffer cleared.');
+}
+
+/* ==========================================================================
+   Simulator Stream Generator (For Testing UART / BLE Live Recording)
+   ========================================================================== */
+function toggleSimulatorStream() {
+  isSimulatorRunning = !isSimulatorRunning;
+  if (isSimulatorRunning) {
+    btnSimulateStream.classList.add('btn-primary');
+    btnSimulateStream.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Test';
+    logToConsole('system', '[SIMULATOR] Test UART stream generator STARTED.');
+
+    let simLat = 31.968600;
+    let simLng = -99.901800;
+    let count = 0;
+
+    simulatorInterval = setInterval(() => {
+      count++;
+      simLat += (Math.random() - 0.5) * 0.00015;
+      simLng += (Math.random() - 0.5) * 0.00015;
+      const ax = (Math.sin(count * 0.4) * 0.6).toFixed(2);
+      const ay = (Math.cos(count * 0.3) * 0.4).toFixed(2);
+      const az = (0.98 + (Math.random() - 0.5) * 0.1).toFixed(2);
+      const batt = (3.88 - (count * 0.001)).toFixed(2);
+
+      // Alternate between formatted UART text and binary packets
+      if (count % 2 === 0) {
+        const textMsg = `LAT=${simLat.toFixed(6)}, LNG=${simLng.toFixed(6)}, AX=${ax}, AY=${ay}, AZ=${az}, BATT=${batt}V, TAG=XIAO-COWTAG\n`;
+        processRawUartChunk(textMsg, 'SIM_UART');
+      } else {
+        const buffer = new ArrayBuffer(20);
+        const view = new DataView(buffer);
+        view.setUint8(0, 0xCB);
+        view.setUint16(1, 8492, true);
+        view.setInt32(3, Math.round(simLat * 1e7), true);
+        view.setInt32(7, Math.round(simLng * 1e7), true);
+        view.setInt16(11, Math.round(parseFloat(ax) * 1000), true);
+        view.setInt16(13, Math.round(parseFloat(ay) * 1000), true);
+        view.setInt16(15, Math.round(parseFloat(az) * 1000), true);
+        view.setUint16(17, Math.round(parseFloat(batt) * 1000), true);
+        view.setUint8(19, 1);
+        processRawUartChunk(view, 'SIM_BLE');
+      }
+    }, 1000);
+  } else {
+    clearInterval(simulatorInterval);
+    simulatorInterval = null;
+    btnSimulateStream.classList.remove('btn-primary');
+    btnSimulateStream.innerHTML = '<i class="fa-solid fa-flask"></i> Test Stream';
+    logToConsole('system', '[SIMULATOR] Test stream generator STOPPED.');
+  }
 }
 
 /* ==========================================================================
