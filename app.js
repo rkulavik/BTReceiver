@@ -1,12 +1,13 @@
 // ==========================================================================
 // Ranchbot Cattle Ear Tag BLE & 6-DOF IMU Telemetry Receiver Application
 // High-Performance Engine:
-// 1. Zero-Allocation Float32Array Circular Ring Buffers ($0$ GC Pauses)
-// 2. GPU Hardware Transforms (translate3d/scaleX) with 0 Layout Reflows
-// 3. Virtualized & Capped DOM Terminal Logging (150 Node Max Limit)
-// 4. Dedicated DSP Web Worker for Madgwick AHRS & 64-Point FFT Math
-// 5. Page Visibility Power Caching (Automatic Background Pausing)
-// 6. 1-Click Stationary Tare Calibration & Center-Zero Bi-Directional Gauges
+// 1. Full-Screen Red-Highlighted Stream Diagnostics & Issue Tracker
+// 2. Zero-Hang Full-Screen Transition (Background Front-Screen Suspension)
+// 3. Zero-Allocation Float32Array Circular Ring Buffers ($0$ GC Pauses)
+// 4. GPU Hardware Transforms (translate3d/scaleX) with 0 Layout Reflows
+// 5. Virtualized & Capped DOM Terminal Logging (150 Node Max Limit)
+// 6. Dedicated DSP Web Worker for Madgwick AHRS & 64-Point FFT Math
+// 7. Page Visibility Power Caching (Automatic Background Pausing)
 // ==========================================================================
 
 // Bluetooth & Serial Hardware State
@@ -43,6 +44,12 @@ let recordingStartTime = null;
 let recordingTimerInterval = null;
 let isFullWidth = false;
 let activeRecordingFileName = '';
+
+// Stream Diagnostics & Issue Alert Tracking State
+let streamIssues = [];
+let issueFilterCategory = 'all'; // 'all', 'error', 'warn', 'sensor', 'battery'
+let issueSortOrder = 'desc';     // 'desc' (newest first), 'asc' (oldest first)
+const MAX_STREAM_ISSUES = 250;
 
 // Simulator Stream State
 let isSimulatorRunning = false;
@@ -182,9 +189,7 @@ function initDspWorker() {
     try {
       dspWorker = new Worker('dsp-worker.js');
       dspWorker.onmessage = handleWorkerMessage;
-      dspWorker.onerror = () => {
-        isDspWorkerActive = false;
-      };
+      dspWorker.onerror = () => { isDspWorkerActive = false; };
       isDspWorkerActive = true;
     } catch (e) {
       isDspWorkerActive = false;
@@ -526,6 +531,18 @@ const btnReplayPrev = document.getElementById('btnReplayPrev');
 const btnReplayNext = document.getElementById('btnReplayNext');
 const replaySpeedGroup = document.getElementById('replaySpeedGroup');
 
+// Stream Diagnostics & Issue Alert Elements
+const streamIssuePanel = document.getElementById('streamIssuePanel');
+const issueBadge = document.getElementById('issueBadge');
+const streamIssueCountText = document.getElementById('streamIssueCountText');
+const streamIssueStatusSubtext = document.getElementById('streamIssueStatusSubtext');
+const streamIssueList = document.getElementById('streamIssueList');
+const issueFilterGroup = document.getElementById('issueFilterGroup');
+const issueSortGroup = document.getElementById('issueSortGroup');
+const btnSortIssuesDesc = document.getElementById('btnSortIssuesDesc');
+const btnSortIssuesAsc = document.getElementById('btnSortIssuesAsc');
+const btnClearIssues = document.getElementById('btnClearIssues');
+
 // Terminal, Parsed Grid & Full-Width Elements
 const terminalLog = document.getElementById('terminalLog');
 const fieldsGrid = document.getElementById('fieldsGrid');
@@ -565,6 +582,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setupTareEventListeners();
   setupModelSwitcherListeners();
   setupReplayEventListeners();
+  setupIssueEventListeners();
   setupMobileTabs();
   setupResponsiveHandlers();
   setupPageVisibilityOptimization();
@@ -574,11 +592,11 @@ document.addEventListener('DOMContentLoaded', () => {
   updateDeviceOverview('--', '--', false);
   updateIMUAndOrientation(0.00, 0.00, 1.00, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 'Default Position', 'At Rest');
   
-  logToConsole('system', 'Ranchbot Cow Tag BLE Receiver with High-Performance Engine (Ring Buffers, GPU Transforms, Virtual Log & Web Worker) ACTIVE.');
+  logToConsole('system', 'Ranchbot Cow Tag Receiver: High-Performance Engine, Stream Issue Monitor & Zero-Hang View Switching ACTIVE.');
 });
 
 // ==========================================================================
-// 3. Page Visibility Power Caching
+// Page Visibility Power Caching
 // ==========================================================================
 function setupPageVisibilityOptimization() {
   document.addEventListener('visibilitychange', () => {
@@ -681,7 +699,7 @@ function setupEventListeners() {
       btn.classList.add('active');
       chartFilterMode = btn.dataset.mode || 'all';
       applyChartFilterMode();
-      if (motionChart) motionChart.update();
+      if (motionChart && !isFullWidth) motionChart.update();
     });
   }
 
@@ -694,7 +712,7 @@ function setupEventListeners() {
       const winSec = parseInt(btn.dataset.window, 10) || 60;
       chartTimeWindowMs = winSec * 1000;
       chartNeedsUpdate = true;
-      rebuildChartFromBuffer();
+      if (!isFullWidth) rebuildChartFromBuffer();
     });
   }
 
@@ -706,10 +724,147 @@ function setupEventListeners() {
 }
 
 // ==========================================================================
-// 4. GPU-Accelerated Hardware Transform Helper for Center-Zero Ball Gauges
+// Stream Diagnostics & Issue Detection Engine (Red Highlighted Issues)
+// ==========================================================================
+function setupIssueEventListeners() {
+  if (issueFilterGroup) {
+    issueFilterGroup.addEventListener('click', (e) => {
+      const btn = e.target.closest('.btn');
+      if (!btn) return;
+      issueFilterGroup.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      issueFilterCategory = btn.dataset.filter || 'all';
+      renderStreamIssues();
+    });
+  }
+
+  if (btnSortIssuesDesc) {
+    btnSortIssuesDesc.addEventListener('click', () => {
+      issueSortOrder = 'desc';
+      btnSortIssuesDesc.classList.add('active');
+      if (btnSortIssuesAsc) btnSortIssuesAsc.classList.remove('active');
+      renderStreamIssues();
+    });
+  }
+
+  if (btnSortIssuesAsc) {
+    btnSortIssuesAsc.addEventListener('click', () => {
+      issueSortOrder = 'asc';
+      btnSortIssuesAsc.classList.add('active');
+      if (btnSortIssuesDesc) btnSortIssuesDesc.classList.remove('active');
+      renderStreamIssues();
+    });
+  }
+
+  if (btnClearIssues) {
+    btnClearIssues.addEventListener('click', () => {
+      streamIssues = [];
+      renderStreamIssues();
+      logToConsole('system', 'Stream diagnostic issue log cleared.');
+    });
+  }
+}
+
+function recordStreamIssue(category, severity, description, rawPayload = '') {
+  const issue = {
+    id: Date.now() + Math.random(),
+    timestamp: new Date(),
+    timeStr: new Date().toLocaleTimeString(),
+    category, // 'error', 'warn', 'sensor', 'battery'
+    severity, // 'error', 'warn', 'alert'
+    description,
+    rawPayload: String(rawPayload || '').slice(0, 100)
+  };
+
+  streamIssues.push(issue);
+  if (streamIssues.length > MAX_STREAM_ISSUES) {
+    streamIssues.shift();
+  }
+
+  renderStreamIssues();
+}
+
+function renderStreamIssues() {
+  if (!streamIssueList) return;
+
+  const totalCount = streamIssues.length;
+  const errorCount = streamIssues.filter(i => i.severity === 'error').length;
+  const warnCount = streamIssues.filter(i => i.severity === 'warn' || i.category === 'sensor').length;
+
+  if (streamIssueCountText) {
+    if (totalCount === 0) {
+      streamIssueCountText.textContent = '0 STREAM ISSUES DETECTED';
+    } else {
+      streamIssueCountText.textContent = `${totalCount} STREAM ISSUE${totalCount > 1 ? 'S' : ''} DETECTED (${errorCount} ERR, ${warnCount} WARN)`;
+    }
+  }
+
+  if (issueBadge) {
+    if (totalCount === 0) {
+      issueBadge.className = 'issue-badge-red nominal';
+      issueBadge.innerHTML = '<i class="fa-solid fa-circle-check"></i> <span id="streamIssueCountText">0 STREAM ISSUES DETECTED</span>';
+    } else {
+      issueBadge.className = 'issue-badge-red';
+      issueBadge.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> <span id="streamIssueCountText">${totalCount} STREAM ISSUE${totalCount > 1 ? 'S' : ''} DETECTED</span>`;
+    }
+  }
+
+  if (streamIssuePanel) {
+    streamIssuePanel.classList.toggle('has-errors', errorCount > 0);
+  }
+
+  if (streamIssueStatusSubtext) {
+    if (totalCount === 0) {
+      streamIssueStatusSubtext.textContent = 'Stream nominal • 0 CRC/Frame dropouts';
+      streamIssueStatusSubtext.style.color = '#38ef7d';
+    } else {
+      const latest = streamIssues[streamIssues.length - 1];
+      streamIssueStatusSubtext.textContent = `Latest: [${latest.timeStr}] ${latest.description}`;
+      streamIssueStatusSubtext.style.color = latest.severity === 'error' ? '#ff4d6d' : '#ffb703';
+    }
+  }
+
+  // Apply Category Filter
+  let filtered = streamIssues.filter(i => {
+    if (issueFilterCategory === 'all') return true;
+    return i.category === issueFilterCategory;
+  });
+
+  // Apply Sorting
+  filtered.sort((a, b) => {
+    if (issueSortOrder === 'desc') return b.timestamp - a.timestamp;
+    return a.timestamp - b.timestamp;
+  });
+
+  if (filtered.length === 0) {
+    streamIssueList.innerHTML = `<div class="issue-empty-state"><i class="fa-solid fa-circle-check"></i> ${totalCount === 0 ? 'No stream errors or anomalies detected. Live telemetry healthy.' : 'No issues match the selected filter category.'}</div>`;
+    return;
+  }
+
+  streamIssueList.innerHTML = '';
+  for (const item of filtered) {
+    const el = document.createElement('div');
+    el.className = `issue-item severity-${item.severity}`;
+
+    let tagClass = 'tag-error';
+    if (item.category === 'warn') tagClass = 'tag-warn';
+    else if (item.category === 'sensor') tagClass = 'tag-sensor';
+    else if (item.category === 'battery') tagClass = 'tag-battery';
+
+    el.innerHTML = `
+      <span class="issue-time">${item.timeStr}</span>
+      <span class="issue-tag ${tagClass}">${item.category.toUpperCase()}</span>
+      <span class="issue-desc" title="${escapeHtml(item.description)} ${item.rawPayload ? `| Raw: ${escapeHtml(item.rawPayload)}` : ''}">${escapeHtml(item.description)}</span>
+    `;
+    streamIssueList.appendChild(el);
+  }
+}
+
+// ==========================================================================
+// GPU-Accelerated Hardware Transform Helper for Center-Zero Ball Gauges
 // ==========================================================================
 function updateBiDirectionalAxis(barEl, ballEl, val, maxScale) {
-  if (!barEl) return;
+  if (!barEl || isFullWidth) return;
   const num = parseFloat(val) || 0;
   const clamped = Math.max(-maxScale, Math.min(maxScale, num));
   const ratio = clamped / maxScale;
@@ -1031,7 +1186,7 @@ function start3DAnimationLoop() {
 
   function animate() {
     requestAnimationFrame(animate);
-    if (isPageVisible && is3dInitialized && targetQuaternion) {
+    if (!isFullWidth && isPageVisible && is3dInitialized && targetQuaternion) {
       currentQuaternion.slerp(targetQuaternion, 0.45);
       if (imuBoardGroup) imuBoardGroup.quaternion.copy(currentQuaternion);
       if (cowTagModelGroup) cowTagModelGroup.quaternion.copy(currentQuaternion);
@@ -1051,8 +1206,10 @@ function update3DOrientation(pitchDeg, rollDeg, yawDeg, totalG = 1.0, isFlat = t
   targetEuler.set(-pitchRad, -yawRad, rollRad, 'YXZ');
   targetQuaternion.setFromEuler(targetEuler);
 
+  if (isFullWidth) return;
+
   if (hudPitch) hudPitch.textContent = `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}°`;
-  if (hudRoll) hudRoll.textContent = `${rollDeg >= 0 ? '+' : ''}${rollDeg.toFixed(1)}°`;
+  if (hudRoll) hudRoll.textContent = `${rollDeg >= 0 ? '+' : ''}${rollRoll.toFixed(1)}°`;
   if (hudYaw) hudYaw.textContent = `${yawDeg.toFixed(1)}°`;
   if (hudGravity) hudGravity.textContent = `${totalG.toFixed(2)} g (${isFlat ? 'Z+ Normal' : 'Dynamic'})`;
 
@@ -1126,7 +1283,7 @@ function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawG
   const dt = lastOrientationTimestamp ? Math.min((now - lastOrientationTimestamp) / 1000.0, 0.2) : 0.05;
   lastOrientationTimestamp = now;
 
-  // Process through Web Worker if active, otherwise fallback to main thread
+  // Process through Web Worker if active
   if (isDspWorkerActive && dspWorker) {
     dspWorker.postMessage({
       type: 'PROCESS_IMU',
@@ -1154,6 +1311,11 @@ function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawG
 
   const totalG = Math.sqrt(ax * ax + ay * ay + az * az);
   fftAnalyzer.addSample(totalG - 1.0);
+
+  // Check for Sensor Anomaly / High Impact Shock
+  if (totalG > 2.2) {
+    recordStreamIssue('sensor', 'alert', `High Shock Impact: ${totalG.toFixed(2)}g exceeds ±2.2g threshold`, `AX:${ax.toFixed(2)} AY:${ay.toFixed(2)} AZ:${az.toFixed(2)}`);
+  }
 
   let numPitch, numRoll, numYaw;
 
@@ -1187,102 +1349,104 @@ function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawG
   currentImuState.yaw = numYaw;
   currentImuState.totalG = totalG;
 
-  if (valAccelX) valAccelX.textContent = `${ax >= 0 ? '+' : ''}${ax.toFixed(2)} g`;
-  if (valAccelY) valAccelY.textContent = `${ay >= 0 ? '+' : ''}${ay.toFixed(2)} g`;
-  if (valAccelZ) valAccelZ.textContent = `${az >= 0 ? '+' : ''}${az.toFixed(2)} g`;
+  if (!isFullWidth) {
+    if (valAccelX) valAccelX.textContent = `${ax >= 0 ? '+' : ''}${ax.toFixed(2)} g`;
+    if (valAccelY) valAccelY.textContent = `${ay >= 0 ? '+' : ''}${ay.toFixed(2)} g`;
+    if (valAccelZ) valAccelZ.textContent = `${az >= 0 ? '+' : ''}${az.toFixed(2)} g`;
 
-  updateBiDirectionalAxis(barAccelX, ballAccelX, ax, accelFullScale);
-  updateBiDirectionalAxis(barAccelY, ballAccelY, ay, accelFullScale);
-  updateBiDirectionalAxis(barAccelZ, ballAccelZ, az, accelFullScale);
+    updateBiDirectionalAxis(barAccelX, ballAccelX, ax, accelFullScale);
+    updateBiDirectionalAxis(barAccelY, ballAccelY, ay, accelFullScale);
+    updateBiDirectionalAxis(barAccelZ, ballAccelZ, az, accelFullScale);
 
-  if (valGyroX) valGyroX.textContent = `${gx >= 0 ? '+' : ''}${gx.toFixed(1)} °/s`;
-  if (valGyroY) valGyroY.textContent = `${gy >= 0 ? '+' : ''}${gy.toFixed(1)} °/s`;
-  if (valGyroZ) valGyroZ.textContent = `${gz >= 0 ? '+' : ''}${gz.toFixed(1)} °/s`;
+    if (valGyroX) valGyroX.textContent = `${gx >= 0 ? '+' : ''}${gx.toFixed(1)} °/s`;
+    if (valGyroY) valGyroY.textContent = `${gy >= 0 ? '+' : ''}${gy.toFixed(1)} °/s`;
+    if (valGyroZ) valGyroZ.textContent = `${gz >= 0 ? '+' : ''}${gz.toFixed(1)} °/s`;
 
-  updateBiDirectionalAxis(barGyroX, ballGyroX, gx, gyroFullScale);
-  updateBiDirectionalAxis(barGyroY, ballGyroY, gy, gyroFullScale);
-  updateBiDirectionalAxis(barGyroZ, ballGyroZ, gz, gyroFullScale);
+    updateBiDirectionalAxis(barGyroX, ballGyroX, gx, gyroFullScale);
+    updateBiDirectionalAxis(barGyroY, ballGyroY, gy, gyroFullScale);
+    updateBiDirectionalAxis(barGyroZ, ballGyroZ, gz, gyroFullScale);
 
-  if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
-  if (valRoll) valRoll.textContent = `${numRoll >= 0 ? '+' : ''}${numRoll.toFixed(1)}°`;
-  if (valYaw) valYaw.textContent = `${numYaw.toFixed(1)}° ${getCompassHeading(numYaw)}`;
+    if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
+    if (valRoll) valRoll.textContent = `${numRoll >= 0 ? '+' : ''}${numRoll.toFixed(1)}°`;
+    if (valYaw) valYaw.textContent = `${numYaw.toFixed(1)}° ${getCompassHeading(numYaw)}`;
 
-  if (barPitch) {
-    const pPct = Math.min(50, (Math.abs(numPitch) / 90.0) * 50.0);
-    barPitch.style.width = `${pPct}%`;
-    barPitch.style.marginLeft = numPitch >= 0 ? '50%' : `${50 - pPct}%`;
-  }
-
-  if (barRoll) {
-    const rPct = Math.min(50, (Math.abs(numRoll) / 180.0) * 50.0);
-    barRoll.style.width = `${rPct}%`;
-    barRoll.style.marginLeft = numRoll >= 0 ? '50%' : `${50 - rPct}%`;
-  }
-
-  if (barYaw) {
-    const yPct = Math.min(100, Math.max(0, (numYaw / 360.0) * 100));
-    barYaw.style.width = `${yPct}%`;
-    barYaw.style.marginLeft = '0';
-  }
-
-  if (attitudeModeText) {
-    attitudeModeText.textContent = fusionMode === 'madgwick' ? 'Madgwick 6-DOF Fusion' : (fusionMode === 'complementary' ? 'Complementary Filter' : 'Accel Gravity');
-  }
-
-  const isFlat = Math.abs(numPitch) < 3.0 && Math.abs(numRoll) < 3.0;
-
-  if (attitudePill) {
-    if (isFlat) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(56, 239, 125, 0.4)';
-      attitudePill.style.color = '#38ef7d';
-      attitudePill.textContent = 'Flat (Top Up)';
-    } else if (numPitch > 18) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
-      attitudePill.style.color = '#ffb703';
-      attitudePill.textContent = `Nose Up (+${numPitch.toFixed(0)}°)`;
-    } else if (numPitch < -18) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
-      attitudePill.style.color = '#ffb703';
-      attitudePill.textContent = `Nosedown (${numPitch.toFixed(0)}°)`;
-    } else if (numRoll > 20) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
-      attitudePill.style.color = '#00f2fe';
-      attitudePill.textContent = `Bank Right (+${numRoll.toFixed(0)}°)`;
-    } else if (numRoll < -20) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
-      attitudePill.style.color = '#00f2fe';
-      attitudePill.textContent = `Bank Left (${numRoll.toFixed(0)}°)`;
-    } else {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(245, 158, 11, 0.4)';
-      attitudePill.style.color = '#f59e0b';
-      attitudePill.textContent = `Tilt P:${numPitch.toFixed(0)}° R:${numRoll.toFixed(0)}°`;
+    if (barPitch) {
+      const pPct = Math.min(50, (Math.abs(numPitch) / 90.0) * 50.0);
+      barPitch.style.width = `${pPct}%`;
+      barPitch.style.marginLeft = numPitch >= 0 ? '50%' : `${50 - pPct}%`;
     }
-  }
 
-  if (motionPill) {
-    if (totalG > 1.8) {
-      motionPill.className = 'pill pill-danger';
-      motionPill.textContent = 'RAPID MOTION / ALARM';
-    } else if (totalG > 1.2) {
-      motionPill.className = 'pill pill-warning';
-      motionPill.textContent = 'ACTIVE MOTION';
-    } else {
-      motionPill.className = 'pill pill-info';
-      motionPill.textContent = isFlat ? 'AT REST (DESK)' : 'NORMAL REST';
+    if (barRoll) {
+      const rPct = Math.min(50, (Math.abs(numRoll) / 180.0) * 50.0);
+      barRoll.style.width = `${rPct}%`;
+      barRoll.style.marginLeft = numRoll >= 0 ? '50%' : `${50 - rPct}%`;
     }
-  }
 
-  if (activityStateEl && activityStr && activityStateEl.textContent !== '--') {
-    activityStateEl.textContent = activityStr;
-  }
+    if (barYaw) {
+      const yPct = Math.min(100, Math.max(0, (numYaw / 360.0) * 100));
+      barYaw.style.width = `${yPct}%`;
+      barYaw.style.marginLeft = '0';
+    }
 
-  update3DOrientation(numPitch, numRoll, numYaw, totalG, isFlat);
+    if (attitudeModeText) {
+      attitudeModeText.textContent = fusionMode === 'madgwick' ? 'Madgwick 6-DOF Fusion' : (fusionMode === 'complementary' ? 'Complementary Filter' : 'Accel Gravity');
+    }
+
+    const isFlat = Math.abs(numPitch) < 3.0 && Math.abs(numRoll) < 3.0;
+
+    if (attitudePill) {
+      if (isFlat) {
+        attitudePill.className = 'pill pill-attitude';
+        attitudePill.style.borderColor = 'rgba(56, 239, 125, 0.4)';
+        attitudePill.style.color = '#38ef7d';
+        attitudePill.textContent = 'Flat (Top Up)';
+      } else if (numPitch > 18) {
+        attitudePill.className = 'pill pill-attitude';
+        attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
+        attitudePill.style.color = '#ffb703';
+        attitudePill.textContent = `Nose Up (+${numPitch.toFixed(0)}°)`;
+      } else if (numPitch < -18) {
+        attitudePill.className = 'pill pill-attitude';
+        attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
+        attitudePill.style.color = '#ffb703';
+        attitudePill.textContent = `Nosedown (${numPitch.toFixed(0)}°)`;
+      } else if (numRoll > 20) {
+        attitudePill.className = 'pill pill-attitude';
+        attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+        attitudePill.style.color = '#00f2fe';
+        attitudePill.textContent = `Bank Right (+${numRoll.toFixed(0)}°)`;
+      } else if (numRoll < -20) {
+        attitudePill.className = 'pill pill-attitude';
+        attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+        attitudePill.style.color = '#00f2fe';
+        attitudePill.textContent = `Bank Left (${numRoll.toFixed(0)}°)`;
+      } else {
+        attitudePill.className = 'pill pill-attitude';
+        attitudePill.style.borderColor = 'rgba(245, 158, 11, 0.4)';
+        attitudePill.style.color = '#f59e0b';
+        attitudePill.textContent = `Tilt P:${numPitch.toFixed(0)}° R:${numRoll.toFixed(0)}°`;
+      }
+    }
+
+    if (motionPill) {
+      if (totalG > 1.8) {
+        motionPill.className = 'pill pill-danger';
+        motionPill.textContent = 'RAPID MOTION / ALARM';
+      } else if (totalG > 1.2) {
+        motionPill.className = 'pill pill-warning';
+        motionPill.textContent = 'ACTIVE MOTION';
+      } else {
+        motionPill.className = 'pill pill-info';
+        motionPill.textContent = isFlat ? 'AT REST (DESK)' : 'NORMAL REST';
+      }
+    }
+
+    if (activityStateEl && activityStr && activityStateEl.textContent !== '--') {
+      activityStateEl.textContent = activityStr;
+    }
+
+    update3DOrientation(numPitch, numRoll, numYaw, totalG, isFlat);
+  }
 
   return { pitch: numPitch, roll: numRoll, yaw: numYaw, ax, ay, az, gx, gy, gz, totalG };
 }
@@ -1308,7 +1472,7 @@ function startFftRenderLoop() {
 
   function renderFft() {
     requestAnimationFrame(renderFft);
-    if (!isPageVisible) return;
+    if (isFullWidth || !isPageVisible) return;
 
     const w = canvas.clientWidth || 300;
     const h = canvas.clientHeight || 120;
@@ -1852,6 +2016,10 @@ function updateBatteryDisplay(batteryVolts, batteryPct = null) {
   if (!isNaN(v) && v > 100) v = v / 1000.0;
   if (pct === null && !isNaN(v) && v > 0) pct = Math.round(Math.min(100, Math.max(0, ((v - 3.3) / 0.9) * 100)));
 
+  if (v > 0 && v < 3.45) {
+    recordStreamIssue('battery', 'warn', `Low Tag Battery Alert: ${v.toFixed(2)}V (${pct !== null ? `${pct}%` : 'Low'})`);
+  }
+
   if (batteryValueEl) batteryValueEl.textContent = !isNaN(v) ? `${v.toFixed(2)} V` : '-- V';
   if (batteryPillEl && pct !== null) {
     batteryPillEl.textContent = `${pct}%`;
@@ -2056,7 +2224,9 @@ async function readSerialStream() {
       if (done) break;
       if (value) processRawUartChunk(value, 'SERIAL');
     }
-  } catch (err) {}
+  } catch (err) {
+    recordStreamIssue('error', 'error', `Serial Read Error: ${err.message}`);
+  }
 }
 
 async function disconnectSerialPort() {
@@ -2082,6 +2252,10 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
 
   if (dataView.byteLength >= 16) {
     const header = dataView.getUint8(0);
+    if (header !== 0xCB) {
+      recordStreamIssue('error', 'error', `Invalid Sync Header: 0x${header.toString(16).toUpperCase()} (Expected 0xCB)`, rawHexStr);
+    }
+
     const tagIdNum = dataView.getUint16(1, true);
     const latMicro = dataView.getInt32(3, true);
     const lngMicro = dataView.getInt32(7, true);
@@ -2153,6 +2327,7 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
       });
     }
   } else {
+    recordStreamIssue('error', 'error', `Truncated Packet: ${dataView.byteLength} bytes (Expected >= 16 bytes)`, rawHexStr);
     parsed = { 'Raw Hex': rawHexStr, 'Length': `${dataView.byteLength} Bytes` };
   }
 
@@ -2172,6 +2347,14 @@ function parseTextTelemetry(line) {
   if (!line || typeof line !== 'string') return res;
   
   let cleanLine = line.trim();
+
+  // Detect Error & Warning Indicators in Stream Text
+  if (/<err>|\[ERR\]|\bERROR\b|\bFAIL\b|\bCRC_ERR\b|\bBAD_FRAME\b|\bTIMEOUT\b|\bCHECKSUM\b/i.test(cleanLine)) {
+    recordStreamIssue('error', 'error', `Stream Error: ${cleanLine}`, cleanLine);
+  } else if (/<wrn>|\[WARN\]|\bWARNING\b|\bDROPPED\b|\bSTALE\b/i.test(cleanLine)) {
+    recordStreamIssue('warn', 'warn', `Stream Warning: ${cleanLine}`, cleanLine);
+  }
+
   cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*(?:\[(?:BLE|SERIAL|UART|SIM|RX|TX)\])?\s*/i, '');
   cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i);
   cleanLine = cleanLine.trim();
@@ -2348,6 +2531,7 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
         if (uartByteRingBuffer[i] === 0xCB) { syncIdx = i; break; }
       }
       if (syncIdx === -1) {
+        recordStreamIssue('error', 'warn', `Missing 0xCB Sync in ${uartByteRingBuffer.length} incoming bytes`);
         uartByteRingBuffer = uartByteRingBuffer.slice(Math.max(0, uartByteRingBuffer.length - 19));
         break;
       }
@@ -2411,7 +2595,7 @@ function addChartData(timeLabel, ax, ay, az, gx = 0, gy = 0, gz = 0) {
 function startChartRenderLoop() {
   function loop(timestamp) {
     requestAnimationFrame(loop);
-    if (isPageVisible && chartNeedsUpdate && (timestamp - lastChartRenderTime >= CHART_RENDER_FPS_INTERVAL)) {
+    if (!isFullWidth && isPageVisible && chartNeedsUpdate && (timestamp - lastChartRenderTime >= CHART_RENDER_FPS_INTERVAL)) {
       lastChartRenderTime = timestamp;
       chartNeedsUpdate = false;
       rebuildChartFromBuffer();
@@ -2421,7 +2605,7 @@ function startChartRenderLoop() {
 }
 
 function rebuildChartFromBuffer() {
-  if (!motionChart) return;
+  if (!motionChart || isFullWidth) return;
   const cutoffTime = Date.now() - chartTimeWindowMs;
   const data = chartRingBuffer.getOrderedData(cutoffTime);
 
@@ -2487,6 +2671,8 @@ function updateGPSPosition(lat, lng, alt, speed) {
   if (lblAlt) lblAlt.textContent = `${alt.toFixed(1)} m`;
   if (lblSpeed) lblSpeed.textContent = `${speed.toFixed(1)} km/h`;
 
+  if (isFullWidth) return;
+
   const newPos = [lat, lng];
   if (cowMarker) cowMarker.setLatLng(newPos);
   pathHistory.push(newPos);
@@ -2496,7 +2682,7 @@ function updateGPSPosition(lat, lng, alt, speed) {
 }
 
 // ==========================================================================
-// 5. Virtualized & Capped DOM Terminal Logging (150 Node Max Limit)
+// Virtualized & Capped DOM Terminal Logging (150 Node Max Limit)
 // ==========================================================================
 const MAX_TERMINAL_LOG_ENTRIES = 150;
 
@@ -2753,7 +2939,7 @@ function toggleSimulatorStream() {
       const rawGy = Math.round(parseFloat(gy) * gyroLsbPerDps);
       const rawGz = Math.round(parseFloat(gz) * gyroLsbPerDps);
 
-      const mode = count % 4;
+      const mode = count % 6;
       if (mode === 0) {
         const textMsg = `$IMU,${280 + count},${482000 + count * 20},${rawAx},${rawAy},${rawAz},${rawGx},${rawGy},${rawGz},${pitch},${roll},${yaw}\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
@@ -2763,6 +2949,26 @@ function toggleSimulatorStream() {
       } else if (mode === 2) {
         const textMsg = `ACCEL: ${ax}, ${ay}, ${az}\nGYRO: ${gx}, ${gy}, ${gz}\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
+      } else if (mode === 3) {
+        // Simulated stream error/warning
+        if (count % 30 === 0) {
+          processRawUartChunk(`[${new Date().toLocaleTimeString()}] <err> cowtag_uart: CRC_ERR frame dropped at pkt #${count}\n`, 'SIM_UART');
+        } else if (count % 45 === 0) {
+          processRawUartChunk(`[${new Date().toLocaleTimeString()}] <wrn> cowtag_pwr: BATTERY : 18 % ( 3380 mV ) Low Threshold\n`, 'SIM_UART');
+        } else {
+          const buffer = new ArrayBuffer(20);
+          const view = new DataView(buffer);
+          view.setUint8(0, 0xCB);
+          view.setUint16(1, 8492, true);
+          view.setInt32(3, Math.round(simLat * 1e7), true);
+          view.setInt32(7, Math.round(simLng * 1e7), true);
+          view.setInt16(11, rawAx, true);
+          view.setInt16(13, rawAy, true);
+          view.setInt16(15, rawAz, true);
+          view.setUint16(17, battMv, true);
+          view.setUint8(19, 1);
+          processRawUartChunk(view, 'SIM_BLE');
+        }
       } else {
         const buffer = new ArrayBuffer(20);
         const view = new DataView(buffer);
@@ -2788,7 +2994,7 @@ function toggleSimulatorStream() {
 }
 
 // ==========================================================================
-// Mobile Tabs & Full Width Layout Handlers
+// Mobile Tabs & Zero-Hang Full Width Layout Handlers
 // ==========================================================================
 function setupMobileTabs() {
   if (!mobileTabNav) return;
@@ -2831,17 +3037,19 @@ function setupResponsiveHandlers() {
   const handleResize = () => {
     clearTimeout(resizeTimeout);
     resizeTimeout = setTimeout(() => {
-      if (map) map.invalidateSize();
-      if (motionChart) motionChart.resize();
-      if (renderer3d && camera3d) {
-        const container = document.getElementById('imu3dContainer');
-        if (container) {
-          const w = container.clientWidth || 300;
-          const h = container.clientHeight || 280;
-          camera3d.aspect = w / h;
-          camera3d.updateProjectionMatrix();
-          renderer3d.setSize(w, h);
-          render3D();
+      if (!isFullWidth) {
+        if (map) map.invalidateSize();
+        if (motionChart) motionChart.resize();
+        if (renderer3d && camera3d) {
+          const container = document.getElementById('imu3dContainer');
+          if (container) {
+            const w = container.clientWidth || 300;
+            const h = container.clientHeight || 280;
+            camera3d.aspect = w / h;
+            camera3d.updateProjectionMatrix();
+            renderer3d.setSize(w, h);
+            render3D();
+          }
         }
       }
     }, 150);
@@ -2860,13 +3068,37 @@ function toggleFullWidthStream() {
     dashboardGrid.classList.add('full-width-active');
     btnToggleFullWidth.innerHTML = '<i class="fa-solid fa-compress"></i> <span class="btn-text">Restore View</span>';
     btnToggleFullWidth.classList.add('btn-primary');
+    logToConsole('system', 'Switched to Full Screen UART Stream View (Front-screen rendering suspended for maximum performance).');
   } else {
     dashboardGrid.classList.remove('full-width-active');
     btnToggleFullWidth.innerHTML = '<i class="fa-solid fa-expand"></i> <span class="btn-text">Full Width</span>';
     btnToggleFullWidth.classList.remove('btn-primary');
-  }
+    logToConsole('system', 'Restored Normal Dashboard View.');
 
-  if (map) setTimeout(() => map.invalidateSize(), 250);
+    // Single instantaneous coordinated refresh upon returning
+    requestAnimationFrame(() => {
+      if (map) map.invalidateSize();
+      if (motionChart) {
+        motionChart.resize();
+        rebuildChartFromBuffer();
+      }
+      if (renderer3d && camera3d) {
+        const container = document.getElementById('imu3dContainer');
+        if (container) {
+          const w = container.clientWidth || 300;
+          const h = container.clientHeight || 280;
+          camera3d.aspect = w / h;
+          camera3d.updateProjectionMatrix();
+          renderer3d.setSize(w, h);
+          render3D();
+        }
+      }
+      updateIMUAndOrientation(
+        currentImuState.rawAx, currentImuState.rawAy, currentImuState.rawAz,
+        currentImuState.rawGx, currentImuState.rawGy, currentImuState.rawGz
+      );
+    });
+  }
 }
 
 function checkLastConnectedDevice() {

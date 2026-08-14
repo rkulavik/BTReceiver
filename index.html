@@ -625,6 +625,38 @@
           </div>
         </div>
         <div class="card-body flex-column">
+          <!-- Stream Diagnostics & Issue Alert Header (Red Highlighted Issues) -->
+          <div class="stream-issue-panel" id="streamIssuePanel">
+            <div class="issue-panel-header">
+              <div class="issue-title-group">
+                <span class="issue-badge-red" id="issueBadge">
+                  <i class="fa-solid fa-triangle-exclamation"></i>
+                  <span id="streamIssueCountText">0 STREAM ISSUES DETECTED</span>
+                </span>
+                <span class="issue-status-subtext" id="streamIssueStatusSubtext">Stream nominal • 0 CRC/Frame dropouts</span>
+              </div>
+              <div class="issue-controls">
+                <div class="btn-group issue-filter-group" id="issueFilterGroup">
+                  <button class="btn btn-sm active" data-filter="all">All Issues</button>
+                  <button class="btn btn-sm" data-filter="error">Errors</button>
+                  <button class="btn btn-sm" data-filter="warn">Warnings</button>
+                  <button class="btn btn-sm" data-filter="sensor">Sensor Shocks</button>
+                  <button class="btn btn-sm" data-filter="battery">Battery</button>
+                </div>
+                <div class="btn-group" id="issueSortGroup">
+                  <button class="btn btn-sm active" id="btnSortIssuesDesc" title="Sort Newest First"><i class="fa-solid fa-arrow-down-short-wide"></i> Newest</button>
+                  <button class="btn btn-sm" id="btnSortIssuesAsc" title="Sort Oldest First"><i class="fa-solid fa-arrow-up-wide-short"></i> Oldest</button>
+                </div>
+                <button class="btn btn-sm" id="btnClearIssues" title="Clear Issue Log"><i class="fa-solid fa-trash-can"></i> Clear</button>
+              </div>
+            </div>
+            <div class="issue-list-wrapper" id="issueListWrapper">
+              <div class="issue-list" id="streamIssueList">
+                <div class="issue-empty-state"><i class="fa-solid fa-circle-check"></i> No stream errors or anomalies detected. Live telemetry healthy.</div>
+              </div>
+            </div>
+          </div>
+
           <!-- Stream CSV / Direct File Recorder Panel -->
           <div class="recorder-bar" id="recorderBar">
             <div class="recorder-info">

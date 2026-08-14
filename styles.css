@@ -1551,6 +1551,188 @@ input:checked + .slider:before {
 }
 
 /* ==========================================================================
+   Full Width Viewport Optimization & Zero-Hang Transition
+   ========================================================================== */
+.dashboard-grid.full-width-active {
+  grid-template-columns: 1fr;
+}
+
+.dashboard-grid.full-width-active .dashboard-left {
+  display: none !important;
+}
+
+.dashboard-grid.full-width-active .console-card {
+  grid-column: 1 / -1;
+  width: 100%;
+}
+
+/* ==========================================================================
+   Stream Diagnostics & Issue Alert Header (Red Highlighted Issues)
+   ========================================================================== */
+.stream-issue-panel {
+  background: linear-gradient(135deg, rgba(217, 4, 41, 0.12), rgba(11, 15, 25, 0.95));
+  border: 1.5px solid rgba(255, 77, 109, 0.45);
+  border-radius: var(--radius-sm);
+  padding: 0.65rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  box-shadow: 0 0 15px rgba(255, 77, 109, 0.15);
+  margin-bottom: 0.5rem;
+  transition: all 0.25s ease;
+}
+
+.stream-issue-panel.has-errors {
+  border-color: #ff4d6d;
+  box-shadow: 0 0 20px rgba(255, 77, 109, 0.35);
+  background: linear-gradient(135deg, rgba(217, 4, 41, 0.22), rgba(20, 10, 18, 0.98));
+}
+
+.issue-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.issue-title-group {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.issue-badge-red {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: #ff4d6d;
+  color: #ffffff;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 800;
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  letter-spacing: 0.04em;
+  box-shadow: 0 0 10px rgba(255, 77, 109, 0.5);
+  animation: pulse-red-glow 2s infinite ease-in-out;
+}
+
+.issue-badge-red.nominal {
+  background: rgba(56, 239, 125, 0.15);
+  color: #38ef7d;
+  border: 1px solid rgba(56, 239, 125, 0.4);
+  box-shadow: none;
+  animation: none;
+}
+
+.issue-status-subtext {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: #ff8599;
+  font-weight: 600;
+}
+
+.issue-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.issue-filter-group .btn.active,
+#issueSortGroup .btn.active {
+  background: #ff4d6d;
+  color: #ffffff;
+  border-color: #ff4d6d;
+  font-weight: 700;
+}
+
+.issue-list-wrapper {
+  max-height: 140px;
+  overflow-y: auto;
+  border: 1px solid rgba(255, 77, 109, 0.25);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.45);
+  padding: 0.35rem;
+}
+
+.issue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.issue-empty-state {
+  color: #38ef7d;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.4rem;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+}
+
+.issue-item {
+  display: grid;
+  grid-template-columns: 85px 80px 1fr;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.28rem 0.5rem;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  background: rgba(255, 77, 109, 0.08);
+  border-left: 3px solid #ff4d6d;
+  color: #ffb4c2;
+}
+
+.issue-item.severity-error {
+  border-left-color: #ff4d6d;
+  color: #ff4d6d;
+  font-weight: 700;
+}
+
+.issue-item.severity-warn {
+  border-left-color: #ffb703;
+  color: #ffb703;
+}
+
+.issue-item.severity-alert {
+  border-left-color: #00f2fe;
+  color: #00f2fe;
+}
+
+.issue-time {
+  color: #94a3b8;
+  font-size: 0.68rem;
+}
+
+.issue-tag {
+  display: inline-block;
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  font-weight: 700;
+  text-align: center;
+}
+
+.issue-tag.tag-error { background: rgba(255, 77, 109, 0.25); color: #ff4d6d; }
+.issue-tag.tag-warn { background: rgba(255, 183, 3, 0.25); color: #ffb703; }
+.issue-tag.tag-sensor { background: rgba(236, 72, 153, 0.25); color: #ec4899; }
+.issue-tag.tag-battery { background: rgba(245, 158, 11, 0.25); color: #f59e0b; }
+
+.issue-desc {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ==========================================================================
    Right Panel: Packet Telemetry Console & Raw Hex Payload Inspector
    ========================================================================== */
 .console-card {
