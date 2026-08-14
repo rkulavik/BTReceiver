@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ranchbot Cow Tag BLE Receiver & GPS Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- Leaflet Map CSS & JS for Live GPS Cow Tracking -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Chart.js for Accelerometer/Gyro Motion Graphing -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Navigation / Header -->
+    <header class="navbar">
+      <div class="brand">
+        <div class="logo-icon">
+          <i class="fa-solid fa-cow"></i>
+          <i class="fa-solid fa-location-crosshairs"></i>
+        </div>
+        <div class="brand-text">
+          <h1>Ranchbot Cattle Ear Tag BLE Receiver</h1>
+          <span class="subtext">Livestock Tracker • 6-DOF IMU (Accel & Gyro) • GPS Telemetry Decoder</span>
+        </div>
+      </div>
+      <div class="nav-controls">
+        <div class="connection-status-badge disconnected" id="statusBadge">
+          <span class="status-dot"></span>
+          <span id="statusText">Disconnected</span>
+        </div>
+        <button id="btnConnect" class="btn btn-primary">
+          <i class="fa-solid fa-bluetooth-b"></i> Connect Ear Tag
+        </button>
+        <button id="btnScanAll" class="btn btn-secondary" title="Unfiltered scan for all nearby Bluetooth devices">
+          <i class="fa-solid fa-radar"></i> Scan All BLE Devices
+        </button>
+        <button id="btnSimulate" class="btn btn-secondary">
+          <i class="fa-solid fa-vial"></i> Toggle Cow Tag Demo
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Dashboard Grid -->
+    <main class="dashboard-grid">
+      <!-- Left Sidebar: Cattle Tag Specs & Device Info -->
+      <aside class="card device-info-card">
+        <div class="card-header">
+          <h2><i class="fa-solid fa-tag"></i> Cattle Tag Overview</h2>
+          <span class="badge" id="deviceTypeBadge">No Tag</span>
+        </div>
+        <div class="card-body">
+          <div class="info-row">
+            <span class="label">Cow Tag ID</span>
+            <span class="value" id="cowTagId">COW-8492</span>
+          </div>
+          <div class="info-row">
+            <span class="label">BLE Device Name</span>
+            <span class="value" id="deviceName">--</span>
+          </div>
+          <div class="info-row">
+            <span class="label">Tag Battery</span>
+            <span class="value" id="batteryValue">-- V</span>
+          </div>
+          <div class="info-row">
+            <span class="label">Signal (RSSI)</span>
+            <span class="value" id="rssiValue">-- dBm</span>
+          </div>
+          <div class="info-row">
+            <span class="label">Activity State</span>
+            <span class="valueHighlight" id="activityState">Grazing</span>
+          </div>
+          <div class="info-row">
+            <span class="label">Packets Recv</span>
+            <span class="value" id="packetCount">0</span>
+          </div>
+
+          <hr class="divider">
+
+          <h3><i class="fa-solid fa-sliders"></i> Protocol Settings</h3>
+          <div class="form-group">
+            <label for="decoderSelect">BLE Payload Unpacker</label>
+            <select id="decoderSelect" class="form-control">
+              <option value="cow_tag_full">Ranchbot Cow Tag (GPS + IMU 6-DOF)</option>
+              <option value="imu_only">IMU Motion Only (Accel/Gyro Raw)</option>
+              <option value="raw_hex">Raw Byte Inspector</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="serviceUuid">GATT Service UUID</label>
+            <input type="text" id="serviceUuid" class="form-control" value="0000181a-0000-1000-8000-00805f9b34fb">
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center Section: GPS Pasture Map & 6-DOF Motion Metrics -->
+      <section class="main-telemetry">
+        <!-- Top Metrics: Live GPS Map + IMU Motion Status -->
+        <div class="metrics-grid">
+          <!-- Live Cattle GPS Location Map -->
+          <div class="card map-card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-map-location-dot"></i> Cattle GPS Location (Pasture Track)</h3>
+              <span class="pill pill-success" id="gpsFixPill">GPS Locked (8 Sats)</span>
+            </div>
+            <div class="card-body map-body">
+              <div id="map"></div>
+              <div class="gps-coords-bar">
+                <span>Lat: <strong id="lblLat">31.968600</strong>°</span>
+                <span>Lng: <strong id="lblLng">-99.901800</strong>°</span>
+                <span>Alt: <strong id="lblAlt">412 m</strong></span>
+                <span>Speed: <strong id="lblSpeed">1.2 km/h</strong></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Accelerometer & Gyroscope Sensor Gauges -->
+          <div class="card imu-card">
+            <div class="card-header">
+              <h3><i class="fa-solid fa-compass"></i> 6-DOF Motion Sensors (Ear Tag IMU)</h3>
+              <span class="pill pill-info" id="motionPill">Normal Motion</span>
+            </div>
+            <div class="card-body flex-column">
+              <!-- Accelerometer 3-Axis Reading -->
+              <div class="sensor-section">
+                <div class="section-title"><i class="fa-solid fa-gauge"></i> Accelerometer (g-force)</div>
+                <div class="axis-bars">
+                  <div class="axis-row">
+                    <span class="axis-lbl">X (Pitch):</span>
+                    <div class="bar-bg"><div class="bar-fill bar-x" id="barAccelX" style="width: 50%;"></div></div>
+                    <span class="axis-val" id="valAccelX">+0.04 g</span>
+                  </div>
+                  <div class="axis-row">
+                    <span class="axis-lbl">Y (Roll):</span>
+                    <div class="bar-bg"><div class="bar-fill bar-y" id="barAccelY" style="width: 50%;"></div></div>
+                    <span class="axis-val" id="valAccelY">-0.12 g</span>
+                  </div>
+                  <div class="axis-row">
+                    <span class="axis-lbl">Z (Yaw):</span>
+                    <div class="bar-bg"><div class="bar-fill bar-z" id="barAccelZ" style="width: 75%;"></div></div>
+                    <span class="axis-val" id="valAccelZ">+0.98 g</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Gyroscope 3-Axis Reading -->
+              <div class="sensor-section">
+                <div class="section-title"><i class="fa-solid fa-rotate"></i> Gyroscope (°/s rotation)</div>
+                <div class="axis-bars">
+                  <div class="axis-row">
+                    <span class="axis-lbl">GX (Roll rate):</span>
+                    <span class="axis-val-wide" id="valGyroX">1.2 °/s</span>
+                  </div>
+                  <div class="axis-row">
+                    <span class="axis-lbl">GY (Pitch rate):</span>
+                    <span class="axis-val-wide" id="valGyroY">-4.5 °/s</span>
+                  </div>
+                  <div class="axis-row">
+                    <span class="axis-lbl">GZ (Yaw rate):</span>
+                    <span class="axis-val-wide" id="valGyroZ">0.8 °/s</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Real-time IMU Motion History Chart -->
+        <div class="card chart-card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-chart-line"></i> Real-time Motion Acceleration History (3-Axis IMU)</h3>
+            <div class="chart-actions">
+              <button class="btn btn-sm" id="btnClearChart"><i class="fa-solid fa-trash-can"></i> Clear Graph</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="chart-wrapper">
+              <canvas id="motionChart"></canvas>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Panel: Packet Telemetry Console & Raw Hex Payload Inspector -->
+      <aside class="card console-card">
+        <div class="card-header">
+          <h2><i class="fa-solid fa-terminal"></i> BLE Telemetry Stream</h2>
+          <button class="btn btn-sm btn-icon" id="btnClearLog" title="Clear Terminal">
+            <i class="fa-solid fa-eraser"></i>
+          </button>
+        </div>
+        <div class="card-body flex-column">
+          <!-- Parsed Fields Grid -->
+          <div class="parsed-fields-box">
+            <div class="box-title">Decoded Cattle Tag Payload</div>
+            <div class="fields-grid" id="fieldsGrid">
+              <div class="empty-state">Waiting for Cow Tag BLE packets...</div>
+            </div>
+          </div>
+
+          <!-- Hex Log Terminal -->
+          <div class="terminal-wrapper">
+            <div class="terminal-header">
+              <span>Time</span>
+              <span>Cow Tag Broadcast Event / Raw Hex</span>
+            </div>
+            <div class="terminal-log" id="terminalLog">
+              <div class="log-entry system">[SYSTEM] Cattle Ear Tag Receiver ready. Click "Connect Ear Tag" or "Toggle Cow Tag Demo".</div>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

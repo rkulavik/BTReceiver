@@ -1,0 +1,19 @@
+{
+  "name": "bt-receiver-ranchbot",
+  "version": "1.0.0",
+  "description": "Ranchbot & BLE Telemetry Receiver Application",
+  "main": "app.js",
+  "scripts": {
+    "start": "npx serve .",
+    "dev": "npx vite --open"
+  },
+  "keywords": [
+    "bluetooth",
+    "ble",
+    "ranchbot",
+    "telemetry",
+    "decoder"
+  ],
+  "author": "",
+  "license": "ISC"
+}
