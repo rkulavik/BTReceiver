@@ -888,6 +888,382 @@ body {
 }
 
 /* ==========================================================================
+   Middle Row: 3D IMU Chip Visualization & Digital Low-Pass Filter Controls
+   ========================================================================== */
+.btn-last-device {
+  background: rgba(0, 242, 254, 0.12);
+  color: var(--secondary);
+  border-color: rgba(0, 242, 254, 0.3);
+  font-weight: 600;
+}
+
+.btn-last-device:hover {
+  background: rgba(0, 242, 254, 0.25);
+  border-color: var(--secondary);
+  box-shadow: 0 0 12px rgba(0, 242, 254, 0.3);
+}
+
+.imu-3d-and-filter-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--app-gap);
+  min-height: 340px;
+}
+
+/* 3D IMU Chip & Board Card */
+.imu-3d-card {
+  min-height: 340px;
+  display: flex;
+  flex-direction: column;
+}
+
+.imu-3d-body {
+  padding: 0;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+.imu-3d-canvas-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 280px;
+  background: radial-gradient(circle at center, #111a2e 0%, #060a12 100%);
+  flex: 1;
+}
+
+#imu3dCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.imu-3d-hud {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  background: rgba(11, 15, 25, 0.88);
+  border: 1px solid rgba(0, 242, 254, 0.25);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+  z-index: 5;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.4);
+}
+
+.hud-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.hud-item .hud-lbl {
+  color: var(--text-dim);
+}
+
+.hud-item strong {
+  color: var(--secondary);
+}
+
+.imu-3d-legend {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  display: flex;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  z-index: 5;
+  pointer-events: none;
+  flex-wrap: wrap;
+}
+
+.axis-badge {
+  background: rgba(11, 15, 25, 0.88);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 0.15rem 0.45rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  backdrop-filter: blur(6px);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-red { background: #ff4d6d; box-shadow: 0 0 6px #ff4d6d; }
+.dot-green { background: #38ef7d; box-shadow: 0 0 6px #38ef7d; }
+.dot-blue { background: #00c6ff; box-shadow: 0 0 6px #00c6ff; }
+
+/* Digital Low-Pass Filter Control Card */
+.filter-card {
+  min-height: 340px;
+  display: flex;
+  flex-direction: column;
+}
+
+.calibration-info-banner {
+  background: rgba(0, 198, 255, 0.05);
+  border: 1px solid rgba(0, 198, 255, 0.15);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.cal-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.cal-item i {
+  color: var(--primary);
+}
+
+.cal-item strong {
+  color: var(--text-main);
+}
+
+.filter-controls-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+.filter-block {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.filter-block-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  padding-bottom: 0.35rem;
+}
+
+.filter-toggle-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.filter-name {
+  font-size: 0.8rem;
+  color: var(--text-main);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.filter-name i {
+  color: var(--primary);
+}
+
+/* Custom Switch Toggle */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 34px;
+  height: 18px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(255, 255, 255, 0.15);
+  transition: 0.3s;
+  border-radius: 18px;
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 12px;
+  width: 12px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: 0.3s;
+  border-radius: 50%;
+}
+
+input:checked + .slider {
+  background-color: var(--accent);
+  box-shadow: 0 0 8px rgba(56, 239, 125, 0.4);
+}
+
+input:checked + .slider:before {
+  transform: translateX(16px);
+}
+
+.filter-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.filter-settings .form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.filter-settings label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.form-control-sm {
+  padding: 0.25rem 0.45rem;
+  font-size: 0.74rem;
+  height: 28px;
+}
+
+.slider-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.freq-display {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--secondary);
+}
+
+.slider-with-input {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.range-slider {
+  flex: 1;
+  accent-color: var(--secondary);
+  cursor: pointer;
+}
+
+.number-input-sm {
+  width: 58px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.15rem 0.3rem;
+  text-align: center;
+}
+
+.filter-presets {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+  margin-top: 0.15rem;
+}
+
+.preset-label {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+}
+
+.btn-preset {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  transition: all 0.2s;
+}
+
+.btn-preset:hover {
+  background: rgba(0, 198, 255, 0.15);
+  color: var(--primary);
+  border-color: rgba(0, 198, 255, 0.3);
+}
+
+.btn-preset.active {
+  background: rgba(0, 198, 255, 0.2);
+  color: var(--primary);
+  border-color: var(--primary);
+  font-weight: 700;
+}
+
+.filter-impact-status {
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.6rem;
+}
+
+.impact-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  transition: all 0.3s;
+}
+
+.impact-indicator.active {
+  color: var(--text-main);
+}
+
+.impact-indicator.active i {
+  color: var(--accent);
+}
+
+.impact-indicator.disabled {
+  color: var(--warning);
+}
+
+.impact-indicator.disabled i {
+  color: var(--warning);
+}
+
+/* ==========================================================================
    Right Panel: Packet Telemetry Console & Raw Hex Payload Inspector
    ========================================================================== */
 .console-card {
@@ -1329,6 +1705,14 @@ body {
     gap: 0.85rem;
   }
 
+  .imu-3d-and-filter-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .filter-controls-grid {
+    grid-template-columns: 1fr;
+  }
+
   #map {
     height: 250px;
     min-height: 220px;
@@ -1385,7 +1769,15 @@ body {
 
   /* Mobile Tab Filtering: show/hide cards when tab is selected */
   .dashboard-grid[data-mobile-tab="telemetry"] .device-info-card,
-  .dashboard-grid[data-mobile-tab="telemetry"] .console-card {
+  .dashboard-grid[data-mobile-tab="telemetry"] .console-card,
+  .dashboard-grid[data-mobile-tab="telemetry"] .imu-3d-and-filter-grid {
+    display: none;
+  }
+
+  .dashboard-grid[data-mobile-tab="imu3d"] .device-info-card,
+  .dashboard-grid[data-mobile-tab="imu3d"] .console-card,
+  .dashboard-grid[data-mobile-tab="imu3d"] .metrics-grid,
+  .dashboard-grid[data-mobile-tab="imu3d"] .chart-card {
     display: none;
   }
 
@@ -1401,7 +1793,10 @@ body {
 
   .dashboard-grid[data-mobile-tab="all"] .device-info-card,
   .dashboard-grid[data-mobile-tab="all"] .main-telemetry,
-  .dashboard-grid[data-mobile-tab="all"] .console-card {
+  .dashboard-grid[data-mobile-tab="all"] .console-card,
+  .dashboard-grid[data-mobile-tab="all"] .imu-3d-and-filter-grid,
+  .dashboard-grid[data-mobile-tab="all"] .metrics-grid,
+  .dashboard-grid[data-mobile-tab="all"] .chart-card {
     display: flex;
   }
 }

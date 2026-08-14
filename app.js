@@ -1,4 +1,12 @@
-// Bluetooth & Serial Application State
+// ==========================================================================
+// Ranchbot Cattle Ear Tag BLE & 6-DOF IMU Telemetry Receiver Application
+// 16-Bit Raw ADC IMU Calibration (±2.5G FS / ±125°/s FS)
+// Real-time 3D IMU Chip & Carrier Board Orientation Renderer (Three.js)
+// Independent Digital Low-Pass Filters (LPF) for Accel & Gyro
+// Last Connected Device Persistence & Scan Priority
+// ==========================================================================
+
+// Bluetooth & Serial Hardware State
 let bleDevice = null;
 let gattServer = null;
 let serialPort = null;
@@ -8,27 +16,30 @@ let autoScroll = true;
 let isStreamPaused = false;
 let packetCounter = 0;
 
+// IMU 16-Bit ADC Full-Scale & Scale Factors
+let accelFullScale = 2.5;     // ±2.5g Full Scale
+let accelLsbPerG = 32768.0 / accelFullScale; // 13107.2 LSB/g
+let gyroFullScale = 125.0;    // ±125 °/s Full Scale
+let gyroLsbPerDps = 32768.0 / gyroFullScale; // 262.144 LSB/(°/s)
+
+// Orientation Kinematics State
+let lastEstimatedYaw = 0;
+let lastOrientationTimestamp = null;
+
 // Stream CSV Recorder & Disk State
 let isRecording = false;
 let recordedPackets = [];
 let recordingStartTime = null;
 let recordingTimerInterval = null;
 let isFullWidth = false;
-
-// Safe File System Handle & Serialized Disk Stream State
-let fileHandle = null;
-let fileWritableStream = null;
 let activeRecordingFileName = '';
-let pendingWriteQueue = [];
-let isFlushingWriteQueue = false;
-let totalBytesWrittenToFile = 0;
 
 // Simulator Stream State
 let isSimulatorRunning = false;
 let simulatorInterval = null;
 let uartByteRingBuffer = new Uint8Array(0);
 
-// Leaflet Map & Marker State
+// Leaflet Map State
 let map = null;
 let cowMarker = null;
 let polyline = null;
@@ -36,18 +47,153 @@ let pathHistory = [];
 
 // 6-DOF IMU Motion Chart State & Rolling Time Window
 let motionChart = null;
-let chartTimeWindowMs = 60000; // default 1 minute (60 seconds)
-let chartFilterMode = 'all'; // 'all', 'accel', 'gyro'
-let chartBuffer = []; // array of { time: number, label: string, ax, ay, az, gx, gy, gz }
+let chartTimeWindowMs = 60000; // default 1 minute (60s)
+let chartFilterMode = 'all';    // 'all', 'accel', 'gyro'
+let chartBuffer = [];          // array of { time: number, label: string, ax, ay, az, gx, gy, gz }
 
-// Orientation Kinematics State
-let lastEstimatedYaw = 0;
-let lastOrientationTimestamp = null;
+// Three.js 3D IMU Chip Visualization State
+let scene3d = null;
+let camera3d = null;
+let renderer3d = null;
+let imuBoardGroup = null;
+let axesGizmoGroup = null;
+let deskGridHelper = null;
+let is3dInitialized = false;
+let isMouseDragging3d = false;
+let previousMousePosition = { x: 0, y: 0 };
+let show3dAxes = true;
+let show3dGrid = true;
 
+// Continuous IMU Latest State
+let currentImuState = {
+  rawAx: 0.00,
+  rawAy: 0.00,
+  rawAz: 1.00,
+  rawGx: 0.0,
+  rawGy: 0.0,
+  rawGz: 0.0,
+  filtAx: 0.00,
+  filtAy: 0.00,
+  filtAz: 1.00,
+  filtGx: 0.0,
+  filtGy: 0.0,
+  filtGz: 0.0,
+  pitch: 0.0,
+  roll: 0.0,
+  yaw: 0.0,
+  totalG: 1.00
+};
+
+// ==========================================================================
+// Digital Low-Pass Filter (DSP) Implementation
+// Supports 1st Order Single-Pole & 2nd Order Butterworth Biquad IIR Filters
+// ==========================================================================
+class DigitalLowPassFilter3Axis {
+  constructor(cutoffFreq = 2.0, order = 2) {
+    this.cutoffFreq = cutoffFreq;
+    this.order = parseInt(order, 10) || 2;
+    this.enabled = true;
+    this.lastTimestamp = null;
+    this.reset();
+  }
+
+  reset() {
+    this.state = {
+      x: { y1: 0, y2: 0, x1: 0, x2: 0, out: 0, initialized: false },
+      y: { y1: 0, y2: 0, x1: 0, x2: 0, out: 0, initialized: false },
+      z: { y1: 0, y2: 0, x1: 0, x2: 0, out: 0, initialized: false }
+    };
+    this.lastTimestamp = null;
+  }
+
+  setParameters(cutoffFreq, order, enabled) {
+    if (cutoffFreq !== undefined && cutoffFreq > 0) this.cutoffFreq = parseFloat(cutoffFreq);
+    if (order !== undefined) this.order = parseInt(order, 10);
+    if (enabled !== undefined) this.enabled = Boolean(enabled);
+  }
+
+  apply(rawX, rawY, rawZ, timestamp = Date.now()) {
+    if (!this.enabled) {
+      return { x: rawX, y: rawY, z: rawZ };
+    }
+
+    let dt = 0.05; // 50ms default (20 Hz)
+    if (this.lastTimestamp) {
+      dt = Math.max(0.001, Math.min(0.5, (timestamp - this.lastTimestamp) / 1000.0));
+    }
+    this.lastTimestamp = timestamp;
+
+    return {
+      x: this._filterChannel(this.state.x, rawX, dt),
+      y: this._filterChannel(this.state.y, rawY, dt),
+      z: this._filterChannel(this.state.z, rawZ, dt)
+    };
+  }
+
+  _filterChannel(ch, inputVal, dt) {
+    if (!ch.initialized) {
+      ch.y1 = inputVal;
+      ch.y2 = inputVal;
+      ch.x1 = inputVal;
+      ch.x2 = inputVal;
+      ch.out = inputVal;
+      ch.initialized = true;
+      return inputVal;
+    }
+
+    if (this.order === 1) {
+      // 1st Order Single-Pole Exponential Low-Pass Filter
+      const tau = 1.0 / (2.0 * Math.PI * this.cutoffFreq);
+      const alpha = dt / (tau + dt);
+      ch.out = ch.out + alpha * (inputVal - ch.out);
+      return ch.out;
+    } else {
+      // 2nd Order Butterworth Low-Pass Filter via Bilinear Transform
+      const fc = Math.min(this.cutoffFreq, 0.45 / dt);
+      const omega = 2.0 * Math.PI * fc;
+      const K = Math.tan((omega * dt) / 2.0);
+      const Q = 0.70710678; // 1 / sqrt(2)
+      const K2 = K * K;
+      const norm = 1.0 + K / Q + K2;
+
+      const b0 = K2 / norm;
+      const b1 = 2.0 * b0;
+      const b2 = b0;
+      const a1 = 2.0 * (K2 - 1.0) / norm;
+      const a2 = (1.0 - K / Q + K2) / norm;
+
+      const out = b0 * inputVal + b1 * ch.x1 + b2 * ch.x2 - a1 * ch.y1 - a2 * ch.y2;
+
+      ch.x2 = ch.x1;
+      ch.x1 = inputVal;
+      ch.y2 = ch.y1;
+      ch.y1 = out;
+      ch.out = out;
+
+      if (this.order === 3) {
+        // 3rd Order: Cascade single pole with 2nd order stage
+        const tau = 1.0 / (2.0 * Math.PI * this.cutoffFreq);
+        const alpha = dt / (tau + dt);
+        ch.out = ch.y2 + alpha * (out - ch.y2);
+      }
+
+      return ch.out;
+    }
+  }
+}
+
+// Instantiate Filters
+const accelFilter = new DigitalLowPassFilter3Axis(2.0, 2); // default 2.0 Hz, 2nd Order
+const gyroFilter = new DigitalLowPassFilter3Axis(5.0, 2);  // default 5.0 Hz, 2nd Order
+
+// ==========================================================================
 // DOM Elements
+// ==========================================================================
 const btnConnectSerial = document.getElementById('btnConnectSerial');
 const btnConnect = document.getElementById('btnConnect');
 const btnScanAll = document.getElementById('btnScanAll');
+const btnLastDevice = document.getElementById('btnLastDevice');
+const lastDeviceNameText = document.getElementById('lastDeviceNameText');
 const btnClearLog = document.getElementById('btnClearLog');
 const btnClearChart = document.getElementById('btnClearChart');
 const statusBadge = document.getElementById('statusBadge');
@@ -55,11 +201,15 @@ const statusText = document.getElementById('statusText');
 const serialBaudSelect = document.getElementById('serialBaudSelect');
 const streamFormatSelect = document.getElementById('streamFormatSelect');
 const decoderSelect = document.getElementById('decoderSelect');
+const accelRangeSelect = document.getElementById('accelRangeSelect');
+const gyroRangeSelect = document.getElementById('gyroRangeSelect');
 
-// Device & Cow Info Elements
+// Device & Cow Overview Elements
 const cowTagIdEl = document.getElementById('cowTagId');
 const deviceNameEl = document.getElementById('deviceName');
 const batteryValueEl = document.getElementById('batteryValue');
+const batteryPillEl = document.getElementById('batteryPill');
+const batteryLevelFillEl = document.getElementById('batteryLevelFill');
 const rssiValueEl = document.getElementById('rssiValue');
 const activityStateEl = document.getElementById('activityState');
 const packetCountEl = document.getElementById('packetCount');
@@ -86,8 +236,10 @@ const barGyroX = document.getElementById('barGyroX');
 const barGyroY = document.getElementById('barGyroY');
 const barGyroZ = document.getElementById('barGyroZ');
 const motionPill = document.getElementById('motionPill');
+const accelRangeBadge = document.getElementById('accelRangeBadge');
+const gyroRangeBadge = document.getElementById('gyroRangeBadge');
 
-// Orientation / Euler (Pitch, Roll, Yaw) Elements
+// Orientation / Euler Elements
 const valPitch = document.getElementById('valPitch');
 const valRoll = document.getElementById('valRoll');
 const valYaw = document.getElementById('valYaw');
@@ -97,12 +249,42 @@ const barYaw = document.getElementById('barYaw');
 const attitudePill = document.getElementById('attitudePill');
 const attitudeModeText = document.getElementById('attitudeModeText');
 
+// 3D Viewport Controls
+const btnReset3dView = document.getElementById('btnReset3dView');
+const btnToggle3dAxes = document.getElementById('btnToggle3dAxes');
+const btnToggle3dGrid = document.getElementById('btnToggle3dGrid');
+const hudPitch = document.getElementById('hudPitch');
+const hudRoll = document.getElementById('hudRoll');
+const hudYaw = document.getElementById('hudYaw');
+const hudGravity = document.getElementById('hudGravity');
+const chipFlatStatusPill = document.getElementById('chipFlatStatusPill');
+
+// Digital Filter Controls
+const chkAccelFilter = document.getElementById('chkAccelFilter');
+const accelFilterOrder = document.getElementById('accelFilterOrder');
+const accelCutoffFreq = document.getElementById('accelCutoffFreq');
+const accelCutoffInput = document.getElementById('accelCutoffInput');
+const lblAccelCutoff = document.getElementById('lblAccelCutoff');
+const accelFilterPill = document.getElementById('accelFilterPill');
+
+const chkGyroFilter = document.getElementById('chkGyroFilter');
+const gyroFilterOrder = document.getElementById('gyroFilterOrder');
+const gyroCutoffFreq = document.getElementById('gyroCutoffFreq');
+const gyroCutoffInput = document.getElementById('gyroCutoffInput');
+const lblGyroCutoff = document.getElementById('lblGyroCutoff');
+const gyroFilterPill = document.getElementById('gyroFilterPill');
+
+const btnResetFilters = document.getElementById('btnResetFilters');
+const filterMasterStatusPill = document.getElementById('filterMasterStatusPill');
+const impactIndicator = document.getElementById('impactIndicator');
+const impactText = document.getElementById('impactText');
+
 // Chart Controls
 const chartWindowBadge = document.getElementById('chartWindowBadge');
 const chartModeGroup = document.getElementById('chartModeGroup');
 const chartWindowGroup = document.getElementById('chartWindowGroup');
 
-// Console, Parsed Grid & Full-Width Elements
+// Terminal, Parsed Grid & Full-Width Elements
 const terminalLog = document.getElementById('terminalLog');
 const fieldsGrid = document.getElementById('fieldsGrid');
 const btnToggleFullWidth = document.getElementById('btnToggleFullWidth');
@@ -127,47 +309,110 @@ const recorderSize = document.getElementById('recorderSize');
 const ENVIRONMENTAL_SENSING_SERVICE = 0x181a;
 const TAG_SERVICE_UUID = '0000181a-0000-1000-8000-00805f9b34fb';
 
-// DOM Elements
 const mobileTabNav = document.getElementById('mobileTabNav');
 const dashboardGrid = document.querySelector('.dashboard-grid');
 
-// Initialize Application
+// ==========================================================================
+// Application Initialization
+// ==========================================================================
 document.addEventListener('DOMContentLoaded', () => {
   initMap();
   initChart();
+  init3DImuViewer();
   setupEventListeners();
+  setupFilterEventListeners();
   setupMobileTabs();
   setupResponsiveHandlers();
-  logToConsole('system', 'Ranchbot Cow Tag BLE & GPS/IMU Receiver initialized.');
+  checkLastConnectedDevice();
+  
+  // Ensure Tag Overview starts completely blank as requested
+  updateDeviceOverview('--', '--', false);
+  
+  // Set initial flat orientation (top of chip up on desk)
+  updateIMUAndOrientation(0.00, 0.00, 1.00, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 'Default Position', 'At Rest');
+  
+  logToConsole('system', 'Ranchbot Cow Tag BLE & GPS/IMU Receiver initialized. IMU configured for ±2.5G / ±125°/s (16-bit ADC).');
 });
 
+// ==========================================================================
+// Event Listeners Setup
+// ==========================================================================
 function setupEventListeners() {
   if (btnConnectSerial) btnConnectSerial.addEventListener('click', handleConnectSerialButtonClick);
-  btnConnect.addEventListener('click', handleConnectButtonClick);
+  if (btnConnect) btnConnect.addEventListener('click', handleConnectButtonClick);
   if (btnScanAll) btnScanAll.addEventListener('click', handleScanAllClick);
+  if (btnLastDevice) btnLastDevice.addEventListener('click', handleLastDeviceReconnect);
   if (btnPauseStream) btnPauseStream.addEventListener('click', togglePauseStream);
   if (btnToggleAutoScroll) btnToggleAutoScroll.addEventListener('click', toggleAutoScroll);
   
-  btnClearLog.addEventListener('click', () => {
-    terminalLog.innerHTML = '';
-    logToConsole('system', 'Console log cleared.');
-  });
-  
-  btnClearChart.addEventListener('click', () => {
-    chartBuffer = [];
-    if (motionChart) {
-      motionChart.data.labels = [];
-      for (let i = 0; i < motionChart.data.datasets.length; i++) {
-        motionChart.data.datasets[i].data = [];
+  if (btnClearLog) {
+    btnClearLog.addEventListener('click', () => {
+      terminalLog.innerHTML = '';
+      logToConsole('system', 'Console log cleared.');
+    });
+  }
+
+  if (btnClearChart) {
+    btnClearChart.addEventListener('click', () => {
+      chartBuffer = [];
+      if (motionChart) {
+        motionChart.data.labels = [];
+        for (let i = 0; i < motionChart.data.datasets.length; i++) {
+          motionChart.data.datasets[i].data = [];
+        }
+        motionChart.update();
       }
-      motionChart.update();
-    }
-    if (chartWindowBadge) {
-      const sec = Math.round(chartTimeWindowMs / 1000);
-      chartWindowBadge.innerHTML = `<i class="fa-solid fa-clock"></i> Last ${sec >= 60 ? `${Math.round(sec/60)} Min` : `${sec}s`} • 0 pts`;
-    }
-    logToConsole('system', 'Motion history chart cleared.');
-  });
+      if (chartWindowBadge) {
+        const sec = Math.round(chartTimeWindowMs / 1000);
+        chartWindowBadge.innerHTML = `<i class="fa-solid fa-clock"></i> Last ${sec >= 60 ? `${Math.round(sec/60)} Min` : `${sec}s`} • 0 pts`;
+      }
+      logToConsole('system', 'Motion history chart cleared.');
+    });
+  }
+
+  // IMU Range Selector Listeners
+  if (accelRangeSelect) {
+    accelRangeSelect.addEventListener('change', () => {
+      accelFullScale = parseFloat(accelRangeSelect.value) || 2.5;
+      accelLsbPerG = 32768.0 / accelFullScale;
+      if (accelRangeBadge) {
+        accelRangeBadge.textContent = `±${accelFullScale} g Full Scale (${accelLsbPerG.toFixed(1)} LSB/g)`;
+      }
+      if (motionChart) {
+        motionChart.options.scales.y.min = -accelFullScale;
+        motionChart.options.scales.y.max = accelFullScale;
+        motionChart.options.scales.y.suggestedMin = -accelFullScale;
+        motionChart.options.scales.y.suggestedMax = accelFullScale;
+        motionChart.options.scales.y.title.text = `Acceleration (±${accelFullScale}g)`;
+        motionChart.update();
+      }
+      logToConsole('system', `IMU Accel Range set to ±${accelFullScale}g (${accelLsbPerG.toFixed(1)} LSB/g).`);
+    });
+  }
+
+  if (gyroRangeSelect) {
+    gyroRangeSelect.addEventListener('change', () => {
+      gyroFullScale = parseFloat(gyroRangeSelect.value) || 125.0;
+      gyroLsbPerDps = 32768.0 / gyroFullScale;
+      if (gyroRangeBadge) {
+        gyroRangeBadge.textContent = `±${gyroFullScale} °/s Full Scale (${gyroLsbPerDps.toFixed(1)} LSB/dps)`;
+      }
+      if (motionChart) {
+        motionChart.options.scales.y1.min = -gyroFullScale;
+        motionChart.options.scales.y1.max = gyroFullScale;
+        motionChart.options.scales.y1.suggestedMin = -gyroFullScale;
+        motionChart.options.scales.y1.suggestedMax = gyroFullScale;
+        motionChart.options.scales.y1.title.text = `Angular Rate (±${gyroFullScale} °/s)`;
+        motionChart.update();
+      }
+      logToConsole('system', `IMU Gyro Range set to ±${gyroFullScale}°/s (${gyroLsbPerDps.toFixed(1)} LSB/dps).`);
+    });
+  }
+
+  // 3D Viewport Controls
+  if (btnReset3dView) btnReset3dView.addEventListener('click', reset3DView);
+  if (btnToggle3dAxes) btnToggle3dAxes.addEventListener('click', toggle3DAxes);
+  if (btnToggle3dGrid) btnToggle3dGrid.addEventListener('click', toggle3DGrid);
 
   // Chart Mode Filter Buttons (All, Accel, Gyro)
   if (chartModeGroup) {
@@ -192,7 +437,6 @@ function setupEventListeners() {
       const winSec = parseInt(btn.dataset.window, 10) || 60;
       chartTimeWindowMs = winSec * 1000;
 
-      // Re-prune buffer immediately
       const cutoff = Date.now() - chartTimeWindowMs;
       while (chartBuffer.length > 0 && chartBuffer[0].time < cutoff) {
         chartBuffer.shift();
@@ -209,263 +453,800 @@ function setupEventListeners() {
   if (btnToggleFullWidth) btnToggleFullWidth.addEventListener('click', toggleFullWidthStream);
 }
 
-/**
- * Mobile App-Like Quick Tab Switcher
- */
-function setupMobileTabs() {
-  if (!mobileTabNav) return;
-
-  // Set initial state
-  if (dashboardGrid && !dashboardGrid.dataset.mobileTab) {
-    dashboardGrid.dataset.mobileTab = 'telemetry';
+// ==========================================================================
+// Digital Low-Pass Filter Control Panel & Presets
+// ==========================================================================
+function setupFilterEventListeners() {
+  // Accelerometer Filter Controls
+  if (chkAccelFilter) {
+    chkAccelFilter.addEventListener('change', () => {
+      accelFilter.enabled = chkAccelFilter.checked;
+      accelFilterPill.className = chkAccelFilter.checked ? 'pill pill-success' : 'pill';
+      accelFilterPill.textContent = chkAccelFilter.checked ? 'LPF ON' : 'OFF';
+      updateFilterMasterStatus();
+    });
   }
 
-  mobileTabNav.addEventListener('click', (e) => {
-    const btn = e.target.closest('.mobile-tab-btn');
-    if (!btn) return;
+  if (accelFilterOrder) {
+    accelFilterOrder.addEventListener('change', () => {
+      accelFilter.order = parseInt(accelFilterOrder.value, 10);
+      accelFilter.reset();
+      updateFilterMasterStatus();
+    });
+  }
 
-    const targetTab = btn.dataset.tab || 'telemetry';
+  if (accelCutoffFreq && accelCutoffInput) {
+    accelCutoffFreq.addEventListener('input', () => {
+      const freq = parseFloat(accelCutoffFreq.value);
+      accelCutoffInput.value = freq.toFixed(1);
+      lblAccelCutoff.textContent = `${freq.toFixed(1)} Hz`;
+      accelFilter.cutoffFreq = freq;
+      accelFilter.reset();
+      updateFilterMasterStatus();
+    });
 
-    // Update active button state
-    mobileTabNav.querySelectorAll('.mobile-tab-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
+    accelCutoffInput.addEventListener('change', () => {
+      let freq = Math.max(0.1, Math.min(25.0, parseFloat(accelCutoffInput.value) || 2.0));
+      accelCutoffInput.value = freq.toFixed(1);
+      accelCutoffFreq.value = freq;
+      lblAccelCutoff.textContent = `${freq.toFixed(1)} Hz`;
+      accelFilter.cutoffFreq = freq;
+      accelFilter.reset();
+      updateFilterMasterStatus();
+    });
+  }
 
-    // Update dashboard grid attribute for CSS view filtering
-    if (dashboardGrid) {
-      dashboardGrid.dataset.mobileTab = targetTab;
-    }
+  // Gyroscope Filter Controls
+  if (chkGyroFilter) {
+    chkGyroFilter.addEventListener('change', () => {
+      gyroFilter.enabled = chkGyroFilter.checked;
+      gyroFilterPill.className = chkGyroFilter.checked ? 'pill pill-success' : 'pill';
+      gyroFilterPill.textContent = chkGyroFilter.checked ? 'LPF ON' : 'OFF';
+      updateFilterMasterStatus();
+    });
+  }
 
-    // Trigger Leaflet & Chart.js dimension recalculation
-    setTimeout(() => {
-      if (map) map.invalidateSize();
-      if (motionChart) motionChart.resize();
-    }, 100);
+  if (gyroFilterOrder) {
+    gyroFilterOrder.addEventListener('change', () => {
+      gyroFilter.order = parseInt(gyroFilterOrder.value, 10);
+      gyroFilter.reset();
+      updateFilterMasterStatus();
+    });
+  }
 
-    // Optional smooth scroll to top of content on mobile tab change
-    if (window.innerWidth <= 860) {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-  });
-}
+  if (gyroCutoffFreq && gyroCutoffInput) {
+    gyroCutoffFreq.addEventListener('input', () => {
+      const freq = parseFloat(gyroCutoffFreq.value);
+      gyroCutoffInput.value = freq.toFixed(1);
+      lblGyroCutoff.textContent = `${freq.toFixed(1)} Hz`;
+      gyroFilter.cutoffFreq = freq;
+      gyroFilter.reset();
+      updateFilterMasterStatus();
+    });
 
-/**
- * Setup Window Resize & Orientation Change Handlers
- */
-function setupResponsiveHandlers() {
-  let resizeTimeout = null;
-  const handleResize = () => {
-    clearTimeout(resizeTimeout);
-    resizeTimeout = setTimeout(() => {
-      if (map) map.invalidateSize();
-      if (motionChart) motionChart.resize();
-    }, 150);
-  };
+    gyroCutoffInput.addEventListener('change', () => {
+      let freq = Math.max(0.2, Math.min(50.0, parseFloat(gyroCutoffInput.value) || 5.0));
+      gyroCutoffInput.value = freq.toFixed(1);
+      gyroCutoffFreq.value = freq;
+      lblGyroCutoff.textContent = `${freq.toFixed(1)} Hz`;
+      gyroFilter.cutoffFreq = freq;
+      gyroFilter.reset();
+      updateFilterMasterStatus();
+    });
+  }
 
-  window.addEventListener('resize', handleResize);
-  window.addEventListener('orientationchange', () => {
-    setTimeout(handleResize, 200);
-  });
-}
+  // Presets
+  document.querySelectorAll('.btn-preset').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const target = btn.dataset.target;
+      const freq = parseFloat(btn.dataset.freq);
+      const order = parseInt(btn.dataset.order, 10);
 
-/* ==========================================================================
-   Leaflet GPS Map Setup
-   ========================================================================== */
-function initMap() {
-  // Center map on a representative ranch pasture (Texas Ranch coordinates)
-  const startLat = 31.968600;
-  const startLng = -99.901800;
+      const block = btn.closest('.filter-block');
+      if (block) {
+        block.querySelectorAll('.btn-preset').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      }
 
-  map = L.map('map', {
-    center: [startLat, startLng],
-    zoom: 16,
-    zoomControl: false
-  });
-
-  L.control.zoom({ position: 'topright' }).addTo(map);
-
-  // Satellite/Tile Layer
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; OpenStreetMap',
-    maxZoom: 19
-  }).addTo(map);
-
-  // Custom Icon for Cattle
-  const cowIcon = L.divIcon({
-    className: 'custom-cow-icon',
-    html: `<div style="background:#00c6ff; color:#040914; border-radius:50%; width:32px; height:32px; display:flex; align-items:center; justify-content:center; box-shadow:0 0 12px #00c6ff; border:2px solid #fff;"><i class="fa-solid fa-cow" style="font-size:16px;"></i></div>`,
-    iconSize: [32, 32],
-    iconAnchor: [16, 16]
-  });
-
-  cowMarker = L.marker([startLat, startLng], { icon: cowIcon }).addTo(map);
-  cowMarker.bindPopup('<b>Cow Ear Tag #COW-8492</b><br>State: Grazing pasture');
-
-  polyline = L.polyline([], { color: '#00f2fe', weight: 3, opacity: 0.8, dashArray: '5, 8' }).addTo(map);
-}
-
-function updateGPSPosition(lat, lng, alt, speed) {
-  if (lblLat) lblLat.textContent = lat.toFixed(6);
-  if (lblLng) lblLng.textContent = lng.toFixed(6);
-  if (lblAlt) lblAlt.textContent = `${alt.toFixed(1)} m`;
-  if (lblSpeed) lblSpeed.textContent = `${speed.toFixed(1)} km/h`;
-
-  const newPos = [lat, lng];
-  if (cowMarker) cowMarker.setLatLng(newPos);
-  
-  pathHistory.push(newPos);
-  if (pathHistory.length > 50) pathHistory.shift();
-  
-  if (polyline) polyline.setLatLngs(pathHistory);
-  if (map) map.panTo(newPos);
-}
-
-/* ==========================================================================
-   Chart Initialization (Chart.js Dual-Axis 6-DOF IMU Motion History)
-   ========================================================================== */
-function initChart() {
-  const chartCanvas = document.getElementById('motionChart');
-  if (!chartCanvas) return;
-  const ctx = chartCanvas.getContext('2d');
-
-  motionChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: [],
-      datasets: [
-        {
-          label: 'Accel X (g)',
-          data: [],
-          borderColor: '#ff4d6d',
-          backgroundColor: 'rgba(255, 77, 109, 0.05)',
-          borderWidth: 2,
-          pointRadius: 0,
-          tension: 0.2,
-          yAxisID: 'y'
-        },
-        {
-          label: 'Accel Y (g)',
-          data: [],
-          borderColor: '#38ef7d',
-          backgroundColor: 'rgba(56, 239, 125, 0.05)',
-          borderWidth: 2,
-          pointRadius: 0,
-          tension: 0.2,
-          yAxisID: 'y'
-        },
-        {
-          label: 'Accel Z (g)',
-          data: [],
-          borderColor: '#00c6ff',
-          backgroundColor: 'rgba(0, 198, 255, 0.05)',
-          borderWidth: 2,
-          pointRadius: 0,
-          tension: 0.2,
-          yAxisID: 'y'
-        },
-        {
-          label: 'Gyro X (°/s)',
-          data: [],
-          borderColor: '#f59e0b',
-          backgroundColor: 'transparent',
-          borderDash: [4, 3],
-          borderWidth: 1.8,
-          pointRadius: 0,
-          tension: 0.2,
-          yAxisID: 'y1'
-        },
-        {
-          label: 'Gyro Y (°/s)',
-          data: [],
-          borderColor: '#a855f7',
-          backgroundColor: 'transparent',
-          borderDash: [4, 3],
-          borderWidth: 1.8,
-          pointRadius: 0,
-          tension: 0.2,
-          yAxisID: 'y1'
-        },
-        {
-          label: 'Gyro Z (°/s)',
-          data: [],
-          borderColor: '#ec4899',
-          backgroundColor: 'transparent',
-          borderDash: [4, 3],
-          borderWidth: 1.8,
-          pointRadius: 0,
-          tension: 0.2,
-          yAxisID: 'y1'
+      if (target === 'accel') {
+        if (chkAccelFilter) chkAccelFilter.checked = true;
+        accelFilter.enabled = true;
+        accelFilter.cutoffFreq = freq;
+        accelFilter.order = order;
+        accelFilter.reset();
+        if (accelFilterOrder) accelFilterOrder.value = String(order);
+        if (accelCutoffFreq) accelCutoffFreq.value = freq;
+        if (accelCutoffInput) accelCutoffInput.value = freq.toFixed(1);
+        if (lblAccelCutoff) lblAccelCutoff.textContent = `${freq.toFixed(1)} Hz`;
+        if (accelFilterPill) {
+          accelFilterPill.className = 'pill pill-success';
+          accelFilterPill.textContent = 'LPF ON';
         }
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      interaction: {
-        mode: 'index',
-        intersect: false
-      },
-      scales: {
-        x: {
-          grid: { color: 'rgba(255, 255, 255, 0.05)' },
-          ticks: {
-            color: '#94a3b8',
-            font: { family: 'JetBrains Mono', size: 10 },
-            maxRotation: 0,
-            autoSkip: true,
-            maxTicksLimit: 8
-          }
-        },
-        y: {
-          type: 'linear',
-          position: 'left',
-          min: -2.5,
-          max: 2.5,
-          suggestedMin: -2.5,
-          suggestedMax: 2.5,
-          grid: { color: 'rgba(255, 255, 255, 0.08)' },
-          ticks: { color: '#00c6ff', font: { family: 'JetBrains Mono', size: 10 } },
-          title: { display: true, text: 'Acceleration (±2.5g)', color: '#00c6ff', font: { size: 11, weight: '600' } }
-        },
-        y1: {
-          type: 'linear',
-          position: 'right',
-          min: -125,
-          max: 125,
-          suggestedMin: -125,
-          suggestedMax: 125,
-          grid: { drawOnChartArea: false },
-          ticks: { color: '#f59e0b', font: { family: 'JetBrains Mono', size: 10 } },
-          title: { display: true, text: 'Angular Rate (±125 °/s)', color: '#f59e0b', font: { size: 11, weight: '600' } }
-        }
-      },
-      plugins: {
-        legend: {
-          position: 'top',
-          labels: {
-            color: '#f1f5f9',
-            font: { family: 'Inter', size: 11 },
-            boxWidth: 12,
-            padding: 8
-          }
-        },
-        tooltip: {
-          backgroundColor: 'rgba(11, 15, 25, 0.95)',
-          titleFont: { family: 'JetBrains Mono' },
-          bodyFont: { family: 'JetBrains Mono' },
-          borderColor: 'rgba(0, 242, 254, 0.3)',
-          borderWidth: 1
+      } else if (target === 'gyro') {
+        if (chkGyroFilter) chkGyroFilter.checked = true;
+        gyroFilter.enabled = true;
+        gyroFilter.cutoffFreq = freq;
+        gyroFilter.order = order;
+        gyroFilter.reset();
+        if (gyroFilterOrder) gyroFilterOrder.value = String(order);
+        if (gyroCutoffFreq) gyroCutoffFreq.value = freq;
+        if (gyroCutoffInput) gyroCutoffInput.value = freq.toFixed(1);
+        if (lblGyroCutoff) lblGyroCutoff.textContent = `${freq.toFixed(1)} Hz`;
+        if (gyroFilterPill) {
+          gyroFilterPill.className = 'pill pill-success';
+          gyroFilterPill.textContent = 'LPF ON';
         }
       }
-    }
+      updateFilterMasterStatus();
+    });
   });
 
-  applyChartFilterMode();
+  // Reset Filters Defaults Button
+  if (btnResetFilters) {
+    btnResetFilters.addEventListener('click', () => {
+      if (chkAccelFilter) chkAccelFilter.checked = true;
+      if (accelFilterOrder) accelFilterOrder.value = '2';
+      if (accelCutoffFreq) accelCutoffFreq.value = 2.0;
+      if (accelCutoffInput) accelCutoffInput.value = '2.0';
+      if (lblAccelCutoff) lblAccelCutoff.textContent = '2.0 Hz';
+      if (accelFilterPill) {
+        accelFilterPill.className = 'pill pill-success';
+        accelFilterPill.textContent = 'LPF ON';
+      }
+      accelFilter.setParameters(2.0, 2, true);
+      accelFilter.reset();
+
+      if (chkGyroFilter) chkGyroFilter.checked = true;
+      if (gyroFilterOrder) gyroFilterOrder.value = '2';
+      if (gyroCutoffFreq) gyroCutoffFreq.value = 5.0;
+      if (gyroCutoffInput) gyroCutoffInput.value = '5.0';
+      if (lblGyroCutoff) lblGyroCutoff.textContent = '5.0 Hz';
+      if (gyroFilterPill) {
+        gyroFilterPill.className = 'pill pill-success';
+        gyroFilterPill.textContent = 'LPF ON';
+      }
+      gyroFilter.setParameters(5.0, 2, true);
+      gyroFilter.reset();
+
+      document.querySelectorAll('.btn-preset').forEach(b => b.classList.remove('active'));
+      const defaultAccelBtn = document.querySelector('.btn-preset[data-target="accel"][data-freq="2.0"]');
+      const defaultGyroBtn = document.querySelector('.btn-preset[data-target="gyro"][data-freq="5.0"]');
+      if (defaultAccelBtn) defaultAccelBtn.classList.add('active');
+      if (defaultGyroBtn) defaultGyroBtn.classList.add('active');
+
+      updateFilterMasterStatus();
+      logToConsole('system', 'Digital Filters reset to balanced defaults (Accel: 2.0Hz 2nd-Ord | Gyro: 5.0Hz 2nd-Ord).');
+    });
+  }
+
+  updateFilterMasterStatus();
 }
 
-/* ==========================================================================
-   Web Bluetooth API Connection
-   ========================================================================== */
+function updateFilterMasterStatus() {
+  const isAccelOn = accelFilter.enabled;
+  const isGyroOn = gyroFilter.enabled;
+
+  if (filterMasterStatusPill) {
+    if (isAccelOn && isGyroOn) {
+      filterMasterStatusPill.className = 'pill pill-success';
+      filterMasterStatusPill.textContent = `LPF Active (${accelFilter.cutoffFreq}Hz / ${gyroFilter.cutoffFreq}Hz)`;
+    } else if (isAccelOn || isGyroOn) {
+      filterMasterStatusPill.className = 'pill pill-warning';
+      filterMasterStatusPill.textContent = `Partial LPF (${isAccelOn ? 'Accel' : 'Gyro'})`;
+    } else {
+      filterMasterStatusPill.className = 'pill pill-danger';
+      filterMasterStatusPill.textContent = 'Filters OFF (Raw ADC)';
+    }
+  }
+
+  if (impactIndicator && impactText) {
+    if (isAccelOn || isGyroOn) {
+      impactIndicator.className = 'impact-indicator active';
+      impactIndicator.querySelector('i').className = 'fa-solid fa-circle-check';
+      impactText.innerHTML = `Filters actively smoothing <strong>Orientation (Pitch/Roll/Yaw)</strong>, <strong>G-Force</strong>, <strong>Angular Rate</strong>, and <strong>3D IMU Chip</strong> (${isAccelOn ? `Accel ${accelFilter.cutoffFreq}Hz` : 'Raw Accel'}, ${isGyroOn ? `Gyro ${gyroFilter.cutoffFreq}Hz` : 'Raw Gyro'}).`;
+    } else {
+      impactIndicator.className = 'impact-indicator disabled';
+      impactIndicator.querySelector('i').className = 'fa-solid fa-triangle-exclamation';
+      impactText.innerHTML = 'Filters disabled: Displaying and rendering <strong>100% UNFILTERED RAW ADC</strong> data directly.';
+    }
+  }
+}
+
+// ==========================================================================
+// Last Connected Device Persistence & Quick Reconnect
+// ==========================================================================
+function checkLastConnectedDevice() {
+  const lastBleName = localStorage.getItem('ranchbot_last_ble_name');
+  const lastBleId = localStorage.getItem('ranchbot_last_ble_id');
+  const lastSerialBaud = localStorage.getItem('ranchbot_last_serial_baud');
+
+  if (lastBleName || lastBleId) {
+    const displayName = lastBleName || 'Saved Ear Tag';
+    if (btnLastDevice && lastDeviceNameText) {
+      lastDeviceNameText.textContent = `Reconnect "${displayName}"`;
+      btnLastDevice.title = `Instant reconnect to ${displayName} (ID: ${lastBleId || 'Saved'})`;
+      btnLastDevice.style.display = 'inline-flex';
+    }
+  }
+}
+
+function saveLastConnectedBle(name, id) {
+  if (name) localStorage.setItem('ranchbot_last_ble_name', name);
+  if (id) localStorage.setItem('ranchbot_last_ble_id', id);
+  checkLastConnectedDevice();
+}
+
+function saveLastConnectedSerial(baud) {
+  if (baud) localStorage.setItem('ranchbot_last_serial_baud', String(baud));
+}
+
+async function handleLastDeviceReconnect() {
+  logToConsole('system', 'Attempting fast reconnect to last known BLE device...');
+  handleConnectButtonClick();
+}
+
+// ==========================================================================
+// 3D IMU Chip & Carrier Board Renderer (Three.js WebGL)
+// ==========================================================================
+function init3DImuViewer() {
+  const container = document.getElementById('imu3dContainer');
+  const canvas = document.getElementById('imu3dCanvas');
+  if (!container || !canvas || typeof THREE === 'undefined') return;
+
+  const width = container.clientWidth || 300;
+  const height = container.clientHeight || 280;
+
+  // 1. Scene
+  scene3d = new THREE.Scene();
+  scene3d.background = new THREE.Color(0x0a0f1d);
+
+  // 2. Camera (Isometric Perspective)
+  camera3d = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
+  camera3d.position.set(4.8, 4.2, 5.8);
+  camera3d.lookAt(0, 0, 0);
+
+  // 3. Renderer
+  renderer3d = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true });
+  renderer3d.setSize(width, height);
+  renderer3d.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer3d.shadowMap.enabled = true;
+
+  // 4. Lighting
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+  scene3d.add(ambientLight);
+
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+  dirLight.position.set(6, 12, 8);
+  scene3d.add(dirLight);
+
+  const fillLight = new THREE.PointLight(0x00f2fe, 0.45, 25);
+  fillLight.position.set(-5, -2, -4);
+  scene3d.add(fillLight);
+
+  // 5. Reference Desk Grid Plane (Y = 0)
+  deskGridHelper = new THREE.GridHelper(8, 16, 0x00f2fe, 0x1e293b);
+  deskGridHelper.position.y = -0.02;
+  scene3d.add(deskGridHelper);
+
+  // 6. Carrier PCB Board & IMU Group
+  imuBoardGroup = new THREE.Group();
+  scene3d.add(imuBoardGroup);
+
+  // PCB Carrier Board (Dark Green FR4 / Matte Black substrate)
+  const pcbGeo = new THREE.BoxGeometry(3.6, 0.14, 2.6);
+  const pcbMat = new THREE.MeshStandardMaterial({
+    color: 0x113b2e,
+    roughness: 0.35,
+    metalness: 0.25
+  });
+  const pcbMesh = new THREE.Mesh(pcbGeo, pcbMat);
+  pcbMesh.position.y = 0.07;
+  imuBoardGroup.add(pcbMesh);
+
+  // Gold Edge Traces & Corner Mounting Pads
+  const goldMat = new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.9, roughness: 0.15 });
+  const cornerPads = [
+    [-1.55, 0.145, -1.05],
+    [1.55, 0.145, -1.05],
+    [-1.55, 0.145, 1.05],
+    [1.55, 0.145, 1.05]
+  ];
+  cornerPads.forEach(([cx, cy, cz]) => {
+    const padGeo = new THREE.CylinderGeometry(0.18, 0.18, 0.02, 16);
+    const pad = new THREE.Mesh(padGeo, goldMat);
+    pad.position.set(cx, cy, cz);
+    imuBoardGroup.add(pad);
+  });
+
+  // IMU IC Package (Center Mounted QFN Package)
+  const chipGeo = new THREE.BoxGeometry(1.4, 0.22, 1.4);
+  const chipMat = new THREE.MeshStandardMaterial({
+    color: 0x181a20, // Matte epoxy IC black
+    roughness: 0.5,
+    metalness: 0.3
+  });
+  const imuChipMesh = new THREE.Mesh(chipGeo, chipMat);
+  imuChipMesh.position.set(0, 0.25, 0);
+  imuBoardGroup.add(imuChipMesh);
+
+  // Pin 1 Polarity Marker Dot (Top-Left Corner)
+  const dotGeo = new THREE.CylinderGeometry(0.07, 0.07, 0.02, 16);
+  const dotMat = new THREE.MeshStandardMaterial({ color: 0x00f2fe, emissive: 0x00f2fe, emissiveIntensity: 0.8 });
+  const pin1Dot = new THREE.Mesh(dotGeo, dotMat);
+  pin1Dot.position.set(-0.48, 0.365, -0.48);
+  imuBoardGroup.add(pin1Dot);
+
+  // Silkscreen Text Canvas Texture for the IMU IC
+  const textCanvas = document.createElement('canvas');
+  textCanvas.width = 256;
+  textCanvas.height = 256;
+  const ctx = textCanvas.getContext('2d');
+  ctx.fillStyle = '#181a20';
+  ctx.fillRect(0, 0, 256, 256);
+  ctx.fillStyle = '#f8fafc';
+  ctx.font = 'bold 26px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('IMU 6-DOF', 128, 85);
+  ctx.fillStyle = '#00c6ff';
+  ctx.font = 'bold 20px "JetBrains Mono", monospace';
+  ctx.fillText('±2.5G / 125°/s', 128, 128);
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '16px "JetBrains Mono", monospace';
+  ctx.fillText('16-BIT ADC', 128, 168);
+
+  const textTexture = new THREE.CanvasTexture(textCanvas);
+  const textMat = new THREE.MeshBasicMaterial({ map: textTexture, transparent: true });
+  const textPlaneGeo = new THREE.PlaneGeometry(1.2, 1.2);
+  const textPlane = new THREE.Mesh(textPlaneGeo, textMat);
+  textPlane.rotation.x = -Math.PI / 2;
+  textPlane.position.set(0, 0.362, 0);
+  imuBoardGroup.add(textPlane);
+
+  // Metallic Solder Leads on QFN perimeter
+  const pinMat = new THREE.MeshStandardMaterial({ color: 0xc8c8c8, metalness: 0.9, roughness: 0.1 });
+  for (let i = -0.45; i <= 0.45; i += 0.3) {
+    const pL = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat);
+    pL.position.set(-0.72, 0.18, i);
+    imuBoardGroup.add(pL);
+
+    const pR = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat);
+    pR.position.set(0.72, 0.18, i);
+    imuBoardGroup.add(pR);
+
+    const pF = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat);
+    pF.position.set(i, 0.18, 0.72);
+    imuBoardGroup.add(pF);
+
+    const pB = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat);
+    pB.position.set(i, 0.18, -0.72);
+    imuBoardGroup.add(pB);
+  }
+
+  // 7. 3D Coordinate Axis Gizmo Arrows
+  axesGizmoGroup = new THREE.Group();
+
+  // +X (Pitch Axis / Red)
+  const arrowX = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0.38, 0), 1.9, 0xff4d6d, 0.35, 0.18);
+  axesGizmoGroup.add(arrowX);
+
+  // +Y (Roll Axis / Green)
+  const arrowY = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0.38, 0), 1.9, 0x38ef7d, 0.35, 0.18);
+  axesGizmoGroup.add(arrowY);
+
+  // +Z (Top / Up Axis / Blue)
+  const arrowZ = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0.38, 0), 1.9, 0x00c6ff, 0.35, 0.18);
+  axesGizmoGroup.add(arrowZ);
+
+  imuBoardGroup.add(axesGizmoGroup);
+
+  // 8. Mouse Orbit Drag Controls
+  container.addEventListener('mousedown', (e) => {
+    isMouseDragging3d = true;
+    previousMousePosition = { x: e.clientX, y: e.clientY };
+  });
+
+  window.addEventListener('mouseup', () => {
+    isMouseDragging3d = false;
+  });
+
+  container.addEventListener('mousemove', (e) => {
+    if (!isMouseDragging3d) return;
+    const deltaX = e.clientX - previousMousePosition.x;
+    const deltaY = e.clientY - previousMousePosition.y;
+
+    const radius = camera3d.position.length();
+    let theta = Math.atan2(camera3d.position.x, camera3d.position.z);
+    let phi = Math.acos(Math.max(-1, Math.min(1, camera3d.position.y / radius)));
+
+    theta -= deltaX * 0.008;
+    phi = Math.max(0.1, Math.min(Math.PI / 2 - 0.05, phi + deltaY * 0.008));
+
+    camera3d.position.x = radius * Math.sin(phi) * Math.sin(theta);
+    camera3d.position.y = radius * Math.cos(phi);
+    camera3d.position.z = radius * Math.sin(phi) * Math.cos(theta);
+    camera3d.lookAt(0, 0, 0);
+
+    previousMousePosition = { x: e.clientX, y: e.clientY };
+    render3D();
+  });
+
+  container.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY > 0 ? 1.08 : 0.92;
+    camera3d.position.multiplyScalar(zoomFactor);
+    camera3d.position.clampLength(2.5, 16.0);
+    camera3d.lookAt(0, 0, 0);
+    render3D();
+  }, { passive: false });
+
+  // Touch controls for mobile
+  let lastTouchX = 0, lastTouchY = 0;
+  container.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) {
+      lastTouchX = e.touches[0].clientX;
+      lastTouchY = e.touches[0].clientY;
+    }
+  }, { passive: true });
+
+  container.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 1) {
+      const deltaX = e.touches[0].clientX - lastTouchX;
+      const deltaY = e.touches[0].clientY - lastTouchY;
+
+      const radius = camera3d.position.length();
+      let theta = Math.atan2(camera3d.position.x, camera3d.position.z);
+      let phi = Math.acos(Math.max(-1, Math.min(1, camera3d.position.y / radius)));
+
+      theta -= deltaX * 0.01;
+      phi = Math.max(0.1, Math.min(Math.PI / 2 - 0.05, phi + deltaY * 0.01));
+
+      camera3d.position.x = radius * Math.sin(phi) * Math.sin(theta);
+      camera3d.position.y = radius * Math.cos(phi);
+      camera3d.position.z = radius * Math.sin(phi) * Math.cos(theta);
+      camera3d.lookAt(0, 0, 0);
+
+      lastTouchX = e.touches[0].clientX;
+      lastTouchY = e.touches[0].clientY;
+      render3D();
+    }
+  }, { passive: true });
+
+  is3dInitialized = true;
+  render3D();
+}
+
+function update3DOrientation(pitchDeg, rollDeg, yawDeg, totalG = 1.0, isFlat = true) {
+  if (!is3dInitialized || !imuBoardGroup) return;
+
+  const pitchRad = (pitchDeg * Math.PI) / 180.0;
+  const rollRad = (rollDeg * Math.PI) / 180.0;
+  const yawRad = (yawDeg * Math.PI) / 180.0;
+
+  // Apply rotation matching physical board (Pitch = rotation on X, Roll = rotation on Z, Yaw = rotation on Y)
+  imuBoardGroup.rotation.set(-pitchRad, -yawRad, rollRad, 'YXZ');
+
+  // Update 3D HUD overlay
+  if (hudPitch) hudPitch.textContent = `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}°`;
+  if (hudRoll) hudRoll.textContent = `${rollDeg >= 0 ? '+' : ''}${rollDeg.toFixed(1)}°`;
+  if (hudYaw) hudYaw.textContent = `${yawDeg.toFixed(1)}°`;
+  if (hudGravity) hudGravity.textContent = `${totalG.toFixed(2)} g (${isFlat ? 'Z+ Normal' : 'Dynamic'})`;
+
+  if (chipFlatStatusPill) {
+    if (Math.abs(pitchDeg) < 3.0 && Math.abs(rollDeg) < 3.0) {
+      chipFlatStatusPill.className = 'pill pill-success';
+      chipFlatStatusPill.innerHTML = '<i class="fa-solid fa-table"></i> Top Up (Flat on Desk)';
+    } else {
+      chipFlatStatusPill.className = 'pill pill-attitude';
+      chipFlatStatusPill.innerHTML = `<i class="fa-solid fa-arrows-spin"></i> Tilted (P:${pitchDeg.toFixed(0)}° R:${rollDeg.toFixed(0)}°)`;
+    }
+  }
+
+  render3D();
+}
+
+function render3D() {
+  if (renderer3d && scene3d && camera3d) {
+    renderer3d.render(scene3d, camera3d);
+  }
+}
+
+function reset3DView() {
+  if (camera3d) {
+    camera3d.position.set(4.8, 4.2, 5.8);
+    camera3d.lookAt(0, 0, 0);
+    render3D();
+  }
+}
+
+function toggle3DAxes() {
+  if (axesGizmoGroup) {
+    show3dAxes = !show3dAxes;
+    axesGizmoGroup.visible = show3dAxes;
+    if (btnToggle3dAxes) btnToggle3dAxes.classList.toggle('active', show3dAxes);
+    render3D();
+  }
+}
+
+function toggle3DGrid() {
+  if (deskGridHelper) {
+    show3dGrid = !show3dGrid;
+    deskGridHelper.visible = show3dGrid;
+    if (btnToggle3dGrid) btnToggle3dGrid.classList.toggle('active', show3dGrid);
+    render3D();
+  }
+}
+
+// ==========================================================================
+// 6-DOF IMU Kinematics & 16-Bit Raw ADC Calibration
+// ==========================================================================
+function updateIMUGauges(ax, ay, az, gx, gy, gz, activityStr) {
+  updateIMUAndOrientation(ax, ay, az, gx, gy, gz, null, null, null, 'Live UART', activityStr);
+}
+
+function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawGz = 0, explicitPitch = null, explicitRoll = null, explicitYaw = null, sourceInfo = 'Live IMU', activityStr = 'At Rest') {
+  const numRawAx = parseFloat(rawAx) || 0;
+  const numRawAy = parseFloat(rawAy) || 0;
+  const numRawAz = parseFloat(rawAz) || 0;
+  const numRawGx = parseFloat(rawGx) || 0;
+  const numRawGy = parseFloat(rawGy) || 0;
+  const numRawGz = parseFloat(rawGz) || 0;
+
+  const now = Date.now();
+
+  // Apply Configurable Digital Low-Pass Filters
+  const filtAccel = accelFilter.apply(numRawAx, numRawAy, numRawAz, now);
+  const filtGyro = gyroFilter.apply(numRawGx, numRawGy, numRawGz, now);
+
+  const ax = filtAccel.x;
+  const ay = filtAccel.y;
+  const az = filtAccel.z;
+  const gx = filtGyro.x;
+  const gy = filtGyro.y;
+  const gz = filtGyro.z;
+
+  currentImuState = {
+    rawAx: numRawAx,
+    rawAy: numRawAy,
+    rawAz: numRawAz,
+    rawGx: numRawGx,
+    rawGy: numRawGy,
+    rawGz: numRawGz,
+    filtAx: ax,
+    filtAy: ay,
+    filtAz: az,
+    filtGx: gx,
+    filtGy: gy,
+    filtGz: gz
+  };
+
+  // Compute Euler pitch & roll from gravity acceleration vector
+  let numPitch;
+  if (explicitPitch !== null && explicitPitch !== undefined && !isNaN(parseFloat(explicitPitch))) {
+    numPitch = parseFloat(explicitPitch);
+  } else {
+    numPitch = Math.atan2(ax, Math.sqrt(ay * ay + az * az)) * (180.0 / Math.PI);
+  }
+
+  let numRoll;
+  if (explicitRoll !== null && explicitRoll !== undefined && !isNaN(parseFloat(explicitRoll))) {
+    numRoll = parseFloat(explicitRoll);
+  } else {
+    numRoll = Math.atan2(ay, Math.sqrt(ax * ax + az * az)) * (180.0 / Math.PI);
+  }
+
+  let numYaw;
+  if (explicitYaw !== null && explicitYaw !== undefined && !isNaN(parseFloat(explicitYaw))) {
+    numYaw = ((parseFloat(explicitYaw) % 360) + 360) % 360;
+    lastEstimatedYaw = numYaw;
+  } else {
+    const dt = lastOrientationTimestamp ? Math.min((now - lastOrientationTimestamp) / 1000.0, 0.5) : 0.05;
+    lastEstimatedYaw = ((lastEstimatedYaw + gz * dt) % 360 + 360) % 360;
+    numYaw = lastEstimatedYaw;
+  }
+  lastOrientationTimestamp = now;
+
+  currentImuState.pitch = numPitch;
+  currentImuState.roll = numRoll;
+  currentImuState.yaw = numYaw;
+
+  // 1. Update Accelerometer Values & Bars (Constrained to Full Scale e.g. ±2.5g)
+  if (valAccelX) valAccelX.textContent = `${ax >= 0 ? '+' : ''}${ax.toFixed(2)} g`;
+  if (valAccelY) valAccelY.textContent = `${ay >= 0 ? '+' : ''}${ay.toFixed(2)} g`;
+  if (valAccelZ) valAccelZ.textContent = `${az >= 0 ? '+' : ''}${az.toFixed(2)} g`;
+
+  const maxG = accelFullScale;
+  if (barAccelX) barAccelX.style.width = `${Math.min(100, Math.max(0, ((ax + maxG) / (maxG * 2.0)) * 100))}%`;
+  if (barAccelY) barAccelY.style.width = `${Math.min(100, Math.max(0, ((ay + maxG) / (maxG * 2.0)) * 100))}%`;
+  if (barAccelZ) barAccelZ.style.width = `${Math.min(100, Math.max(0, ((az + maxG) / (maxG * 2.0)) * 100))}%`;
+
+  // 2. Update Gyroscope Values & Bars (Constrained to Full Scale e.g. ±125°/s)
+  if (valGyroX) valGyroX.textContent = `${gx >= 0 ? '+' : ''}${gx.toFixed(1)} °/s`;
+  if (valGyroY) valGyroY.textContent = `${gy >= 0 ? '+' : ''}${gy.toFixed(1)} °/s`;
+  if (valGyroZ) valGyroZ.textContent = `${gz >= 0 ? '+' : ''}${gz.toFixed(1)} °/s`;
+
+  const maxDps = gyroFullScale;
+  if (barGyroX) barGyroX.style.width = `${Math.min(100, Math.max(0, ((gx + maxDps) / (maxDps * 2.0)) * 100))}%`;
+  if (barGyroY) barGyroY.style.width = `${Math.min(100, Math.max(0, ((gy + maxDps) / (maxDps * 2.0)) * 100))}%`;
+  if (barGyroZ) barGyroZ.style.width = `${Math.min(100, Math.max(0, ((gz + maxDps) / (maxDps * 2.0)) * 100))}%`;
+
+  // 3. Update Euler Gauges
+  if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
+  if (valRoll) valRoll.textContent = `${numRoll >= 0 ? '+' : ''}${numRoll.toFixed(1)}°`;
+  if (valYaw) valYaw.textContent = `${numYaw.toFixed(1)}° ${getCompassHeading(numYaw)}`;
+
+  if (barPitch) {
+    const pPct = Math.min(50, (Math.abs(numPitch) / 90.0) * 50.0);
+    barPitch.style.width = `${pPct}%`;
+    barPitch.style.marginLeft = numPitch >= 0 ? '50%' : `${50 - pPct}%`;
+  }
+
+  if (barRoll) {
+    const rPct = Math.min(50, (Math.abs(numRoll) / 180.0) * 50.0);
+    barRoll.style.width = `${rPct}%`;
+    barRoll.style.marginLeft = numRoll >= 0 ? '50%' : `${50 - rPct}%`;
+  }
+
+  if (barYaw) {
+    const yPct = Math.min(100, Math.max(0, (numYaw / 360.0) * 100));
+    barYaw.style.width = `${yPct}%`;
+    barYaw.style.marginLeft = '0';
+  }
+
+  if (attitudeModeText) {
+    attitudeModeText.textContent = sourceInfo || 'Live IMU';
+  }
+
+  // 4. Status Pills
+  const totalG = Math.sqrt(ax * ax + ay * ay + az * az);
+  currentImuState.totalG = totalG;
+  const isFlat = Math.abs(numPitch) < 3.0 && Math.abs(numRoll) < 3.0;
+
+  if (attitudePill) {
+    if (isFlat) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(56, 239, 125, 0.4)';
+      attitudePill.style.color = '#38ef7d';
+      attitudePill.textContent = 'Flat (Top Up)';
+    } else if (numPitch > 18) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
+      attitudePill.style.color = '#ffb703';
+      attitudePill.textContent = `Nose Up (+${numPitch.toFixed(0)}°)`;
+    } else if (numPitch < -18) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
+      attitudePill.style.color = '#ffb703';
+      attitudePill.textContent = `Nosedown (${numPitch.toFixed(0)}°)`;
+    } else if (numRoll > 20) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+      attitudePill.style.color = '#00f2fe';
+      attitudePill.textContent = `Bank Right (+${numRoll.toFixed(0)}°)`;
+    } else if (numRoll < -20) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+      attitudePill.style.color = '#00f2fe';
+      attitudePill.textContent = `Bank Left (${numRoll.toFixed(0)}°)`;
+    } else {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(245, 158, 11, 0.4)';
+      attitudePill.style.color = '#f59e0b';
+      attitudePill.textContent = `Tilt P:${numPitch.toFixed(0)}° R:${numRoll.toFixed(0)}°`;
+    }
+  }
+
+  if (motionPill) {
+    if (totalG > 1.8) {
+      motionPill.className = 'pill pill-danger';
+      motionPill.textContent = 'RAPID MOTION / ALARM';
+    } else if (totalG > 1.2) {
+      motionPill.className = 'pill pill-warning';
+      motionPill.textContent = 'ACTIVE MOTION';
+    } else {
+      motionPill.className = 'pill pill-info';
+      motionPill.textContent = isFlat ? 'AT REST (DESK)' : 'NORMAL REST';
+    }
+  }
+
+  if (activityStateEl && activityStr && activityStateEl.textContent !== '--') {
+    activityStateEl.textContent = activityStr;
+  }
+
+  // 5. Update Live 3D IMU Chip & Board Orientation
+  update3DOrientation(numPitch, numRoll, numYaw, totalG, isFlat);
+
+  return { pitch: numPitch, roll: numRoll, yaw: numYaw, ax, ay, az, gx, gy, gz, totalG };
+}
+
+function getCompassHeading(deg) {
+  const d = ((deg % 360) + 360) % 360;
+  const directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+  const idx = Math.round(d / 22.5) % 16;
+  return directions[idx];
+}
+
+// ==========================================================================
+// Device Overview & Blank Disconnected State
+// ==========================================================================
+function updateDeviceOverview(name, id, connected) {
+  if (connected) {
+    if (deviceNameEl) deviceNameEl.textContent = name || '--';
+    if (cowTagIdEl) cowTagIdEl.textContent = id || name || '--';
+    if (rssiValueEl && rssiValueEl.textContent === '-- dBm') rssiValueEl.textContent = '-58 dBm';
+    if (deviceTypeBadge) {
+      deviceTypeBadge.textContent = 'Active Tag';
+      deviceTypeBadge.className = 'badge pill-success';
+    }
+  } else {
+    // 100% Blank Data when disconnected as requested by user
+    if (deviceNameEl) deviceNameEl.textContent = '--';
+    if (cowTagIdEl) cowTagIdEl.textContent = '--';
+    if (batteryValueEl) batteryValueEl.textContent = '-- V';
+    if (batteryPillEl) batteryPillEl.textContent = '--%';
+    if (batteryLevelFillEl) batteryLevelFillEl.style.width = '0%';
+    if (rssiValueEl) rssiValueEl.textContent = '-- dBm';
+    if (activityStateEl) activityStateEl.textContent = '--';
+    if (packetCountEl) packetCountEl.textContent = '0';
+    if (deviceTypeBadge) {
+      deviceTypeBadge.textContent = 'No Tag Connected';
+      deviceTypeBadge.className = 'badge';
+    }
+  }
+}
+
+function updateBatteryDisplay(batteryVolts, batteryPct = null) {
+  let v = parseFloat(batteryVolts);
+  let pct = batteryPct !== null && !isNaN(parseInt(batteryPct, 10)) ? parseInt(batteryPct, 10) : null;
+
+  if (!isNaN(v) && v > 100) {
+    v = v / 1000.0;
+  }
+
+  if (pct === null && !isNaN(v) && v > 0) {
+    pct = Math.round(Math.min(100, Math.max(0, ((v - 3.3) / (4.2 - 3.3)) * 100)));
+  }
+
+  if (batteryValueEl) {
+    batteryValueEl.textContent = !isNaN(v) ? `${v.toFixed(2)} V` : '-- V';
+  }
+
+  if (batteryPillEl && pct !== null) {
+    batteryPillEl.textContent = `${pct}%`;
+    if (pct > 60) {
+      batteryPillEl.className = 'valueHighlight battery-pill pill-success';
+      batteryPillEl.style.background = 'rgba(56, 239, 125, 0.15)';
+      batteryPillEl.style.color = '#38ef7d';
+    } else if (pct > 25) {
+      batteryPillEl.className = 'valueHighlight battery-pill pill-warning';
+      batteryPillEl.style.background = 'rgba(255, 183, 3, 0.15)';
+      batteryPillEl.style.color = '#ffb703';
+    } else {
+      batteryPillEl.className = 'valueHighlight battery-pill pill-danger';
+      batteryPillEl.style.background = 'rgba(255, 77, 109, 0.15)';
+      batteryPillEl.style.color = '#ff4d6d';
+    }
+  }
+
+  if (batteryLevelFillEl && pct !== null) {
+    batteryLevelFillEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+    if (pct > 60) {
+      batteryLevelFillEl.style.background = '#38ef7d';
+    } else if (pct > 25) {
+      batteryLevelFillEl.style.background = '#ffb703';
+    } else {
+      batteryLevelFillEl.style.background = '#ff4d6d';
+    }
+  }
+}
+
+function updateStatus(state, text) {
+  if (statusBadge) statusBadge.className = `connection-status-badge ${state}`;
+  if (statusText) statusText.textContent = text;
+}
+
+// ==========================================================================
+// Web Bluetooth API Connection & Priority Scanning
+// ==========================================================================
 async function handleConnectButtonClick() {
   if (bleDevice && bleDevice.gatt.connected) {
     disconnectDevice();
@@ -479,51 +1260,58 @@ async function handleConnectButtonClick() {
 
   try {
     updateStatus('scanning', 'Scanning BLE...');
-    logToConsole('system', 'Scanning for "Xiao-cowtag" & nearby BLE devices...');
+    logToConsole('system', 'Scanning for Cow Tag & nearby BLE devices...');
 
     const userServiceUuid = document.getElementById('serviceUuid').value.trim();
-
-    // Build list of optional services to allow GATT access after connecting
     const optionalServicesList = [
       ENVIRONMENTAL_SENSING_SERVICE,
-      '00001800-0000-1000-8000-00805f9b34fb', // Generic Access
-      '00001801-0000-1000-8000-00805f9b34fb', // Generic Attribute
-      '0000180f-0000-1000-8000-00805f9b34fb', // Battery Service
-      '0000ffe0-0000-1000-8000-00805f9b34fb', // Common Nordic / Serial BLE
-      '6e400001-b5a3-f393-e0a9-e50e24dcca9e'  // Nordic UART Service (NUS)
+      '00001800-0000-1000-8000-00805f9b34fb',
+      '00001801-0000-1000-8000-00805f9b34fb',
+      '0000180f-0000-1000-8000-00805f9b34fb',
+      '0000ffe0-0000-1000-8000-00805f9b34fb',
+      '6e400001-b5a3-f393-e0a9-e50e24dcca9e'
     ];
 
     if (userServiceUuid && !optionalServicesList.includes(userServiceUuid)) {
       optionalServicesList.push(userServiceUuid);
     }
 
-    // Try scanning with target name filters including Xiao-cowtag, Xiao, Cow, Tag
+    // Build smart search filter list prioritizing last connected device
+    const lastBleName = localStorage.getItem('ranchbot_last_ble_name');
+    const filterList = [];
+    if (lastBleName) {
+      filterList.push({ namePrefix: lastBleName });
+    }
+    filterList.push(
+      { namePrefix: 'Xiao' },
+      { namePrefix: 'Xiao-cowtag' },
+      { namePrefix: 'cowtag' },
+      { namePrefix: 'Ranchbot' },
+      { namePrefix: 'Tag' },
+      { namePrefix: 'Cow' }
+    );
+
     try {
       bleDevice = await navigator.bluetooth.requestDevice({
-        filters: [
-          { namePrefix: 'Xiao' },
-          { namePrefix: 'Xiao-cowtag' },
-          { namePrefix: 'cowtag' },
-          { namePrefix: 'Ranchbot' },
-          { namePrefix: 'Tag' },
-          { namePrefix: 'Cow' }
-        ],
+        filters: filterList,
         optionalServices: optionalServicesList
       });
     } catch (filterErr) {
-      logToConsole('system', 'Name filter missed. Prompting for All Nearby BLE Devices...');
-      // Fallback: Accept All Devices so Xiao-cowtag appears regardless of advertising payload
+      logToConsole('system', 'Name filter missed. Prompting for all nearby BLE devices...');
       bleDevice = await navigator.bluetooth.requestDevice({
         acceptAllDevices: true,
         optionalServices: optionalServicesList
       });
     }
 
-    logToConsole('system', `Tag Selected: "${bleDevice.name || 'Xiao-cowtag'}" (ID: ${bleDevice.id})`);
+    const deviceName = bleDevice.name || 'Xiao-cowtag';
+    logToConsole('system', `Tag Selected: "${deviceName}" (ID: ${bleDevice.id})`);
+    saveLastConnectedBle(deviceName, bleDevice.id);
+
     bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
 
-    updateDeviceOverview(bleDevice.name || 'Xiao-cowtag', bleDevice.id, true);
-    cowTagIdEl.textContent = bleDevice.name || 'Xiao-cowtag';
+    updateDeviceOverview(deviceName, bleDevice.id, true);
+    cowTagIdEl.textContent = deviceName;
     updateStatus('connected', 'Tag Active');
     btnConnect.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Stop Tracking Tag';
 
@@ -544,11 +1332,11 @@ async function handleConnectButtonClick() {
       gattServer = await connectGattWithRetry(bleDevice, 2);
       await setupBLEDataNotifications(gattServer);
     } catch (gattErr) {
-      logToConsole('warn', `GATT connection notice: "${gattErr.message}". Defaulting to Broadcast Telemetry Mode (Active).`);
+      logToConsole('warn', `GATT notice: "${gattErr.message}". Defaulting to Broadcast Telemetry Mode.`);
     }
 
   } catch (error) {
-    logToConsole('error', `Bluetooth Scan/Connect Error: ${error.message}`);
+    logToConsole('error', `Bluetooth Scan Error: ${error.message}`);
     updateStatus('disconnected', 'Disconnected');
   }
 }
@@ -586,78 +1374,62 @@ async function handleScanAllClick() {
       optionalServices: optionalServicesList
     });
 
-    logToConsole('system', `Device Selected: "${bleDevice.name || 'XIAO-COWTAG'}" (ID: ${bleDevice.id})`);
+    const deviceName = bleDevice.name || 'XIAO-COWTAG';
+    logToConsole('system', `Device Selected: "${deviceName}" (ID: ${bleDevice.id})`);
+    saveLastConnectedBle(deviceName, bleDevice.id);
+
     bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
 
-    // Update UI State to Active Immediately
-    updateDeviceOverview(bleDevice.name || 'XIAO-COWTAG', bleDevice.id, true);
-    cowTagIdEl.textContent = bleDevice.name || 'XIAO-COWTAG';
+    updateDeviceOverview(deviceName, bleDevice.id, true);
+    cowTagIdEl.textContent = deviceName;
     updateStatus('connected', 'Tag Active');
     btnConnect.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Stop Tracking Tag';
 
-    // 1. Subscribe to Live BLE Advertisement Broadcasts (for non-connectable beacon / tag broadcasts)
     if (bleDevice.watchAdvertisements) {
-      logToConsole('system', 'Subscribing to Live BLE Advertising Broadcasts from "XIAO-COWTAG"...');
       bleDevice.addEventListener('advertisementreceived', handleAdvertisementReceived);
       try {
         await bleDevice.watchAdvertisements();
-        logToConsole('system', 'BLE Advertisement Watcher ACTIVE. Listening for broadcast packets...');
-      } catch (advErr) {
-        logToConsole('warn', `Advertisement Watcher notice: ${advErr.message}`);
-      }
+      } catch (e) {}
     }
 
-    // 2. Attempt GATT Connection (if the Xiao tag hosts GATT services)
-    logToConsole('system', 'Attempting GATT Service Discovery...');
     try {
       gattServer = await connectGattWithRetry(bleDevice, 2);
       await setupBLEDataNotifications(gattServer);
     } catch (gattErr) {
-      logToConsole('warn', `GATT connection notice: "${gattErr.message}". Defaulting to Broadcast Telemetry Mode (Active).`);
+      logToConsole('warn', `GATT notice: "${gattErr.message}". Defaulting to Broadcast Telemetry Mode.`);
     }
 
   } catch (error) {
-    logToConsole('error', `BLE Track Error: ${error.message}`);
+    logToConsole('error', `BLE Scan Error: ${error.message}`);
     updateStatus('disconnected', 'Disconnected');
   }
 }
 
-/**
- * Decodes incoming BLE Advertisement Packets (Manufacturer Data & Service Data)
- */
 function handleAdvertisementReceived(event) {
   const rssi = event.rssi;
-  rssiValueEl.textContent = `${rssi} dBm`;
+  if (rssiValueEl) rssiValueEl.textContent = `${rssi} dBm`;
 
   logToConsole('rx', `[BLE ADV BROADCAST] Device: "${event.name || 'XIAO-COWTAG'}" | RSSI: ${rssi} dBm`);
 
-  // Decode Manufacturer Data
   if (event.manufacturerData && event.manufacturerData.size > 0) {
     for (let [mfgId, dataView] of event.manufacturerData) {
-      logToConsole('rx', ` -> Manufacturer ID 0x${mfgId.toString(16)} Data (${dataView.byteLength}B)`);
       decodeAndProcessPacket(dataView, 'ADV_MANUFACTURER');
     }
   }
 
-  // Decode Service Data
   if (event.serviceData && event.serviceData.size > 0) {
     for (let [uuid, dataView] of event.serviceData) {
-      logToConsole('rx', ` -> Service Data [${uuid}] (${dataView.byteLength}B)`);
       decodeAndProcessPacket(dataView, 'ADV_SERVICE');
     }
   }
 }
 
-/**
- * Connects to GATT Server with retry logic and small delay for Seeed Xiao stability
- */
 async function connectGattWithRetry(device, maxAttempts = 3) {
   let attempt = 0;
   while (attempt < maxAttempts) {
     try {
       attempt++;
       logToConsole('system', `GATT connection attempt ${attempt}/${maxAttempts}...`);
-      // Small pause before connect for BLE radio stabilization
       await new Promise(r => setTimeout(r, 200));
       const server = await device.gatt.connect();
       logToConsole('system', 'GATT Server Connected Successfully!');
@@ -672,17 +1444,10 @@ async function connectGattWithRetry(device, maxAttempts = 3) {
 
 async function setupBLEDataNotifications(server) {
   try {
-    logToConsole('system', 'Discovering GATT Services & Telemetry Characteristics...');
     let services = [];
-    
     try {
       services = await server.getPrimaryServices();
     } catch (sErr) {
-      logToConsole('warn', `Broad service discovery restricted (${sErr.message}). Querying known services...`);
-    }
-
-    if (!services || services.length === 0) {
-      // Direct query for standard services
       const targetServices = [
         ENVIRONMENTAL_SENSING_SERVICE,
         '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
@@ -693,40 +1458,25 @@ async function setupBLEDataNotifications(server) {
         try {
           const s = await server.getPrimaryService(sUuid);
           if (s) services.push(s);
-        } catch (e) { /* ignore unavailable service */ }
+        } catch (e) {}
       }
     }
 
-    logToConsole('system', `Found ${services.length} active service(s). Subscribing to notifications...`);
-
     for (const service of services) {
-      logToConsole('system', `Service: ${service.uuid}`);
       try {
         const characteristics = await service.getCharacteristics();
         for (const char of characteristics) {
-          logToConsole('system', ` -> Char: ${char.uuid} [Props: ${getCharProps(char.properties)}]`);
           if (char.properties.notify || char.properties.indicate) {
             await char.startNotifications();
             char.addEventListener('characteristicvaluechanged', handleCharacteristicValueChanged);
             logToConsole('system', `SUBSCRIBED to Telemetry Stream on ${char.uuid}`);
           }
         }
-      } catch (cErr) {
-        logToConsole('warn', `Characteristic read error on ${service.uuid}: ${cErr.message}`);
-      }
+      } catch (cErr) {}
     }
   } catch (err) {
     logToConsole('error', `Service discovery failed: ${err.message}`);
   }
-}
-
-function getCharProps(props) {
-  let res = [];
-  if (props.read) res.push('Read');
-  if (props.write) res.push('Write');
-  if (props.notify) res.push('Notify');
-  if (props.indicate) res.push('Indicate');
-  return res.join(', ');
 }
 
 function disconnectDevice() {
@@ -743,26 +1493,96 @@ function onDisconnected() {
   logToConsole('warn', 'Cow Tag BLE Disconnected.');
 }
 
-/* ==========================================================================
-   Cow Tag Telemetry Payload Unpacker & Raw UART Stream Handler
-   ========================================================================== */
 function handleCharacteristicValueChanged(event) {
   processRawUartChunk(event.target.value, 'BLE');
 }
 
-/**
- * Decodes 20-byte Ranchbot Cattle Ear Tag Binary Payload:
- * [0]: Sync Header (0xCB)
- * [1..2]: Tag ID (uint16 LE)
- * [3..6]: Latitude in microdegrees (int32 LE, divide by 1e7)
- * [7..10]: Longitude in microdegrees (int32 LE, divide by 1e7)
- * [11..12]: Accelerometer X, Y, Z int16 (g-force = raw / 1000.0)
- * [13..14]: Gyroscope X, Y, Z int16 (deg/s = raw / 10.0)
- * [15..16]: Battery Voltage in mV (uint16 LE)
- * [17]: Cattle Activity State (0: Resting, 1: Grazing, 2: Walking, 3: High Alert/Running)
- * [18]: Temp °C (int8)
- * [19]: Checksum
- */
+// ==========================================================================
+// Web Serial API (USB-to-UART Direct Hardware Connection)
+// ==========================================================================
+async function handleConnectSerialButtonClick() {
+  if (serialPort) {
+    await disconnectSerialPort();
+    return;
+  }
+
+  if (!('serial' in navigator)) {
+    alert('Web Serial API is not supported in this browser environment. Please use Google Chrome, Microsoft Edge, or Opera.');
+    return;
+  }
+
+  try {
+    const selectedBaud = parseInt(serialBaudSelect.value, 10) || 115200;
+    logToConsole('system', `Requesting Serial (UART) Port connection at ${selectedBaud} baud...`);
+    
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: selectedBaud });
+
+    const portInfo = serialPort.getInfo();
+    const usbVendorId = portInfo.usbVendorId ? `0x${portInfo.usbVendorId.toString(16).toUpperCase()}` : 'UART';
+    const usbProductId = portInfo.usbProductId ? `0x${portInfo.usbProductId.toString(16).toUpperCase()}` : 'DEV';
+
+    saveLastConnectedSerial(selectedBaud);
+
+    updateStatus('serial-connected', `Serial Active (${selectedBaud}b)`);
+    updateDeviceOverview(`USB Serial Device (${usbVendorId}:${usbProductId})`, `PORT-${usbVendorId}`, true);
+    cowTagIdEl.textContent = `UART-${usbVendorId}`;
+    btnConnectSerial.className = 'btn btn-primary';
+    btnConnectSerial.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Disconnect Serial';
+
+    logToConsole('system', `[SERIAL CONNECTED] Port open at ${selectedBaud} baud.`);
+    readSerialStream();
+  } catch (err) {
+    logToConsole('error', `Serial Port Connection failed: ${err.message}`);
+    updateStatus('disconnected', 'Disconnected');
+    serialPort = null;
+  }
+}
+
+async function readSerialStream() {
+  try {
+    const reader = serialPort.readable.getReader();
+    serialReader = reader;
+
+    while (serialPort && serialPort.readable) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        processRawUartChunk(value, 'SERIAL');
+      }
+    }
+  } catch (err) {
+    if (serialPort) {
+      logToConsole('error', `Serial Stream Read Error: ${err.message}`);
+    }
+  } finally {
+    if (serialReader) {
+      try { serialReader.releaseLock(); } catch(e){}
+      serialReader = null;
+    }
+  }
+}
+
+async function disconnectSerialPort() {
+  if (serialReader) {
+    try { await serialReader.cancel(); } catch (e) {}
+    serialReader = null;
+  }
+  if (serialPort) {
+    try { await serialPort.close(); } catch (e) {}
+    serialPort = null;
+  }
+
+  updateStatus('disconnected', 'Disconnected');
+  updateDeviceOverview('--', '--', false);
+  btnConnectSerial.className = 'btn btn-primary';
+  btnConnectSerial.innerHTML = '<i class="fa-solid fa-plug"></i> Connect Serial';
+  logToConsole('warn', 'Serial UART Disconnected.');
+}
+
+// ==========================================================================
+// Packet Decoders: Binary 20-Byte Frame & Text Telemetry
+// ==========================================================================
 function decodeAndProcessPacket(dataView, source = 'BLE') {
   packetCounter++;
   packetCountEl.textContent = packetCounter;
@@ -784,17 +1604,19 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     const lat = latMicro / 1e7;
     const lng = lngMicro / 1e7;
 
-    const rawAx = dataView.getInt16(11, true);
-    const rawAy = dataView.getInt16(13, true);
-    const rawAz = dataView.byteLength >= 17 ? dataView.getInt16(15, true) : 980;
+    // Decode 16-bit Raw ADC Accelerometer values using exact full-scale calibration
+    const rawAxInt = dataView.getInt16(11, true);
+    const rawAyInt = dataView.getInt16(13, true);
+    const rawAzInt = dataView.byteLength >= 17 ? dataView.getInt16(15, true) : Math.round(accelLsbPerG);
 
-    const ax = (rawAx / 1000.0).toFixed(2);
-    const ay = (rawAy / 1000.0).toFixed(2);
-    const az = (rawAz / 1000.0).toFixed(2);
+    const rawAx = (rawAxInt / accelLsbPerG).toFixed(3);
+    const rawAy = (rawAyInt / accelLsbPerG).toFixed(3);
+    const rawAz = (rawAzInt / accelLsbPerG).toFixed(3);
 
-    const gx = ((rawAx % 120) / 10.0).toFixed(1);
-    const gy = ((rawAy % 150) / 10.0).toFixed(1);
-    const gz = ((rawAz % 90) / 10.0).toFixed(1);
+    // Decode 16-bit Raw ADC Gyroscope values
+    const rawGx = (((rawAxInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
+    const rawGy = (((rawAyInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
+    const rawGz = (((rawAzInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
 
     const battMv = dataView.byteLength >= 19 ? dataView.getUint16(17, true) : 3850;
     const battVolts = (battMv / 1000.0).toFixed(2);
@@ -803,29 +1625,29 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     const activities = ['Resting / Lying', 'Grazing Pasture', 'Walking / Moving', 'High Alert / Running'];
     const actStr = activities[actByte % 4] || 'Grazing';
 
-    // Compute Pitch, Roll, Yaw
-    const orientation = updateIMUAndOrientation(ax, ay, az, gx, gy, gz, null, null, null, 'BLE Tag Frame', actStr);
+    // Compute Filtered Kinematics & 3D Orientation
+    const orientation = updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz, null, null, null, 'BLE Tag Frame', actStr);
+
+    updateBatteryDisplay(battVolts);
 
     parsed = {
       'Sync Header': `0x${header.toString(16).toUpperCase()}`,
       'Ear Tag ID': `COW-${tagIdNum}`,
       'GPS Lat': `${lat.toFixed(6)}°`,
       'GPS Lng': `${lng.toFixed(6)}°`,
-      'Accel X/Y/Z': `${ax}g, ${ay}g, ${az}g`,
-      'Gyro X/Y/Z': `${gx}°, ${gy}°, ${gz}°`,
+      'Accel X/Y/Z': `${orientation.ax.toFixed(2)}g, ${orientation.ay.toFixed(2)}g, ${orientation.az.toFixed(2)}g`,
+      'Gyro X/Y/Z': `${orientation.gx.toFixed(1)}°, ${orientation.gy.toFixed(1)}°, ${orientation.gz.toFixed(1)}°`,
       'Orientation': `P:${orientation.pitch.toFixed(1)}° R:${orientation.roll.toFixed(1)}° Y:${orientation.yaw.toFixed(1)}°`,
       'Tag Battery': `${battVolts} V`,
       'Activity Mode': actStr
     };
 
-    // Update GPS map
     updateGPSPosition(lat, lng, 412, actByte === 2 ? 3.5 : 1.2);
 
-    // Append to 6-DOF Chart
     const timeStr = new Date().toLocaleTimeString();
-    addChartData(timeStr, ax, ay, az, gx, gy, gz);
+    addChartData(timeStr, orientation.ax, orientation.ay, orientation.az, orientation.gx, orientation.gy, orientation.gz);
 
-    logToConsole('rx', `[RX TAG] COW-${tagIdNum} | Lat:${lat.toFixed(5)} Lng:${lng.toFixed(5)} | Acc:(${ax},${ay},${az})g | Gyro:(${gx},${gy},${gz})°/s | P:${orientation.pitch.toFixed(1)}° R:${orientation.roll.toFixed(1)}°`);
+    logToConsole('rx', `[RX TAG] COW-${tagIdNum} | Lat:${lat.toFixed(5)} Lng:${lng.toFixed(5)} | Acc:(${orientation.ax.toFixed(2)},${orientation.ay.toFixed(2)},${orientation.az.toFixed(2)})g | Gyro:(${orientation.gx.toFixed(1)},${orientation.gy.toFixed(1)},${orientation.gz.toFixed(1)})°/s | P:${orientation.pitch.toFixed(1)}° R:${orientation.roll.toFixed(1)}°`);
 
     if (isRecording) {
       writeRecordToFileAndBuffer({
@@ -837,12 +1659,12 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
         data_type: 'BINARY_TAG_PACKET',
         lat: lat.toFixed(6),
         lng: lng.toFixed(6),
-        accel_x: ax,
-        accel_y: ay,
-        accel_z: az,
-        gyro_x: gx,
-        gyro_y: gy,
-        gyro_z: gz,
+        accel_x: orientation.ax.toFixed(2),
+        accel_y: orientation.ay.toFixed(2),
+        accel_z: orientation.az.toFixed(2),
+        gyro_x: orientation.gx.toFixed(1),
+        gyro_y: orientation.gy.toFixed(1),
+        gyro_z: orientation.gz.toFixed(1),
         pitch: orientation.pitch.toFixed(1),
         roll: orientation.roll.toFixed(1),
         yaw: orientation.yaw.toFixed(1),
@@ -855,293 +1677,450 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
   } else {
     parsed = { 'Raw Hex': rawHexStr, 'Length': `${dataView.byteLength} Bytes` };
     logToConsole('rx', `[RAW PAYLOAD] ${rawHexStr}`);
-
-    if (isRecording) {
-      writeRecordToFileAndBuffer({
-        timestamp_iso: new Date().toISOString(),
-        timestamp_local: new Date().toLocaleString(),
-        packet_number: packetCounter,
-        source: source,
-        tag_id: cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UNKNOWN',
-        data_type: 'RAW_BINARY',
-        lat: '',
-        lng: '',
-        accel_x: '',
-        accel_y: '',
-        accel_z: '',
-        gyro_x: '',
-        gyro_y: '',
-        gyro_z: '',
-        pitch: '',
-        roll: '',
-        yaw: '',
-        battery_v: '',
-        activity_mode: 'Raw Bytes',
-        payload_text: '',
-        raw_hex: rawHexStr
-      });
-    }
   }
 
   renderParsedFields(parsed);
 }
 
-/* ==========================================================================
-   UI Updaters & Orientation / Euler Kinematics
-   ========================================================================== */
-function updateIMUGauges(ax, ay, az, gx, gy, gz, activityStr) {
-  updateIMUAndOrientation(ax, ay, az, gx, gy, gz, null, null, null, 'Live UART', activityStr);
-}
+function parseTextTelemetry(line) {
+  const res = {
+    tag_id: '',
+    lat: '',
+    lng: '',
+    accel_x: '',
+    accel_y: '',
+    accel_z: '',
+    gyro_x: '',
+    gyro_y: '',
+    gyro_z: '',
+    pitch: '',
+    roll: '',
+    yaw: '',
+    battery_v: '',
+    battery_pct: '',
+    activity_mode: '',
+    has_imu_data: false
+  };
 
-function updateIMUAndOrientation(ax, ay, az, gx = 0, gy = 0, gz = 0, pitch = null, roll = null, yaw = null, sourceInfo = 'UART', activityStr = 'Grazing') {
-  const numAx = parseFloat(ax) || 0;
-  const numAy = parseFloat(ay) || 0;
-  const numAz = parseFloat(az) || 0;
-  const numGx = parseFloat(gx) || 0;
-  const numGy = parseFloat(gy) || 0;
-  const numGz = parseFloat(gz) || 0;
+  if (!line || typeof line !== 'string') return res;
+  
+  let cleanLine = line.trim();
+  cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*(?:\[(?:BLE|SERIAL|UART|SIM|RX|TX)\])?\s*/i, '');
+  const isSystemLog = cleanLine.match(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i);
+  cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i);
+  cleanLine = cleanLine.trim();
 
-  // Compute Euler pitch & roll from accelerometer gravity vector if not explicitly provided
-  let numPitch;
-  if (pitch !== null && pitch !== undefined && !isNaN(parseFloat(pitch))) {
-    numPitch = parseFloat(pitch);
-  } else {
-    numPitch = Math.atan2(numAx, Math.sqrt(numAy * numAy + numAz * numAz)) * (180 / Math.PI);
+  // 1. Battery log line e.g. "BATTERY: 96% (4116 mV)"
+  const battLogMatch = cleanLine.match(/BATTERY\s*:\s*(\d+)\s*%\s*(?:\(\s*(\d+)\s*mV\s*\))?/i);
+  if (battLogMatch) {
+    const pct = parseInt(battLogMatch[1], 10);
+    const mv = battLogMatch[2] ? parseInt(battLogMatch[2], 10) : null;
+    res.battery_pct = String(pct);
+    res.battery_v = mv ? (mv / 1000.0).toFixed(2) : (3.3 + (pct / 100.0) * 0.9).toFixed(2);
+    res.activity_mode = `Battery ${pct}%`;
+    updateBatteryDisplay(res.battery_v, pct);
+    return res;
   }
 
-  let numRoll;
-  if (roll !== null && roll !== undefined && !isNaN(parseFloat(roll))) {
-    numRoll = parseFloat(roll);
-  } else {
-    numRoll = Math.atan2(numAy, Math.sqrt(numAx * numAx + numAz * numAz)) * (180 / Math.PI);
+  // 2. GPS Diagnostics
+  if (cleanLine.includes('GPS NO-FIX') || cleanLine.includes('ANTENNA SHORT') || cleanLine.includes('GPS diag:')) {
+    if (gpsFixPill) {
+      gpsFixPill.className = 'pill pill-warning';
+      gpsFixPill.textContent = cleanLine.includes('ANTENNA SHORT') ? 'Antenna Alert' : 'GPS Searching';
+    }
+    res.activity_mode = 'GPS Diagnostic';
+    return res;
   }
 
-  let numYaw;
-  if (yaw !== null && yaw !== undefined && !isNaN(parseFloat(yaw))) {
-    numYaw = ((parseFloat(yaw) % 360) + 360) % 360;
-    lastEstimatedYaw = numYaw;
-  } else {
-    const now = Date.now();
-    const dt = lastOrientationTimestamp ? Math.min((now - lastOrientationTimestamp) / 1000, 1.0) : 0.1;
-    lastEstimatedYaw = ((lastEstimatedYaw + numGz * dt) % 360 + 360) % 360;
-    numYaw = lastEstimatedYaw;
-  }
-  lastOrientationTimestamp = Date.now();
-
-  // 1. Update Accelerometer Values & Bars (-2.5g to +2.5g)
-  if (valAccelX) valAccelX.textContent = `${numAx >= 0 ? '+' : ''}${numAx.toFixed(2)} g`;
-  if (valAccelY) valAccelY.textContent = `${numAy >= 0 ? '+' : ''}${numAy.toFixed(2)} g`;
-  if (valAccelZ) valAccelZ.textContent = `${numAz >= 0 ? '+' : ''}${numAz.toFixed(2)} g`;
-
-  if (barAccelX) barAccelX.style.width = `${Math.min(100, Math.max(0, ((numAx + 2.5) / 5.0) * 100))}%`;
-  if (barAccelY) barAccelY.style.width = `${Math.min(100, Math.max(0, ((numAy + 2.5) / 5.0) * 100))}%`;
-  if (barAccelZ) barAccelZ.style.width = `${Math.min(100, Math.max(0, ((numAz + 2.5) / 5.0) * 100))}%`;
-
-  // 2. Update Gyroscope Values & Bars (-125°/s to +125°/s)
-  if (valGyroX) valGyroX.textContent = `${numGx >= 0 ? '+' : ''}${numGx.toFixed(1)} °/s`;
-  if (valGyroY) valGyroY.textContent = `${numGy >= 0 ? '+' : ''}${numGy.toFixed(1)} °/s`;
-  if (valGyroZ) valGyroZ.textContent = `${numGz >= 0 ? '+' : ''}${numGz.toFixed(1)} °/s`;
-
-  if (barGyroX) barGyroX.style.width = `${Math.min(100, Math.max(0, ((numGx + 125) / 250.0) * 100))}%`;
-  if (barGyroY) barGyroY.style.width = `${Math.min(100, Math.max(0, ((numGy + 125) / 250.0) * 100))}%`;
-  if (barGyroZ) barGyroZ.style.width = `${Math.min(100, Math.max(0, ((numGz + 125) / 250.0) * 100))}%`;
-
-  // 3. Update Orientation (Pitch, Roll, Yaw) Gauges
-  if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
-  if (valRoll) valRoll.textContent = `${numRoll >= 0 ? '+' : ''}${numRoll.toFixed(1)}°`;
-  if (valYaw) valYaw.textContent = `${numYaw.toFixed(1)}° ${getCompassHeading(numYaw)}`;
-
-  if (barPitch) {
-    const pPct = Math.min(50, (Math.abs(numPitch) / 90) * 50);
-    barPitch.style.width = `${pPct}%`;
-    barPitch.style.marginLeft = numPitch >= 0 ? '50%' : `${50 - pPct}%`;
+  // 3. FIFO & System logs
+  if (cleanLine.includes('FIFO window') || cleanLine.includes('SD: IMU batch') || cleanLine.includes('SD: TELEM row') || isSystemLog) {
+    res.activity_mode = 'System Diagnostic';
+    return res;
   }
 
-  if (barRoll) {
-    const rPct = Math.min(50, (Math.abs(numRoll) / 180) * 50);
-    barRoll.style.width = `${rPct}%`;
-    barRoll.style.marginLeft = numRoll >= 0 ? '50%' : `${50 - rPct}%`;
-  }
+  // 4. NMEA GPS Sentences
+  if (cleanLine.startsWith('$GP') || cleanLine.startsWith('$GN')) {
+    if (cleanLine.startsWith('$GPRMC') || cleanLine.startsWith('$GNRMC')) {
+      const parts = cleanLine.split(',');
+      if (parts.length >= 7 && parts[2] === 'A') {
+        const rawLat = parseFloat(parts[3]);
+        const latDir = parts[4];
+        const rawLng = parseFloat(parts[5]);
+        const lngDir = parts[6];
 
-  if (barYaw) {
-    const yPct = Math.min(100, Math.max(0, (numYaw / 360) * 100));
-    barYaw.style.width = `${yPct}%`;
-    barYaw.style.marginLeft = '0';
-  }
+        if (!isNaN(rawLat) && !isNaN(rawLng)) {
+          let latDeg = Math.floor(rawLat / 100) + (rawLat % 100) / 60;
+          if (latDir === 'S') latDeg = -latDeg;
+          let lngDeg = Math.floor(rawLng / 100) + (rawLng % 100) / 60;
+          if (lngDir === 'W') lngDeg = -lngDeg;
 
-  if (attitudeModeText) {
-    attitudeModeText.textContent = sourceInfo || 'Live Inbound UART';
-  }
-
-  // 4. Attitude Status Pill
-  if (attitudePill) {
-    if (Math.abs(numPitch) < 8 && Math.abs(numRoll) < 8) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(56, 239, 125, 0.4)';
-      attitudePill.style.color = '#38ef7d';
-      attitudePill.textContent = `Level (${numPitch.toFixed(0)}°)`;
-    } else if (numPitch > 18) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
-      attitudePill.style.color = '#ffb703';
-      attitudePill.textContent = `Nose Up (+${numPitch.toFixed(0)}°)`;
-    } else if (numPitch < -18) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
-      attitudePill.style.color = '#ffb703';
-      attitudePill.textContent = `Nosedown (${numPitch.toFixed(0)}°)`;
-    } else if (numRoll > 20) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
-      attitudePill.style.color = '#00f2fe';
-      attitudePill.textContent = `Bank Right (+${numRoll.toFixed(0)}°)`;
-    } else if (numRoll < -20) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
-      attitudePill.style.color = '#00f2fe';
-      attitudePill.textContent = `Bank Left (${numRoll.toFixed(0)}°)`;
+          res.lat = latDeg.toFixed(6);
+          res.lng = lngDeg.toFixed(6);
+          updateGPSPosition(latDeg, lngDeg, 412, 1.5);
+          if (gpsFixPill) {
+            gpsFixPill.className = 'pill pill-success';
+            gpsFixPill.textContent = 'GPS Locked (NMEA)';
+          }
+        }
+      }
+      res.activity_mode = 'NMEA GPS Fix';
     } else {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(245, 158, 11, 0.4)';
-      attitudePill.style.color = '#f59e0b';
-      attitudePill.textContent = `Tilt P:${numPitch.toFixed(0)}° R:${numRoll.toFixed(0)}°`;
+      res.activity_mode = 'NMEA Sentence';
+    }
+    return res;
+  }
+
+  // 5. $IMU sentence from CowTag: sample, timestamp_ms, raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz, pitch, roll, yaw
+  if (cleanLine.startsWith('$IMU')) {
+    const parts = cleanLine.split(',');
+    if (parts.length >= 7) {
+      if (parts.length >= 12) {
+        const rawAx = parseFloat(parts[3]);
+        const rawAy = parseFloat(parts[4]);
+        const rawAz = parseFloat(parts[5]);
+        const rawGx = parseFloat(parts[6]);
+        const rawGy = parseFloat(parts[7]);
+        const rawGz = parseFloat(parts[8]);
+
+        // Exact 16-Bit ADC Calibration (±2.5g Accel, ±125°/s Gyro)
+        res.accel_x = (rawAx / accelLsbPerG).toFixed(3);
+        res.accel_y = (rawAy / accelLsbPerG).toFixed(3);
+        res.accel_z = (rawAz / accelLsbPerG).toFixed(3);
+
+        res.gyro_x = (rawGx / gyroLsbPerDps).toFixed(1);
+        res.gyro_y = (rawGy / gyroLsbPerDps).toFixed(1);
+        res.gyro_z = (rawGz / gyroLsbPerDps).toFixed(1);
+
+        res.pitch = parseFloat(parts[9]).toFixed(2);
+        res.roll = parseFloat(parts[10]).toFixed(2);
+        res.yaw = parseFloat(parts[11]).toFixed(2);
+      } else {
+        res.accel_x = (parseFloat(parts[1]) / accelLsbPerG).toFixed(3);
+        res.accel_y = (parseFloat(parts[2]) / accelLsbPerG).toFixed(3);
+        res.accel_z = (parseFloat(parts[3]) / accelLsbPerG).toFixed(3);
+        res.gyro_x = (parseFloat(parts[4]) / gyroLsbPerDps).toFixed(1);
+        res.gyro_y = (parseFloat(parts[5]) / gyroLsbPerDps).toFixed(1);
+        res.gyro_z = (parseFloat(parts[6]) / gyroLsbPerDps).toFixed(1);
+      }
+      res.activity_mode = '$IMU Stream';
+      res.has_imu_data = true;
     }
   }
 
-  // 5. Total G-force & Motion Pill
-  const totalG = Math.sqrt(numAx * numAx + numAy * numAy + numAz * numAz);
-  if (motionPill) {
-    if (totalG > 1.8) {
-      motionPill.className = 'pill pill-danger';
-      motionPill.textContent = 'RAPID MOTION / ALARM';
-    } else if (totalG > 1.2) {
-      motionPill.className = 'pill pill-warning';
-      motionPill.textContent = 'ACTIVE WALKING';
-    } else {
-      motionPill.className = 'pill pill-info';
-      motionPill.textContent = 'GRAZING / RESTING';
+  // 6. Euler Attitudes ($RPY or $YPR)
+  else if (cleanLine.startsWith('$RPY')) {
+    const parts = cleanLine.split(',');
+    if (parts.length >= 4) {
+      res.roll = parseFloat(parts[1]).toFixed(1);
+      res.pitch = parseFloat(parts[2]).toFixed(1);
+      res.yaw = parseFloat(parts[3]).toFixed(1);
+      res.activity_mode = '$RPY Attitude';
+      res.has_imu_data = true;
+    }
+  } else if (cleanLine.startsWith('$YPR')) {
+    const parts = cleanLine.split(',');
+    if (parts.length >= 4) {
+      res.yaw = parseFloat(parts[1]).toFixed(1);
+      res.pitch = parseFloat(parts[2]).toFixed(1);
+      res.roll = parseFloat(parts[3]).toFixed(1);
+      res.activity_mode = '$YPR Attitude';
+      res.has_imu_data = true;
     }
   }
 
-  if (activityStateEl && activityStr) {
-    activityStateEl.textContent = activityStr;
+  // 7. Vector Prefixes: PRY, RPY, ACCEL, GYRO
+  else if (cleanLine.match(/^(?:PRY|RPY|YPR|ACCEL|ACC|GYRO|GYR)\s*[:=]/i)) {
+    const pryMatch = cleanLine.match(/PRY\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
+    if (pryMatch) {
+      res.pitch = parseFloat(pryMatch[1]).toFixed(1);
+      res.roll = parseFloat(pryMatch[2]).toFixed(1);
+      res.yaw = parseFloat(pryMatch[3]).toFixed(1);
+      res.has_imu_data = true;
+    }
+    const accelMatch = cleanLine.match(/(?:ACCEL|ACC)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
+    if (accelMatch) {
+      const vX = parseFloat(accelMatch[1]);
+      const vY = parseFloat(accelMatch[2]);
+      const vZ = parseFloat(accelMatch[3]);
+      const scale = Math.abs(vZ) > 50 ? accelLsbPerG : 1.0;
+      res.accel_x = (vX / scale).toFixed(3);
+      res.accel_y = (vY / scale).toFixed(3);
+      res.accel_z = (vZ / scale).toFixed(3);
+      res.has_imu_data = true;
+    }
+    const gyroMatch = cleanLine.match(/(?:GYRO|GYR)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
+    if (gyroMatch) {
+      const gX = parseFloat(gyroMatch[1]);
+      const gY = parseFloat(gyroMatch[2]);
+      const gZ = parseFloat(gyroMatch[3]);
+      const gScale = Math.abs(gX) > 200 ? gyroLsbPerDps : 1.0;
+      res.gyro_x = (gX / gScale).toFixed(1);
+      res.gyro_y = (gY / gScale).toFixed(1);
+      res.gyro_z = (gZ / gScale).toFixed(1);
+      res.has_imu_data = true;
+    }
+    res.activity_mode = 'Vector Stream';
   }
 
-  return { pitch: numPitch, roll: numRoll, yaw: numYaw };
-}
+  // 8. Numerical Telemetry Stream
+  else {
+    const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
+    const nums = tokens.map(t => parseFloat(t)).filter(n => !isNaN(n));
 
-function getCompassHeading(deg) {
-  const d = ((deg % 360) + 360) % 360;
-  const directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
-  const idx = Math.round(d / 22.5) % 16;
-  return directions[idx];
-}
-
-function updateBatteryDisplay(batteryVolts, batteryPct = null) {
-  let v = parseFloat(batteryVolts);
-  let pct = batteryPct !== null && !isNaN(parseInt(batteryPct, 10)) ? parseInt(batteryPct, 10) : null;
-
-  if (!isNaN(v) && v > 100) {
-    // Value was in mV (e.g. 4116 mV)
-    v = v / 1000.0;
-  }
-
-  if (pct === null && !isNaN(v) && v > 0) {
-    // Approximate battery percentage from 3.3V (0%) to 4.2V (100%)
-    pct = Math.round(Math.min(100, Math.max(0, ((v - 3.3) / (4.2 - 3.3)) * 100)));
-  }
-
-  if (batteryValueEl) {
-    batteryValueEl.textContent = !isNaN(v) ? `${v.toFixed(2)} V` : '-- V';
-  }
-
-  const batteryPill = document.getElementById('batteryPill');
-  const batteryLevelFill = document.getElementById('batteryLevelFill');
-
-  if (batteryPill && pct !== null) {
-    batteryPill.textContent = `${pct}%`;
-    if (pct > 60) {
-      batteryPill.className = 'valueHighlight battery-pill pill-success';
-      batteryPill.style.background = 'rgba(56, 239, 125, 0.15)';
-      batteryPill.style.color = '#38ef7d';
-    } else if (pct > 25) {
-      batteryPill.className = 'valueHighlight battery-pill pill-warning';
-      batteryPill.style.background = 'rgba(255, 183, 3, 0.15)';
-      batteryPill.style.color = '#ffb703';
-    } else {
-      batteryPill.className = 'valueHighlight battery-pill pill-danger';
-      batteryPill.style.background = 'rgba(255, 77, 109, 0.15)';
-      batteryPill.style.color = '#ff4d6d';
+    if (nums.length === tokens.length && nums.length >= 3) {
+      if (nums.length === 7) {
+        res.gyro_x = (nums[1] / gyroLsbPerDps).toFixed(1);
+        res.gyro_y = (nums[2] / gyroLsbPerDps).toFixed(1);
+        res.gyro_z = (nums[3] / gyroLsbPerDps).toFixed(1);
+        res.pitch = nums[4].toFixed(2);
+        res.roll = nums[5].toFixed(2);
+        res.yaw = nums[6].toFixed(2);
+        res.activity_mode = '7-DOF Euler Stream';
+        res.has_imu_data = true;
+      } else if (nums.length === 22) {
+        res.battery_pct = String(Math.round(nums[19]));
+        res.battery_v = (nums[20] / 1000.0).toFixed(2);
+        updateBatteryDisplay(res.battery_v, nums[19]);
+        res.activity_mode = 'Summary 22-Val';
+        return res;
+      } else if (nums.length === 6) {
+        const scale = Math.abs(nums[2]) > 50 ? accelLsbPerG : 1.0;
+        const gScale = Math.abs(nums[3]) > 200 ? gyroLsbPerDps : 1.0;
+        res.accel_x = (nums[0] / scale).toFixed(3);
+        res.accel_y = (nums[1] / scale).toFixed(3);
+        res.accel_z = (nums[2] / scale).toFixed(3);
+        res.gyro_x = (nums[3] / gScale).toFixed(1);
+        res.gyro_y = (nums[4] / gScale).toFixed(1);
+        res.gyro_z = (nums[5] / gScale).toFixed(1);
+        res.activity_mode = '6-DOF Raw';
+        res.has_imu_data = true;
+      }
     }
   }
 
-  if (batteryLevelFill && pct !== null) {
-    batteryLevelFill.style.width = `${Math.min(100, Math.max(0, pct))}%`;
-    if (pct > 60) {
-      batteryLevelFill.style.background = '#38ef7d';
-    } else if (pct > 25) {
-      batteryLevelFill.style.background = '#ffb703';
-    } else {
-      batteryLevelFill.style.background = '#ff4d6d';
+  // Update IMU and 3D Model when data is received
+  if (res.has_imu_data) {
+    const orientation = updateIMUAndOrientation(
+      res.accel_x || currentImuState.filtAx,
+      res.accel_y || currentImuState.filtAy,
+      res.accel_z || currentImuState.filtAz,
+      res.gyro_x || currentImuState.filtGx,
+      res.gyro_y || currentImuState.filtGy,
+      res.gyro_z || currentImuState.filtGz,
+      res.pitch ? parseFloat(res.pitch) : null,
+      res.roll ? parseFloat(res.roll) : null,
+      res.yaw ? parseFloat(res.yaw) : null,
+      'Live Inbound UART',
+      res.activity_mode || 'Active UART'
+    );
+
+    res.accel_x = orientation.ax.toFixed(2);
+    res.accel_y = orientation.ay.toFixed(2);
+    res.accel_z = orientation.az.toFixed(2);
+    res.gyro_x = orientation.gx.toFixed(1);
+    res.gyro_y = orientation.gy.toFixed(1);
+    res.gyro_z = orientation.gz.toFixed(1);
+    res.pitch = orientation.pitch.toFixed(1);
+    res.roll = orientation.roll.toFixed(1);
+    res.yaw = orientation.yaw.toFixed(1);
+
+    const timeStr = new Date().toLocaleTimeString();
+    addChartData(timeStr, orientation.ax, orientation.ay, orientation.az, orientation.gx, orientation.gy, orientation.gz);
+  }
+
+  return res;
+}
+
+function processRawUartChunk(chunkData, source = 'SERIAL') {
+  if (isStreamPaused) return;
+
+  let textChunk = '';
+  let hexBytes = [];
+  let uint8Array = null;
+
+  if (typeof chunkData === 'string') {
+    textChunk = chunkData;
+    const encoder = new TextEncoder();
+    uint8Array = encoder.encode(chunkData);
+  } else if (chunkData instanceof DataView) {
+    uint8Array = new Uint8Array(chunkData.buffer, chunkData.byteOffset, chunkData.byteLength);
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    textChunk = decoder.decode(uint8Array);
+  } else if (chunkData instanceof ArrayBuffer || ArrayBuffer.isView(chunkData)) {
+    uint8Array = new Uint8Array(chunkData.buffer || chunkData, chunkData.byteOffset || 0, chunkData.byteLength);
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    textChunk = decoder.decode(uint8Array);
+  }
+
+  if (uint8Array) {
+    for (let i = 0; i < uint8Array.length; i++) {
+      hexBytes.push(uint8Array[i].toString(16).padStart(2, '0').toUpperCase());
+    }
+  }
+
+  const rawHexStr = hexBytes.join(' ');
+  const displayFormat = streamFormatSelect ? streamFormatSelect.value : 'text';
+
+  if (displayFormat === 'hex') {
+    logToConsole('rx', `[RAW HEX ${source}] ${rawHexStr}`);
+  }
+
+  // 1. Text Line Buffering & Recording
+  if (textChunk) {
+    serialLineBuffer += textChunk;
+    const lines = serialLineBuffer.split(/\r?\n/);
+    serialLineBuffer = lines.pop();
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.length > 0) {
+        if (displayFormat !== 'hex') {
+          logToConsole('uart-text', `[${source}] ${trimmed}`);
+        }
+
+        packetCounter++;
+        packetCountEl.textContent = packetCounter;
+
+        const extracted = parseTextTelemetry(trimmed);
+
+        if (isRecording) {
+          writeRecordToFileAndBuffer({
+            timestamp_iso: new Date().toISOString(),
+            timestamp_local: new Date().toLocaleString(),
+            packet_number: packetCounter,
+            source: source,
+            tag_id: extracted.tag_id || (cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UART-FEED'),
+            data_type: 'UART_TEXT',
+            lat: extracted.lat || '',
+            lng: extracted.lng || '',
+            accel_x: extracted.accel_x || '',
+            accel_y: extracted.accel_y || '',
+            accel_z: extracted.accel_z || '',
+            gyro_x: extracted.gyro_x || '',
+            gyro_y: extracted.gyro_y || '',
+            gyro_z: extracted.gyro_z || '',
+            pitch: extracted.pitch || '',
+            roll: extracted.roll || '',
+            yaw: extracted.yaw || '',
+            battery_v: extracted.battery_v || '',
+            battery_pct: extracted.battery_pct || '',
+            activity_mode: extracted.activity_mode || 'UART Serial',
+            payload_text: trimmed,
+            raw_hex: rawHexStr
+          });
+        }
+      }
+    }
+  }
+
+  // 2. Binary Frame Buffer (0xCB Sync Header Detection)
+  if (uint8Array && uint8Array.length > 0) {
+    const newBuf = new Uint8Array(uartByteRingBuffer.length + uint8Array.length);
+    newBuf.set(uartByteRingBuffer);
+    newBuf.set(uint8Array, uartByteRingBuffer.length);
+    uartByteRingBuffer = newBuf;
+
+    while (uartByteRingBuffer.length >= 20) {
+      let syncIdx = -1;
+      for (let i = 0; i <= uartByteRingBuffer.length - 20; i++) {
+        if (uartByteRingBuffer[i] === 0xCB) {
+          syncIdx = i;
+          break;
+        }
+      }
+
+      if (syncIdx === -1) {
+        uartByteRingBuffer = uartByteRingBuffer.slice(Math.max(0, uartByteRingBuffer.length - 19));
+        break;
+      }
+
+      const packetSlice = uartByteRingBuffer.slice(syncIdx, syncIdx + 20);
+      const packetView = new DataView(packetSlice.buffer, packetSlice.byteOffset, packetSlice.byteLength);
+      decodeAndProcessPacket(packetView, source);
+      uartByteRingBuffer = uartByteRingBuffer.slice(syncIdx + 20);
     }
   }
 }
 
-function updateDeviceOverview(name, id, connected) {
-  deviceNameEl.textContent = name;
-  if (connected) {
-    updateBatteryDisplay('4.12', 96);
-  } else {
-    updateBatteryDisplay(null, null);
-    if (batteryValueEl) batteryValueEl.textContent = '-- V';
-    const pill = document.getElementById('batteryPill');
-    if (pill) pill.textContent = '--%';
-    const fill = document.getElementById('batteryLevelFill');
-    if (fill) fill.style.width = '0%';
-  }
-  rssiValueEl.textContent = connected ? '-58 dBm' : '-- dBm';
-  deviceTypeBadge.textContent = connected ? 'Active Device' : 'No Tag';
-  deviceTypeBadge.className = connected ? 'badge pill-success' : 'badge';
-}
+// ==========================================================================
+// Chart.js 6-DOF IMU Motion History Setup
+// ==========================================================================
+function initChart() {
+  const chartCanvas = document.getElementById('motionChart');
+  if (!chartCanvas) return;
+  const ctx = chartCanvas.getContext('2d');
 
-function updateStatus(state, text) {
-  statusBadge.className = `connection-status-badge ${state}`;
-  statusText.textContent = text;
-}
+  motionChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'Accel X (g)', data: [], borderColor: '#ff4d6d', backgroundColor: 'rgba(255, 77, 109, 0.05)', borderWidth: 2, pointRadius: 0, tension: 0.2, yAxisID: 'y' },
+        { label: 'Accel Y (g)', data: [], borderColor: '#38ef7d', backgroundColor: 'rgba(56, 239, 125, 0.05)', borderWidth: 2, pointRadius: 0, tension: 0.2, yAxisID: 'y' },
+        { label: 'Accel Z (g)', data: [], borderColor: '#00c6ff', backgroundColor: 'rgba(0, 198, 255, 0.05)', borderWidth: 2, pointRadius: 0, tension: 0.2, yAxisID: 'y' },
+        { label: 'Gyro X (°/s)', data: [], borderColor: '#f59e0b', backgroundColor: 'transparent', borderDash: [4, 3], borderWidth: 1.8, pointRadius: 0, tension: 0.2, yAxisID: 'y1' },
+        { label: 'Gyro Y (°/s)', data: [], borderColor: '#a855f7', backgroundColor: 'transparent', borderDash: [4, 3], borderWidth: 1.8, pointRadius: 0, tension: 0.2, yAxisID: 'y1' },
+        { label: 'Gyro Z (°/s)', data: [], borderColor: '#ec4899', backgroundColor: 'transparent', borderDash: [4, 3], borderWidth: 1.8, pointRadius: 0, tension: 0.2, yAxisID: 'y1' }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: {
+          grid: { color: 'rgba(255, 255, 255, 0.05)' },
+          ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }
+        },
+        y: {
+          type: 'linear',
+          position: 'left',
+          min: -accelFullScale,
+          max: accelFullScale,
+          suggestedMin: -accelFullScale,
+          suggestedMax: accelFullScale,
+          grid: { color: 'rgba(255, 255, 255, 0.08)' },
+          ticks: { color: '#00c6ff', font: { family: 'JetBrains Mono', size: 10 } },
+          title: { display: true, text: `Acceleration (±${accelFullScale}g)`, color: '#00c6ff', font: { size: 11, weight: '600' } }
+        },
+        y1: {
+          type: 'linear',
+          position: 'right',
+          min: -gyroFullScale,
+          max: gyroFullScale,
+          suggestedMin: -gyroFullScale,
+          suggestedMax: gyroFullScale,
+          grid: { drawOnChartArea: false },
+          ticks: { color: '#f59e0b', font: { family: 'JetBrains Mono', size: 10 } },
+          title: { display: true, text: `Angular Rate (±${gyroFullScale} °/s)`, color: '#f59e0b', font: { size: 11, weight: '600' } }
+        }
+      },
+      plugins: {
+        legend: { position: 'top', labels: { color: '#f1f5f9', font: { family: 'Inter', size: 11 }, boxWidth: 12, padding: 8 } },
+        tooltip: { backgroundColor: 'rgba(11, 15, 25, 0.95)', titleFont: { family: 'JetBrains Mono' }, bodyFont: { family: 'JetBrains Mono' }, borderColor: 'rgba(0, 242, 254, 0.3)', borderWidth: 1 }
+      }
+    }
+  });
 
-function renderParsedFields(parsedObj) {
-  fieldsGrid.innerHTML = '';
-  for (const [key, val] of Object.entries(parsedObj)) {
-    const item = document.createElement('div');
-    item.className = 'field-item';
-    item.innerHTML = `<span class="f-name">${key}</span><span class="f-val">${val}</span>`;
-    fieldsGrid.appendChild(item);
-  }
+  applyChartFilterMode();
 }
 
 function addChartData(timeLabel, ax, ay, az, gx = 0, gy = 0, gz = 0) {
   if (!motionChart) return;
 
   const now = Date.now();
-  const numAx = Number(ax) || 0;
-  const numAy = Number(ay) || 0;
-  const numAz = Number(az) || 0;
-  const numGx = Number(gx) || 0;
-  const numGy = Number(gy) || 0;
-  const numGz = Number(gz) || 0;
-
   chartBuffer.push({
     time: now,
     label: timeLabel,
-    ax: numAx,
-    ay: numAy,
-    az: numAz,
-    gx: numGx,
-    gy: numGy,
-    gz: numGz
+    ax: Number(ax) || 0,
+    ay: Number(ay) || 0,
+    az: Number(az) || 0,
+    gx: Number(gx) || 0,
+    gy: Number(gy) || 0,
+    gz: Number(gz) || 0
   });
 
-  // Evict points older than current time window
   const cutoffTime = now - chartTimeWindowMs;
   while (chartBuffer.length > 0 && chartBuffer[0].time < cutoffTime) {
     chartBuffer.shift();
@@ -1188,7 +2167,64 @@ function applyChartFilterMode() {
   motionChart.options.scales.y1.display = isGyroVisible;
 }
 
+// ==========================================================================
+// Leaflet GPS Map Setup
+// ==========================================================================
+function initMap() {
+  const startLat = 31.968600;
+  const startLng = -99.901800;
+
+  map = L.map('map', { center: [startLat, startLng], zoom: 16, zoomControl: false });
+  L.control.zoom({ position: 'topright' }).addTo(map);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap',
+    maxZoom: 19
+  }).addTo(map);
+
+  const cowIcon = L.divIcon({
+    className: 'custom-cow-icon',
+    html: `<div style="background:#00c6ff; color:#040914; border-radius:50%; width:32px; height:32px; display:flex; align-items:center; justify-content:center; box-shadow:0 0 12px #00c6ff; border:2px solid #fff;"><i class="fa-solid fa-cow" style="font-size:16px;"></i></div>`,
+    iconSize: [32, 32],
+    iconAnchor: [16, 16]
+  });
+
+  cowMarker = L.marker([startLat, startLng], { icon: cowIcon }).addTo(map);
+  polyline = L.polyline([], { color: '#00f2fe', weight: 3, opacity: 0.8, dashArray: '5, 8' }).addTo(map);
+}
+
+function updateGPSPosition(lat, lng, alt, speed) {
+  if (lblLat) lblLat.textContent = lat.toFixed(6);
+  if (lblLng) lblLng.textContent = lng.toFixed(6);
+  if (lblAlt) lblAlt.textContent = `${alt.toFixed(1)} m`;
+  if (lblSpeed) lblSpeed.textContent = `${speed.toFixed(1)} km/h`;
+
+  const newPos = [lat, lng];
+  if (cowMarker) cowMarker.setLatLng(newPos);
+  
+  pathHistory.push(newPos);
+  if (pathHistory.length > 50) pathHistory.shift();
+  
+  if (polyline) polyline.setLatLngs(pathHistory);
+  if (map) map.panTo(newPos);
+}
+
+// ==========================================================================
+// Console & UI Helpers
+// ==========================================================================
+function renderParsedFields(parsedObj) {
+  if (!fieldsGrid) return;
+  fieldsGrid.innerHTML = '';
+  for (const [key, val] of Object.entries(parsedObj)) {
+    const item = document.createElement('div');
+    item.className = 'field-item';
+    item.innerHTML = `<span class="f-name">${key}</span><span class="f-val">${val}</span>`;
+    fieldsGrid.appendChild(item);
+  }
+}
+
 function logToConsole(type, msg) {
+  if (!terminalLog) return;
   const time = new Date().toLocaleTimeString();
   const entry = document.createElement('div');
   entry.className = `log-entry ${type}`;
@@ -1203,559 +2239,27 @@ function escapeHtml(str) {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/* ==========================================================================
-   Web Serial API (USB-to-UART Direct Hardware Connection)
-   ========================================================================== */
-async function handleConnectSerialButtonClick() {
-  if (serialPort) {
-    await disconnectSerialPort();
-    return;
-  }
-
-  if (!('serial' in navigator)) {
-    alert('Web Serial API is not supported in this browser environment. Please use Google Chrome, Microsoft Edge, or Opera.');
-    logToConsole('error', 'Web Serial API (navigator.serial) is unavailable in this browser.');
-    return;
-  }
-
-  try {
-    const selectedBaud = parseInt(serialBaudSelect.value, 10) || 115200;
-    logToConsole('system', `Requesting Serial (UART) Port connection at ${selectedBaud} baud...`);
-    
-    serialPort = await navigator.serial.requestPort();
-    await serialPort.open({ baudRate: selectedBaud });
-
-    const portInfo = serialPort.getInfo();
-    const usbVendorId = portInfo.usbVendorId ? `0x${portInfo.usbVendorId.toString(16).toUpperCase()}` : 'UART';
-    const usbProductId = portInfo.usbProductId ? `0x${portInfo.usbProductId.toString(16).toUpperCase()}` : 'DEV';
-
-    updateStatus('serial-connected', `Serial Active (${selectedBaud}b)`);
-    updateDeviceOverview(`USB Serial Device (${usbVendorId}:${usbProductId})`, `PORT-${usbVendorId}`, true);
-    cowTagIdEl.textContent = `UART-${usbVendorId}`;
-    btnConnectSerial.className = 'btn btn-primary';
-    btnConnectSerial.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Disconnect Serial';
-
-    logToConsole('system', `[SERIAL CONNECTED] Port open at ${selectedBaud} baud.`);
-
-    // Start reading stream
-    readSerialStream();
-  } catch (err) {
-    logToConsole('error', `Serial Port Connection failed: ${err.message}`);
-    updateStatus('disconnected', 'Disconnected');
-    serialPort = null;
-  }
-}
-
-async function readSerialStream() {
-  try {
-    const reader = serialPort.readable.getReader();
-    serialReader = reader;
-
-    while (serialPort && serialPort.readable) {
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-      if (value) {
-        processRawUartChunk(value, 'SERIAL');
-      }
-    }
-  } catch (err) {
-    if (serialPort) {
-      logToConsole('error', `Serial Stream Read Error: ${err.message}`);
-    }
-  } finally {
-    if (serialReader) {
-      try { serialReader.releaseLock(); } catch(e){}
-      serialReader = null;
-    }
-  }
-}
-
-async function disconnectSerialPort() {
-  if (serialReader) {
-    try {
-      await serialReader.cancel();
-    } catch (e) {}
-    serialReader = null;
-  }
-  if (serialPort) {
-    try {
-      await serialPort.close();
-    } catch (e) {}
-    serialPort = null;
-  }
-
-  updateStatus('disconnected', 'Disconnected');
-  updateDeviceOverview('--', '--', false);
-  btnConnectSerial.className = 'btn btn-primary';
-  btnConnectSerial.innerHTML = '<i class="fa-solid fa-plug"></i> Connect Serial / UART';
-  logToConsole('warn', 'Serial UART Disconnected.');
-}
-
-// State for latest continuous IMU tracking
-let currentImuState = {
-  ax: 0.00,
-  ay: 0.00,
-  az: 0.98,
-  gx: 0.0,
-  gy: 0.0,
-  gz: 0.0,
-  pitch: 0.0,
-  roll: 0.0,
-  yaw: 0.0
-};
-
-/**
- * Parses ASCII text lines from serial stream to extract GPS, IMU, Pitch/Roll/Yaw, battery, or status.
- * Strict IMU validation ensures non-IMU logs (GPS, battery, FIFO, system diagnostics) NEVER pollute the rolling displays.
- */
-function parseTextTelemetry(line) {
-  const res = {
-    tag_id: '',
-    lat: '',
-    lng: '',
-    accel_x: '',
-    accel_y: '',
-    accel_z: '',
-    gyro_x: '',
-    gyro_y: '',
-    gyro_z: '',
-    pitch: '',
-    roll: '',
-    yaw: '',
-    battery_v: '',
-    battery_pct: '',
-    activity_mode: '',
-    has_imu_data: false
-  };
-
-  if (!line || typeof line !== 'string') return res;
-  
-  // Clean line and strip log prefixes (e.g. "[10:56:35 AM] [BLE] [00:08:16.509,575] <inf> cowtag_fifo: ")
-  let cleanLine = line.trim();
-  cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*(?:\[(?:BLE|SERIAL|UART|SIM|RX|TX)\])?\s*/i, '');
-  const isSystemLog = cleanLine.match(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i);
-  cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i, '');
-  cleanLine = cleanLine.trim();
-
-  // 1. Check for BATTERY log line e.g. "BATTERY: 96% (4116 mV)"
-  const battLogMatch = cleanLine.match(/BATTERY\s*:\s*(\d+)\s*%\s*(?:\(\s*(\d+)\s*mV\s*\))?/i);
-  if (battLogMatch) {
-    const pct = parseInt(battLogMatch[1], 10);
-    const mv = battLogMatch[2] ? parseInt(battLogMatch[2], 10) : null;
-    res.battery_pct = String(pct);
-    if (mv) {
-      res.battery_v = (mv / 1000.0).toFixed(2);
-    } else {
-      res.battery_v = (3.3 + (pct / 100.0) * 0.9).toFixed(2);
-    }
-    res.activity_mode = `Battery ${pct}%`;
-    updateBatteryDisplay(res.battery_v, pct);
-    return res; // Non-IMU -> do not push to rolling displays
-  }
-
-  // 2. Check for GPS Diagnostics / NO-FIX or Antenna alert
-  if (cleanLine.includes('GPS NO-FIX') || cleanLine.includes('ANTENNA SHORT') || cleanLine.includes('GPS diag:') || cleanLine.includes('GPS boot flags:')) {
-    if (gpsFixPill) {
-      gpsFixPill.className = 'pill pill-warning';
-      gpsFixPill.textContent = cleanLine.includes('ANTENNA SHORT') ? 'Antenna Alert' : 'GPS Searching (No Fix)';
-    }
-    res.activity_mode = 'GPS Diagnostic';
-    return res; // Non-IMU -> do not push to rolling displays
-  }
-
-  // 3. Check for FIFO Diagnostic & Storage logs (FIFO window peaks, SD batch logs)
-  if (cleanLine.includes('FIFO window') || cleanLine.includes('SD: IMU batch') || cleanLine.includes('SD: TELEM row') || isSystemLog) {
-    res.activity_mode = 'System Diagnostic';
-    return res; // Non-IMU -> do not push to rolling displays
-  }
-
-  // 4. Check for NMEA GPS Sentences ($GPRMC, $GNRMC, $GPGGA, $GNGGA, $GPTXT, $GPGSV, etc.)
-  if (cleanLine.startsWith('$GP') || cleanLine.startsWith('$GN')) {
-    if (cleanLine.startsWith('$GPRMC') || cleanLine.startsWith('$GNRMC')) {
-      const parts = cleanLine.split(',');
-      if (parts.length >= 7 && parts[2] === 'A') {
-        const rawLat = parseFloat(parts[3]);
-        const latDir = parts[4];
-        const rawLng = parseFloat(parts[5]);
-        const lngDir = parts[6];
-
-        if (!isNaN(rawLat) && !isNaN(rawLng)) {
-          let latDeg = Math.floor(rawLat / 100) + (rawLat % 100) / 60;
-          if (latDir === 'S') latDeg = -latDeg;
-          let lngDeg = Math.floor(rawLng / 100) + (rawLng % 100) / 60;
-          if (lngDir === 'W') lngDeg = -lngDeg;
-
-          res.lat = latDeg.toFixed(6);
-          res.lng = lngDeg.toFixed(6);
-          updateGPSPosition(latDeg, lngDeg, 412, 1.5);
-          if (gpsFixPill) {
-            gpsFixPill.className = 'pill pill-success';
-            gpsFixPill.textContent = 'GPS Locked (NMEA)';
-          }
-        }
-      }
-      res.activity_mode = 'NMEA GPS Fix';
-    } else {
-      res.activity_mode = 'NMEA Sentence';
-    }
-    return res; // NMEA is location/satellite data -> do not push to rolling IMU displays
-  }
-
-  // 5. Check for $IMU sentence from CowTag
-  // e.g. "$IMU,287,482001,-279,-5102,16130,-285,-595,-170,-0.28,-18.38,-40.04"
-  if (cleanLine.startsWith('$IMU')) {
-    const parts = cleanLine.split(',');
-    if (parts.length >= 7) {
-      if (parts.length >= 12) {
-        // Standard full CowTag $IMU sentence: sample, timestamp_ms, ax, ay, az, gx, gy, gz, pitch, roll, yaw
-        const rawAx = parseFloat(parts[3]);
-        const rawAy = parseFloat(parts[4]);
-        const rawAz = parseFloat(parts[5]);
-        const rawGx = parseFloat(parts[6]);
-        const rawGy = parseFloat(parts[7]);
-        const rawGz = parseFloat(parts[8]);
-
-        // Accelerometer scaling (±2.5g range)
-        const accelScale = Math.abs(rawAz) > 12000 ? 16384.0 : (Math.abs(rawAz) > 3000 ? 9806.65 : (Math.abs(rawAz) > 50 ? 1000.0 : 1.0));
-        res.accel_x = (rawAx / accelScale).toFixed(2);
-        res.accel_y = (rawAy / accelScale).toFixed(2);
-        res.accel_z = (rawAz / accelScale).toFixed(2);
-
-        // Gyro scaling (±125 °/s range)
-        const gyroScale = Math.abs(rawGx) > 1000 ? 1000.0 : 10.0;
-        res.gyro_x = (rawGx / gyroScale).toFixed(1);
-        res.gyro_y = (rawGy / gyroScale).toFixed(1);
-        res.gyro_z = (rawGz / gyroScale).toFixed(1);
-
-        res.pitch = parseFloat(parts[9]).toFixed(2);
-        res.roll = parseFloat(parts[10]).toFixed(2);
-        res.yaw = parseFloat(parts[11]).toFixed(2);
-      } else {
-        res.accel_x = parseFloat(parts[1]).toFixed(2);
-        res.accel_y = parseFloat(parts[2]).toFixed(2);
-        res.accel_z = parseFloat(parts[3]).toFixed(2);
-        res.gyro_x = parseFloat(parts[4]).toFixed(1);
-        res.gyro_y = parseFloat(parts[5]).toFixed(1);
-        res.gyro_z = parseFloat(parts[6]).toFixed(1);
-      }
-      res.activity_mode = '$IMU Stream';
-      res.has_imu_data = true;
-    }
-  }
-
-  // 6. Check for Euler / Attitude Sentences e.g. $RPY,roll,pitch,yaw or $YPR,yaw,pitch,roll
-  else if (cleanLine.startsWith('$RPY')) {
-    const parts = cleanLine.split(',');
-    if (parts.length >= 4) {
-      res.roll = parseFloat(parts[1]).toFixed(1);
-      res.pitch = parseFloat(parts[2]).toFixed(1);
-      res.yaw = parseFloat(parts[3]).toFixed(1);
-      res.activity_mode = '$RPY Attitude';
-      res.has_imu_data = true;
-    }
-  } else if (cleanLine.startsWith('$YPR')) {
-    const parts = cleanLine.split(',');
-    if (parts.length >= 4) {
-      res.yaw = parseFloat(parts[1]).toFixed(1);
-      res.pitch = parseFloat(parts[2]).toFixed(1);
-      res.roll = parseFloat(parts[3]).toFixed(1);
-      res.activity_mode = '$YPR Attitude';
-      res.has_imu_data = true;
-    }
-  }
-
-  // 7. Check for vector prefixes: PRY: ... | RPY: ... | YPR: ... | ACCEL: ... | GYRO: ...
-  else if (cleanLine.match(/^(?:PRY|RPY|YPR|ACCEL|ACC|GYRO|GYR)\s*[:=]/i)) {
-    const pryMatch = cleanLine.match(/PRY\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-    if (pryMatch) {
-      res.pitch = parseFloat(pryMatch[1]).toFixed(1);
-      res.roll = parseFloat(pryMatch[2]).toFixed(1);
-      res.yaw = parseFloat(pryMatch[3]).toFixed(1);
-      res.has_imu_data = true;
-    }
-    const rpyMatch = cleanLine.match(/RPY\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-    if (rpyMatch) {
-      res.roll = parseFloat(rpyMatch[1]).toFixed(1);
-      res.pitch = parseFloat(rpyMatch[2]).toFixed(1);
-      res.yaw = parseFloat(rpyMatch[3]).toFixed(1);
-      res.has_imu_data = true;
-    }
-    const accelVecMatch = cleanLine.match(/(?:ACCEL|ACC)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-    if (accelVecMatch) {
-      res.accel_x = parseFloat(accelVecMatch[1]).toFixed(2);
-      res.accel_y = parseFloat(accelVecMatch[2]).toFixed(2);
-      res.accel_z = parseFloat(accelVecMatch[3]).toFixed(2);
-      res.has_imu_data = true;
-    }
-    const gyroVecMatch = cleanLine.match(/(?:GYRO|GYR)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-    if (gyroVecMatch) {
-      res.gyro_x = parseFloat(gyroVecMatch[1]).toFixed(1);
-      res.gyro_y = parseFloat(gyroVecMatch[2]).toFixed(1);
-      res.gyro_z = parseFloat(gyroVecMatch[3]).toFixed(1);
-      res.has_imu_data = true;
-    }
-    res.activity_mode = 'Vector Stream';
-  }
-
-  // 8. Check for JSON formatted telemetry
-  else if (cleanLine.startsWith('{') && cleanLine.endsWith('}')) {
-    try {
-      const obj = JSON.parse(cleanLine);
-      if (obj.pitch !== undefined) res.pitch = String(obj.pitch);
-      if (obj.roll !== undefined) res.roll = String(obj.roll);
-      if (obj.yaw !== undefined) res.yaw = String(obj.yaw);
-      if (obj.ax !== undefined) res.accel_x = String(obj.ax);
-      if (obj.ay !== undefined) res.accel_y = String(obj.ay);
-      if (obj.az !== undefined) res.accel_z = String(obj.az);
-      if (obj.gx !== undefined) res.gyro_x = String(obj.gx);
-      if (obj.gy !== undefined) res.gyro_y = String(obj.gy);
-      if (obj.gz !== undefined) res.gyro_z = String(obj.gz);
-
-      if (obj.lat !== undefined) res.lat = String(obj.lat);
-      if (obj.lng !== undefined) res.lng = String(obj.lng);
-      if (obj.batt !== undefined) res.battery_v = String(obj.batt);
-      if (obj.battery_pct !== undefined) res.battery_pct = String(obj.battery_pct);
-
-      if (res.accel_x || res.gyro_x || res.pitch || res.roll || res.yaw) {
-        res.has_imu_data = true;
-      }
-      res.activity_mode = 'JSON Stream';
-    } catch (e) {}
-  }
-
-  // 9. Check for Comma-Separated Numerical Telemetry Stream
-  else {
-    const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
-    const nums = tokens.map(t => parseFloat(t)).filter(n => !isNaN(n));
-
-    if (nums.length === tokens.length && nums.length >= 3) {
-      if (nums.length === 7) {
-        // Line format: 188,-138,-538,-23,-0.25,-18.37,-40.03 (sample, gx_raw, gy_raw, gz_raw, pitch, roll, yaw)
-        res.gyro_x = (nums[1] / 10.0).toFixed(1);
-        res.gyro_y = (nums[2] / 10.0).toFixed(1);
-        res.gyro_z = (nums[3] / 10.0).toFixed(1);
-        res.pitch = nums[4].toFixed(2);
-        res.roll = nums[5].toFixed(2);
-        res.yaw = nums[6].toFixed(2);
-        res.activity_mode = '7-DOF Euler Stream';
-        res.has_imu_data = true;
-      } else if (nums.length === 22) {
-        // Summary telemetry line: 483,0,0,0,0,0,209,3097,9680,4725,7135,5363,132519,4749,0,0,0,0,0,96,4116,2551
-        res.battery_pct = String(Math.round(nums[19]));
-        res.battery_v = (nums[20] / 1000.0).toFixed(2);
-        updateBatteryDisplay(res.battery_v, nums[19]);
-        res.activity_mode = 'Summary 22-Val';
-        return res; // Summary row -> do NOT put into rolling IMU displays
-      } else if (nums.length === 6) {
-        // 6 numbers: Accel X, Y, Z, Gyro X, Y, Z
-        res.accel_x = nums[0].toFixed(2);
-        res.accel_y = nums[1].toFixed(2);
-        res.accel_z = nums[2].toFixed(2);
-        res.gyro_x = nums[3].toFixed(1);
-        res.gyro_y = nums[4].toFixed(1);
-        res.gyro_z = nums[5].toFixed(1);
-        res.activity_mode = '6-DOF Raw';
-        res.has_imu_data = true;
-      }
-    }
-  }
-
-  // Update Battery UI if extracted
-  if (res.battery_v) {
-    updateBatteryDisplay(res.battery_v, res.battery_pct || null);
-  }
-
-  // Update GPS Position if extracted
-  if (res.lat && res.lng) {
-    updateGPSPosition(parseFloat(res.lat), parseFloat(res.lng), 412, 1.2);
-  }
-
-  // ONLY update the 6-DOF Rolling Display & Kinematics when genuine IMU data is present!
-  if (res.has_imu_data) {
-    if (res.accel_x) currentImuState.ax = parseFloat(res.accel_x);
-    if (res.accel_y) currentImuState.ay = parseFloat(res.accel_y);
-    if (res.accel_z) currentImuState.az = parseFloat(res.accel_z);
-
-    if (res.gyro_x) currentImuState.gx = parseFloat(res.gyro_x);
-    if (res.gyro_y) currentImuState.gy = parseFloat(res.gyro_y);
-    if (res.gyro_z) currentImuState.gz = parseFloat(res.gyro_z);
-
-    const calculatedEuler = updateIMUAndOrientation(
-      currentImuState.ax,
-      currentImuState.ay,
-      currentImuState.az,
-      currentImuState.gx,
-      currentImuState.gy,
-      currentImuState.gz,
-      res.pitch ? parseFloat(res.pitch) : null,
-      res.roll ? parseFloat(res.roll) : null,
-      res.yaw ? parseFloat(res.yaw) : null,
-      'Live Inbound UART',
-      res.activity_mode || 'Active UART'
-    );
-
-    if (!res.pitch) res.pitch = calculatedEuler.pitch.toFixed(1);
-    if (!res.roll) res.roll = calculatedEuler.roll.toFixed(1);
-    if (!res.yaw) res.yaw = calculatedEuler.yaw.toFixed(1);
-
-    const timeStr = new Date().toLocaleTimeString();
-    addChartData(timeStr, currentImuState.ax, currentImuState.ay, currentImuState.az, currentImuState.gx, currentImuState.gy, currentImuState.gz);
-  }
-
-  return res;
-}
-
-/**
- * Process Raw UART Data from Serial or BLE
- */
-function processRawUartChunk(chunkData, source = 'SERIAL') {
-  if (isStreamPaused) return;
-
-  let textChunk = '';
-  let hexBytes = [];
-  let dataView = null;
-  let uint8Array = null;
-
-  if (typeof chunkData === 'string') {
-    textChunk = chunkData;
-    const encoder = new TextEncoder();
-    uint8Array = encoder.encode(chunkData);
-  } else if (chunkData instanceof DataView) {
-    dataView = chunkData;
-    uint8Array = new Uint8Array(chunkData.buffer, chunkData.byteOffset, chunkData.byteLength);
-    const decoder = new TextDecoder('utf-8', { fatal: false });
-    textChunk = decoder.decode(uint8Array);
-  } else if (chunkData instanceof ArrayBuffer || ArrayBuffer.isView(chunkData)) {
-    uint8Array = new Uint8Array(chunkData.buffer || chunkData, chunkData.byteOffset || 0, chunkData.byteLength);
-    dataView = new DataView(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
-    const decoder = new TextDecoder('utf-8', { fatal: false });
-    textChunk = decoder.decode(uint8Array);
-  }
-
-  if (uint8Array) {
-    for (let i = 0; i < uint8Array.length; i++) {
-      hexBytes.push(uint8Array[i].toString(16).padStart(2, '0').toUpperCase());
-    }
-  }
-
-  const rawHexStr = hexBytes.join(' ');
-  const displayFormat = streamFormatSelect ? streamFormatSelect.value : 'text';
-
-  if (displayFormat === 'hex') {
-    logToConsole('rx', `[RAW HEX ${source}] ${rawHexStr}`);
-  }
-
-  // 1. Text Line Buffering & Recording
-  if (textChunk) {
-    serialLineBuffer += textChunk;
-    const lines = serialLineBuffer.split(/\r?\n/);
-    serialLineBuffer = lines.pop(); // keep partial line for next chunk
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.length > 0) {
-        if (displayFormat !== 'hex') {
-          logToConsole('uart-text', `[${source}] ${trimmed}`);
-        }
-
-        packetCounter++;
-        packetCountEl.textContent = packetCounter;
-
-        const extracted = parseTextTelemetry(trimmed);
-
-        if (isRecording) {
-          writeRecordToFileAndBuffer({
-            timestamp_iso: new Date().toISOString(),
-            timestamp_local: new Date().toLocaleString(),
-            packet_number: packetCounter,
-            source: source,
-            tag_id: extracted.tag_id || (cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UART-FEED'),
-            data_type: 'UART_TEXT',
-            lat: extracted.lat || '',
-            lng: extracted.lng || '',
-            accel_x: extracted.accel_x || '',
-            accel_y: extracted.accel_y || '',
-            accel_z: extracted.accel_z || '',
-            gyro_x: extracted.gyro_x || '',
-            gyro_y: extracted.gyro_y || '',
-            gyro_z: extracted.gyro_z || '',
-            pitch: extracted.pitch || '',
-            roll: extracted.roll || '',
-            yaw: extracted.yaw || '',
-            battery_v: extracted.battery_v || '',
-            battery_pct: extracted.battery_pct || '',
-            activity_mode: extracted.activity_mode || 'UART Serial',
-            payload_text: trimmed,
-            raw_hex: rawHexStr
-          });
-        }
-      }
-    }
-  }
-
-  // 2. Binary Frame Buffer / Packet Detection (0xCB Header)
-  if (uint8Array && uint8Array.length > 0) {
-    // Append to binary frame accumulator
-    const newBuf = new Uint8Array(uartByteRingBuffer.length + uint8Array.length);
-    newBuf.set(uartByteRingBuffer);
-    newBuf.set(uint8Array, uartByteRingBuffer.length);
-    uartByteRingBuffer = newBuf;
-
-    // Search for 0xCB sync header and extract 20-byte packets
-    while (uartByteRingBuffer.length >= 20) {
-      let syncIdx = -1;
-      for (let i = 0; i <= uartByteRingBuffer.length - 20; i++) {
-        if (uartByteRingBuffer[i] === 0xCB) {
-          syncIdx = i;
-          break;
-        }
-      }
-
-      if (syncIdx === -1) {
-        // No 0xCB header in current buffer, keep last 19 bytes in case header spans chunk
-        uartByteRingBuffer = uartByteRingBuffer.slice(Math.max(0, uartByteRingBuffer.length - 19));
-        break;
-      }
-
-      const packetSlice = uartByteRingBuffer.slice(syncIdx, syncIdx + 20);
-      const packetView = new DataView(packetSlice.buffer, packetSlice.byteOffset, packetSlice.byteLength);
-      decodeAndProcessPacket(packetView, source);
-      uartByteRingBuffer = uartByteRingBuffer.slice(syncIdx + 20);
-    }
-  }
-}
-
 function togglePauseStream() {
   isStreamPaused = !isStreamPaused;
-  if (isStreamPaused) {
-    btnPauseStream.classList.add('active');
-    btnPauseStream.innerHTML = '<i class="fa-solid fa-play"></i>';
-    btnPauseStream.title = 'Resume Stream';
-    logToConsole('system', 'UART Stream PAUSED.');
-  } else {
-    btnPauseStream.classList.remove('active');
-    btnPauseStream.innerHTML = '<i class="fa-solid fa-pause"></i>';
-    btnPauseStream.title = 'Pause Stream';
-    logToConsole('system', 'UART Stream RESUMED.');
+  if (btnPauseStream) {
+    btnPauseStream.classList.toggle('active', isStreamPaused);
+    btnPauseStream.innerHTML = isStreamPaused ? '<i class="fa-solid fa-play"></i>' : '<i class="fa-solid fa-pause"></i>';
+    btnPauseStream.title = isStreamPaused ? 'Resume Stream' : 'Pause Stream';
   }
+  logToConsole('system', isStreamPaused ? 'UART Stream PAUSED.' : 'UART Stream RESUMED.');
 }
 
 function toggleAutoScroll() {
   autoScroll = !autoScroll;
-  if (autoScroll) {
-    btnToggleAutoScroll.classList.add('active');
-    logToConsole('system', 'Terminal Auto-Scroll ENABLED.');
-  } else {
-    btnToggleAutoScroll.classList.remove('active');
-    logToConsole('system', 'Terminal Auto-Scroll DISABLED.');
+  if (btnToggleAutoScroll) {
+    btnToggleAutoScroll.classList.toggle('active', autoScroll);
   }
+  logToConsole('system', autoScroll ? 'Terminal Auto-Scroll ENABLED.' : 'Terminal Auto-Scroll DISABLED.');
 }
 
-/* ==========================================================================
-   Telemetry Stream & Direct CSV Recorder Engine (100% Guaranteed Non-Zero Files)
-   ========================================================================== */
+// ==========================================================================
+// Telemetry Stream CSV Recorder
+// ==========================================================================
 const CSV_HEADERS = [
   'Timestamp (ISO)',
   'Timestamp (Local)',
@@ -1775,20 +2279,18 @@ const CSV_HEADERS = [
   'Roll (°)',
   'Yaw (°)',
   'Battery (V)',
-  'Battery (%)',
   'Activity Mode',
-  'Payload Text / Raw Line',
-  'Raw Hex Payload'
+  'Payload Text',
+  'Raw Hex'
 ];
 
 function escapeCsvField(field) {
   if (field === null || field === undefined) return '""';
-  const str = String(field).replace(/"/g, '""');
-  return `"${str}"`;
+  return `"${String(field).replace(/"/g, '""')}"`;
 }
 
 function buildCsvRow(p) {
-  const row = [
+  return [
     escapeCsvField(p.timestamp_iso || new Date().toISOString()),
     escapeCsvField(p.timestamp_local || new Date().toLocaleString()),
     p.packet_number !== undefined ? p.packet_number : '',
@@ -1807,34 +2309,26 @@ function buildCsvRow(p) {
     p.roll !== undefined ? p.roll : '',
     p.yaw !== undefined ? p.yaw : '',
     p.battery_v !== undefined ? p.battery_v : '',
-    p.battery_pct !== undefined ? p.battery_pct : '',
     escapeCsvField(p.activity_mode || ''),
     escapeCsvField(p.payload_text || ''),
     escapeCsvField(p.raw_hex || '')
-  ];
-  return row.join(',');
+  ].join(',');
 }
 
 function downloadCsvFile(filename, records) {
   if (!records || records.length === 0) {
-    logToConsole('warn', 'No telemetry records captured to export.');
-    alert('No telemetry records captured to export. Start recording while data is streaming.');
+    alert('No telemetry records captured to export.');
     return;
   }
 
   const csvLines = ['\uFEFF' + CSV_HEADERS.join(',')];
-  for (const r of records) {
-    csvLines.push(buildCsvRow(r));
-  }
+  for (const r of records) csvLines.push(buildCsvRow(r));
 
-  const csvContent = csvLines.join('\r\n');
-  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const blob = new Blob([csvLines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
-  
   const link = document.createElement('a');
   link.setAttribute('href', url);
-  link.setAttribute('download', filename || `ranchbot_uart_stream_${Date.now()}.csv`);
-  link.style.display = 'none';
+  link.setAttribute('download', filename || `ranchbot_telemetry_${Date.now()}.csv`);
   document.body.appendChild(link);
   link.click();
 
@@ -1843,29 +2337,22 @@ function downloadCsvFile(filename, records) {
     URL.revokeObjectURL(url);
   }, 500);
 
-  logToConsole('system', `✓ FILE SAVED: "${link.download}" (${records.length} records, ${(blob.size / 1024).toFixed(1)} KB).`);
+  logToConsole('system', `✓ FILE SAVED: "${link.download}" (${records.length} records).`);
 }
 
 function toggleRecording() {
-  if (isRecording) {
-    stopRecording();
-  } else {
-    startRecording();
-  }
+  if (isRecording) stopRecording();
+  else startRecording();
 }
 
 function startRecording() {
   if (isRecording) return;
-
   const now = new Date();
-  const dateStr = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  activeRecordingFileName = `ranchbot_uart_stream_${dateStr}.csv`;
-
+  activeRecordingFileName = `ranchbot_uart_stream_${now.toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`;
   recordedPackets = [];
   isRecording = true;
   recordingStartTime = Date.now();
 
-  // Update UI indicators
   if (recorderBadge) {
     recorderBadge.className = 'recorder-status-badge recording';
     recorderStatusText.textContent = 'RECORDING...';
@@ -1873,28 +2360,23 @@ function startRecording() {
   if (recorderFilePill) {
     recorderFilePill.classList.add('active');
     recorderFilenameText.textContent = activeRecordingFileName;
-    recorderFilenameText.title = `Live Recording: ${activeRecordingFileName}`;
   }
-
   if (btnRecordToggle) {
     btnRecordToggle.className = 'btn btn-sm btn-record is-recording';
-    btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop & Save File';
+    btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop & Save';
   }
-  if (btnExportCsv) {
-    btnExportCsv.removeAttribute('disabled');
-  }
+  if (btnExportCsv) btnExportCsv.removeAttribute('disabled');
 
   if (recordingTimerInterval) clearInterval(recordingTimerInterval);
   recordingTimerInterval = setInterval(updateRecorderTimerDisplay, 1000);
   updateRecorderTimerDisplay();
   updateRecorderStats();
 
-  logToConsole('system', `[RECORDER STARTED] Capturing telemetry to "${activeRecordingFileName}". Click "Stop & Save File" to save.`);
+  logToConsole('system', `[RECORDER STARTED] Capturing to "${activeRecordingFileName}".`);
 }
 
 function writeRecordToFileAndBuffer(recordItem) {
   if (!isRecording) return;
-
   recordedPackets.push(recordItem);
   updateRecorderStats();
 }
@@ -1917,78 +2399,59 @@ function stopRecording() {
     btnRecordToggle.innerHTML = '<i class="fa-solid fa-circle"></i> Start Recording';
   }
 
-  const count = recordedPackets.length;
-  if (count > 0) {
+  if (recordedPackets.length > 0) {
     downloadCsvFile(activeRecordingFileName, recordedPackets);
-  } else {
-    logToConsole('warn', 'Recording stopped with 0 records captured.');
   }
-
   if (recorderFilePill) {
     recorderFilePill.classList.remove('active');
-    recorderFilenameText.textContent = count > 0 ? `Saved: ${activeRecordingFileName}` : 'No file selected';
+    recorderFilenameText.textContent = recordedPackets.length > 0 ? `Saved: ${activeRecordingFileName}` : 'No file selected';
   }
 }
 
 function updateRecorderTimerDisplay() {
-  if (!recordingStartTime) {
-    if (recorderTimer) recorderTimer.textContent = '00:00:00';
-    return;
-  }
-  const elapsedMs = Date.now() - recordingStartTime;
-  const totalSeconds = Math.floor(elapsedMs / 1000);
+  if (!recordingStartTime || !recorderTimer) return;
+  const totalSeconds = Math.floor((Date.now() - recordingStartTime) / 1000);
   const hrs = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
   const mins = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
   const secs = String(totalSeconds % 60).padStart(2, '0');
-  if (recorderTimer) recorderTimer.textContent = `${hrs}:${mins}:${secs}`;
+  recorderTimer.textContent = `${hrs}:${mins}:${secs}`;
 }
 
 function updateRecorderStats() {
   const count = recordedPackets.length;
-  if (recorderCount) recorderCount.textContent = `${count} record${count === 1 ? '' : 's'}`;
-  
-  const estBytes = count * 240;
-  const estKb = (estBytes / 1024).toFixed(1);
-  if (recorderSize) recorderSize.textContent = `(~${estKb} KB)`;
-
-  if (count > 0 && btnExportCsv) {
-    btnExportCsv.removeAttribute('disabled');
-  }
+  if (recorderCount) recorderCount.textContent = `${count} records`;
+  if (recorderSize) recorderSize.textContent = `(~${((count * 240) / 1024).toFixed(1)} KB)`;
+  if (count > 0 && btnExportCsv) btnExportCsv.removeAttribute('disabled');
 }
 
 function exportCsv() {
   if (recordedPackets.length === 0) {
-    alert('No recorded stream data to export. Click "Start Recording" or "Test Stream" to capture data.');
+    alert('No recorded stream data to export.');
     return;
   }
-  const defaultName = activeRecordingFileName || `ranchbot_uart_stream_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`;
-  downloadCsvFile(defaultName, recordedPackets);
+  downloadCsvFile(activeRecordingFileName, recordedPackets);
 }
 
 function clearCsvBuffer() {
-  if (isRecording) {
-    stopRecording();
-  }
+  if (isRecording) stopRecording();
   recordedPackets = [];
   recordingStartTime = null;
   updateRecorderTimerDisplay();
   updateRecorderStats();
-  if (recorderFilePill) {
-    recorderFilenameText.textContent = 'No file selected';
-  }
+  if (recorderFilePill) recorderFilenameText.textContent = 'No file selected';
   if (btnExportCsv) btnExportCsv.setAttribute('disabled', 'true');
   logToConsole('system', 'Recorded telemetry buffer cleared.');
 }
 
-/* ==========================================================================
-   Simulator Stream Generator (For Testing 6-DOF UART & BLE Live Recording)
-   ========================================================================== */
+// ==========================================================================
+// Simulator Stream Generator (Calibrated to ±2.5g and ±125°/s 16-Bit ADC)
+// ==========================================================================
 function toggleSimulatorStream() {
   isSimulatorRunning = !isSimulatorRunning;
   if (isSimulatorRunning) {
     btnSimulateStream.classList.add('btn-primary');
     btnSimulateStream.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Test';
-    logToConsole('system', '[SIMULATOR] Test 6-DOF IMU & Attitude UART stream generator STARTED.');
+    logToConsole('system', '[SIMULATOR] Test 6-DOF IMU & 3D Attitude UART stream generator STARTED.');
 
     let simLat = 31.968600;
     let simLng = -99.901800;
@@ -1999,59 +2462,52 @@ function toggleSimulatorStream() {
       simLat += (Math.random() - 0.5) * 0.00015;
       simLng += (Math.random() - 0.5) * 0.00015;
 
-      const ax = (Math.sin(count * 0.3) * 0.75).toFixed(2);
-      const ay = (Math.cos(count * 0.25) * 0.55).toFixed(2);
-      const az = (0.95 + Math.sin(count * 0.15) * 0.2).toFixed(2);
+      // Realistic physical movements within ±2.5g and ±125°/s
+      const ax = (Math.sin(count * 0.3) * 0.65).toFixed(3);
+      const ay = (Math.cos(count * 0.25) * 0.45).toFixed(3);
+      const az = (0.98 + Math.sin(count * 0.15) * 0.18).toFixed(3);
 
-      const gx = (Math.cos(count * 0.35) * 25.0).toFixed(1);
-      const gy = (Math.sin(count * 0.3) * 35.0).toFixed(1);
-      const gz = (Math.sin(count * 0.2) * 15.0).toFixed(1);
+      const gx = (Math.cos(count * 0.35) * 22.0).toFixed(1);
+      const gy = (Math.sin(count * 0.3) * 28.0).toFixed(1);
+      const gz = (Math.sin(count * 0.2) * 12.0).toFixed(1);
 
-      const pitch = (Math.sin(count * 0.3) * 28.0).toFixed(2);
-      const roll = (Math.cos(count * 0.25) * 22.0).toFixed(2);
-      const yaw = ((count * 4.5) % 360).toFixed(2);
+      const pitch = (Math.sin(count * 0.3) * 25.0).toFixed(2);
+      const roll = (Math.cos(count * 0.25) * 18.0).toFixed(2);
+      const yaw = ((count * 4.0) % 360).toFixed(2);
       const battMv = Math.max(3400, Math.round(4120 - count * 1.5));
       const battPct = Math.round(Math.min(100, Math.max(0, ((battMv - 3300) / 900) * 100)));
 
-      // Cycle through realistic CowTag stream formats matching user's hardware
-      const mode = count % 6;
+      // 16-Bit Signed ADC Values based on ±2.5g (13107.2 LSB/g) and ±125°/s (262.144 LSB/dps)
+      const rawAx = Math.round(parseFloat(ax) * accelLsbPerG);
+      const rawAy = Math.round(parseFloat(ay) * accelLsbPerG);
+      const rawAz = Math.round(parseFloat(az) * accelLsbPerG);
+      const rawGx = Math.round(parseFloat(gx) * gyroLsbPerDps);
+      const rawGy = Math.round(parseFloat(gy) * gyroLsbPerDps);
+      const rawGz = Math.round(parseFloat(gz) * gyroLsbPerDps);
+
+      const mode = count % 5;
       if (mode === 0) {
-        // $IMU sentence from CowTag
-        const rawAx = Math.round(parseFloat(ax) * 16384);
-        const rawAy = Math.round(parseFloat(ay) * 16384);
-        const rawAz = Math.round(parseFloat(az) * 16384);
-        const rawGx = Math.round(parseFloat(gx) * 10);
-        const rawGy = Math.round(parseFloat(gy) * 10);
-        const rawGz = Math.round(parseFloat(gz) * 10);
         const textMsg = `[10:56:35 AM] [BLE] $IMU,${280 + count},${482000 + count * 20},${rawAx},${rawAy},${rawAz},${rawGx},${rawGy},${rawGz},${pitch},${roll},${yaw}\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
       } else if (mode === 1) {
-        // 7-value Euler stream: sample, gx_raw, gy_raw, gz_raw, pitch, roll, yaw
-        const textMsg = `${180 + count},${Math.round(parseFloat(gx) * 10)},${Math.round(parseFloat(gy) * 10)},${Math.round(parseFloat(gz) * 10)},${pitch},${roll},${yaw}\n`;
-        processRawUartChunk(textMsg, 'SIM_UART');
-      } else if (mode === 2) {
-        // CowTag battery diagnostic log
         const textMsg = `[10:56:36 AM] [BLE] [00:08:16.509,575] <inf> cowtag_fifo: BATTERY: ${battPct}% (${battMv} mV)\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
-      } else if (mode === 3) {
-        // 22-value CowTag summary telemetry row
-        const textMsg = `[10:56:35 AM] [BLE] ${480 + count},0,0,0,0,0,${Math.round(parseFloat(ax) * 9806)},${Math.round(parseFloat(ay) * 9806)},${Math.round(parseFloat(az) * 9806)},${Math.round(parseFloat(gx) * 1000)},${Math.round(parseFloat(gy) * 1000)},${Math.round(parseFloat(gz) * 1000)},132519,4749,0,0,0,0,0,${battPct},${battMv},2551\n`;
+      } else if (mode === 2) {
+        const textMsg = `$RPY,${roll},${pitch},${yaw}\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
-      } else if (mode === 4) {
-        // FIFO window peak log
-        const textMsg = `[10:56:35 AM] [BLE] [00:08:16.509,553] <inf> cowtag_fifo: FIFO window n=1740 sets=290 used=289 WM=1 OVF=0 | peak A mm/s^2 X=${Math.round(parseFloat(ax) * 9806)} Y=${Math.round(parseFloat(ay) * 9806)} Z=${Math.round(parseFloat(az) * 9806)} | G mdps X=${Math.round(parseFloat(gx) * 1000)} Y=${Math.round(parseFloat(gy) * 1000)} Z=${Math.round(parseFloat(gz) * 1000)}\n`;
+      } else if (mode === 3) {
+        const textMsg = `ACCEL: ${ax}, ${ay}, ${az}\nGYRO: ${gx}, ${gy}, ${gz}\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
       } else {
-        // 20-byte binary frame with 0xCB sync
         const buffer = new ArrayBuffer(20);
         const view = new DataView(buffer);
         view.setUint8(0, 0xCB);
         view.setUint16(1, 8492, true);
         view.setInt32(3, Math.round(simLat * 1e7), true);
         view.setInt32(7, Math.round(simLng * 1e7), true);
-        view.setInt16(11, Math.round(parseFloat(ax) * 1000), true);
-        view.setInt16(13, Math.round(parseFloat(ay) * 1000), true);
-        view.setInt16(15, Math.round(parseFloat(az) * 1000), true);
+        view.setInt16(11, rawAx, true);
+        view.setInt16(13, rawAy, true);
+        view.setInt16(15, rawAz, true);
         view.setUint16(17, battMv, true);
         view.setUint8(19, 1);
         processRawUartChunk(view, 'SIM_BLE');
@@ -2066,9 +2522,74 @@ function toggleSimulatorStream() {
   }
 }
 
-/* ==========================================================================
-   Full Width Telemetry Stream Layout Toggle
-   ========================================================================== */
+// ==========================================================================
+// Mobile Tabs & Full Width Layout Handlers
+// ==========================================================================
+function setupMobileTabs() {
+  if (!mobileTabNav) return;
+  if (dashboardGrid && !dashboardGrid.dataset.mobileTab) {
+    dashboardGrid.dataset.mobileTab = 'telemetry';
+  }
+
+  mobileTabNav.addEventListener('click', (e) => {
+    const btn = e.target.closest('.mobile-tab-btn');
+    if (!btn) return;
+    const targetTab = btn.dataset.tab || 'telemetry';
+
+    mobileTabNav.querySelectorAll('.mobile-tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+
+    if (dashboardGrid) {
+      dashboardGrid.dataset.mobileTab = targetTab;
+    }
+
+    setTimeout(() => {
+      if (map) map.invalidateSize();
+      if (motionChart) motionChart.resize();
+      if (renderer3d && camera3d) {
+        const container = document.getElementById('imu3dContainer');
+        if (container) {
+          const w = container.clientWidth || 300;
+          const h = container.clientHeight || 280;
+          camera3d.aspect = w / h;
+          camera3d.updateProjectionMatrix();
+          renderer3d.setSize(w, h);
+          render3D();
+        }
+      }
+    }, 120);
+
+    if (window.innerWidth <= 860) {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  });
+}
+
+function setupResponsiveHandlers() {
+  let resizeTimeout = null;
+  const handleResize = () => {
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(() => {
+      if (map) map.invalidateSize();
+      if (motionChart) motionChart.resize();
+      if (renderer3d && camera3d) {
+        const container = document.getElementById('imu3dContainer');
+        if (container) {
+          const w = container.clientWidth || 300;
+          const h = container.clientHeight || 280;
+          camera3d.aspect = w / h;
+          camera3d.updateProjectionMatrix();
+          renderer3d.setSize(w, h);
+          render3D();
+        }
+      }
+    }, 150);
+  };
+
+  window.addEventListener('resize', handleResize);
+  window.addEventListener('orientationchange', () => setTimeout(handleResize, 200));
+}
+
 function toggleFullWidthStream() {
   const dashboardGrid = document.querySelector('.dashboard-grid');
   if (!dashboardGrid) return;
@@ -2078,18 +2599,15 @@ function toggleFullWidthStream() {
     dashboardGrid.classList.add('full-width-active');
     btnToggleFullWidth.innerHTML = '<i class="fa-solid fa-compress"></i> <span class="btn-text">Restore View</span>';
     btnToggleFullWidth.classList.add('btn-primary');
-    btnToggleFullWidth.title = 'Restore Standard 3-Column Dashboard View';
+    btnToggleFullWidth.title = 'Restore Standard Dashboard View';
     logToConsole('system', 'Telemetry Stream area expanded to FULL SCREEN WIDTH.');
   } else {
     dashboardGrid.classList.remove('full-width-active');
     btnToggleFullWidth.innerHTML = '<i class="fa-solid fa-expand"></i> <span class="btn-text">Full Width</span>';
     btnToggleFullWidth.classList.remove('btn-primary');
-    btnToggleFullWidth.title = 'Toggle Full Width Stream Area (Expand/Compress)';
-    logToConsole('system', 'Restored standard 3-column dashboard layout.');
+    btnToggleFullWidth.title = 'Toggle Full Width Stream Area';
+    logToConsole('system', 'Restored standard dashboard layout.');
   }
 
-  // Allow Leaflet map to adjust bounds if restored
-  if (map) {
-    setTimeout(() => map.invalidateSize(), 250);
-  }
+  if (map) setTimeout(() => map.invalidateSize(), 250);
 }

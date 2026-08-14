@@ -2,7 +2,8 @@
 # Provides a Secure Context (http://localhost:8080) required by Web Bluetooth
 
 param (
-    [int]$Port = 8080
+    [int]$Port = 8080,
+    [switch]$NoBrowser
 )
 
 $prefix = "http://localhost:$Port/"
@@ -16,8 +17,10 @@ try {
     Write-Host "  Web Bluetooth Secure Context Active. Browser can access hardware BT radio!" -ForegroundColor Yellow
     Write-Host "=========================================================================" -ForegroundColor Green
 
-    # Launch default browser directly to http://localhost:8080/
-    Start-Process $prefix
+    # Launch default browser if requested
+    if (-not $NoBrowser) {
+        Start-Process $prefix
+    }
 
     while ($listener.IsListening) {
         $context = $listener.GetContext()

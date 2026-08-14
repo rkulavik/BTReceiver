@@ -9,6 +9,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   
+  <!-- Three.js for 3D IMU Chip & Carrier Board Orientation Rendering -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  
   <!-- Leaflet Map CSS & JS for Live GPS Cow Tracking -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -29,7 +32,7 @@
         </div>
         <div class="brand-text">
           <h1>Ranchbot Cattle Ear Tag BLE Receiver</h1>
-          <span class="subtext">Livestock Tracker • 6-DOF IMU (Accel & Gyro) • GPS Telemetry Decoder</span>
+          <span class="subtext">Livestock Tracker • 6-DOF IMU (Accel & Gyro) • 3D Orientation • GPS Telemetry Decoder</span>
         </div>
       </div>
       <div class="nav-controls">
@@ -37,6 +40,9 @@
           <span class="status-dot"></span>
           <span id="statusText">Disconnected</span>
         </div>
+        <button id="btnLastDevice" class="btn btn-secondary btn-last-device" style="display:none;" title="Quick reconnect to last connected device">
+          <i class="fa-solid fa-clock-rotate-left"></i> <span id="lastDeviceNameText">Reconnect</span>
+        </button>
         <button id="btnConnectSerial" class="btn btn-primary" title="Connect to device via Web Serial (USB UART)">
           <i class="fa-solid fa-plug"></i> <span class="btn-text">Connect Serial</span>
         </button>
@@ -54,6 +60,10 @@
       <button class="mobile-tab-btn active" data-tab="telemetry" id="tabBtnTelemetry">
         <i class="fa-solid fa-gauge-high"></i>
         <span>Map & IMU</span>
+      </button>
+      <button class="mobile-tab-btn" data-tab="imu3d" id="tabBtnImu3d">
+        <i class="fa-solid fa-cube"></i>
+        <span>3D IMU & Filters</span>
       </button>
       <button class="mobile-tab-btn" data-tab="console" id="tabBtnConsole">
         <i class="fa-solid fa-terminal"></i>
@@ -75,12 +85,12 @@
       <aside class="card device-info-card" id="deviceInfoCard">
         <div class="card-header">
           <h2><i class="fa-solid fa-tag"></i> Cattle Tag Overview</h2>
-          <span class="badge" id="deviceTypeBadge">No Tag</span>
+          <span class="badge" id="deviceTypeBadge">No Tag Connected</span>
         </div>
         <div class="card-body">
           <div class="info-row">
             <span class="label">Cow Tag ID</span>
-            <span class="value" id="cowTagId">COW-8492</span>
+            <span class="value" id="cowTagId">--</span>
           </div>
           <div class="info-row">
             <span class="label">BLE Device Name</span>
@@ -89,12 +99,12 @@
           <div class="info-row battery-info-row">
             <span class="label"><i class="fa-solid fa-battery-three-quarters"></i> Tag Battery</span>
             <div class="battery-val-container">
-              <span class="valueHighlight battery-pill" id="batteryPill">96%</span>
-              <span class="value" id="batteryValue">4.12 V</span>
+              <span class="valueHighlight battery-pill" id="batteryPill">--%</span>
+              <span class="value" id="batteryValue">-- V</span>
             </div>
           </div>
           <div class="battery-bar-track">
-            <div class="battery-bar-fill" id="batteryLevelFill" style="width: 96%;"></div>
+            <div class="battery-bar-fill" id="batteryLevelFill" style="width: 0%;"></div>
           </div>
           <div class="info-row">
             <span class="label">Signal (RSSI)</span>
@@ -102,7 +112,7 @@
           </div>
           <div class="info-row">
             <span class="label">Activity State</span>
-            <span class="valueHighlight" id="activityState">Grazing</span>
+            <span class="valueHighlight" id="activityState">--</span>
           </div>
           <div class="info-row">
             <span class="label">Packets Recv</span>
@@ -133,9 +143,28 @@
           <div class="form-group">
             <label for="decoderSelect">BLE Payload Unpacker</label>
             <select id="decoderSelect" class="form-control">
-              <option value="cow_tag_full">Ranchbot Cow Tag (GPS + IMU 6-DOF)</option>
+              <option value="cow_tag_full" selected>Ranchbot Cow Tag (GPS + IMU 6-DOF)</option>
               <option value="imu_only">IMU Motion Only (Accel/Gyro Raw)</option>
               <option value="raw_hex">Raw Byte Inspector</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="accelRangeSelect">IMU Accel Full Scale</label>
+            <select id="accelRangeSelect" class="form-control">
+              <option value="2.5" selected>±2.5 g (13107.2 LSB/g)</option>
+              <option value="2.0">±2.0 g (16384 LSB/g)</option>
+              <option value="4.0">±4.0 g (8192 LSB/g)</option>
+              <option value="8.0">±8.0 g (4096 LSB/g)</option>
+              <option value="16.0">±16.0 g (2048 LSB/g)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="gyroRangeSelect">IMU Gyro Full Scale</label>
+            <select id="gyroRangeSelect" class="form-control">
+              <option value="125" selected>±125 °/s (262.14 LSB/dps)</option>
+              <option value="250">±250 °/s (131.07 LSB/dps)</option>
+              <option value="500">±500 °/s (65.54 LSB/dps)</option>
+              <option value="2000">±2000 °/s (16.38 LSB/dps)</option>
             </select>
           </div>
           <div class="form-group">
@@ -145,7 +174,7 @@
         </div>
       </aside>
 
-      <!-- Center Section: GPS Pasture Map & 6-DOF Motion Metrics -->
+      <!-- Center Section: GPS Pasture Map, 6-DOF Motion Metrics, 3D IMU Chip & Digital Filters -->
       <section class="main-telemetry" id="mainTelemetrySection">
         <!-- Top Metrics: Live GPS Map + IMU Motion Status -->
         <div class="metrics-grid">
@@ -153,7 +182,7 @@
           <div class="card map-card">
             <div class="card-header">
               <h3><i class="fa-solid fa-map-location-dot"></i> Cattle GPS Location (Pasture Track)</h3>
-              <span class="pill pill-success" id="gpsFixPill">GPS Locked (8 Sats)</span>
+              <span class="pill pill-success" id="gpsFixPill">GPS Ready</span>
             </div>
             <div class="card-body map-body">
               <div id="map"></div>
@@ -161,7 +190,7 @@
                 <div class="gps-coord-item"><span class="gps-label">Lat:</span> <strong id="lblLat">31.968600</strong>°</div>
                 <div class="gps-coord-item"><span class="gps-label">Lng:</span> <strong id="lblLng">-99.901800</strong>°</div>
                 <div class="gps-coord-item"><span class="gps-label">Alt:</span> <strong id="lblAlt">412 m</strong></div>
-                <div class="gps-coord-item"><span class="gps-label">Speed:</span> <strong id="lblSpeed">1.2 km/h</strong></div>
+                <div class="gps-coord-item"><span class="gps-label">Speed:</span> <strong id="lblSpeed">0.0 km/h</strong></div>
               </div>
             </div>
           </div>
@@ -171,8 +200,8 @@
             <div class="card-header">
               <h3><i class="fa-solid fa-compass"></i> 6-DOF Motion & Attitude (Ear Tag IMU)</h3>
               <div class="header-badges">
-                <span class="pill pill-attitude" id="attitudePill">Level (0°)</span>
-                <span class="pill pill-info" id="motionPill">Normal Motion</span>
+                <span class="pill pill-attitude" id="attitudePill">Flat (Top Up)</span>
+                <span class="pill pill-info" id="motionPill">At Rest</span>
               </div>
             </div>
             <div class="card-body flex-column">
@@ -180,7 +209,7 @@
               <div class="sensor-section orientation-section">
                 <div class="section-title">
                   <span><i class="fa-solid fa-arrows-spin"></i> Orientation & Attitude (Pitch / Roll / Yaw)</span>
-                  <span class="section-subtext" id="attitudeModeText">Live Inbound UART</span>
+                  <span class="section-subtext" id="attitudeModeText">Live IMU</span>
                 </div>
                 <div class="euler-grid">
                   <div class="euler-card">
@@ -190,7 +219,7 @@
                     </div>
                     <div class="euler-bar-wrap">
                       <div class="euler-center-mark"></div>
-                      <div class="euler-bar-fill bar-pitch" id="barPitch" style="width: 50%;"></div>
+                      <div class="euler-bar-fill bar-pitch" id="barPitch" style="width: 0%;"></div>
                     </div>
                     <span class="euler-range">-90° to +90°</span>
                   </div>
@@ -201,7 +230,7 @@
                     </div>
                     <div class="euler-bar-wrap">
                       <div class="euler-center-mark"></div>
-                      <div class="euler-bar-fill bar-roll" id="barRoll" style="width: 50%;"></div>
+                      <div class="euler-bar-fill bar-roll" id="barRoll" style="width: 0%;"></div>
                     </div>
                     <span class="euler-range">-180° to +180°</span>
                   </div>
@@ -222,23 +251,23 @@
               <div class="sensor-section">
                 <div class="section-title">
                   <span><i class="fa-solid fa-gauge"></i> Accelerometer (g-force)</span>
-                  <span class="range-badge">±2.5 g Full Scale</span>
+                  <span class="range-badge" id="accelRangeBadge">±2.5 g Full Scale (Desk Flat: Z=+1.0g)</span>
                 </div>
                 <div class="axis-bars">
                   <div class="axis-row">
                     <span class="axis-lbl">X (Pitch Axis):</span>
                     <div class="bar-bg"><div class="bar-fill bar-x" id="barAccelX" style="width: 50%;"></div></div>
-                    <span class="axis-val" id="valAccelX">+0.04 g</span>
+                    <span class="axis-val" id="valAccelX">+0.00 g</span>
                   </div>
                   <div class="axis-row">
                     <span class="axis-lbl">Y (Roll Axis):</span>
                     <div class="bar-bg"><div class="bar-fill bar-y" id="barAccelY" style="width: 50%;"></div></div>
-                    <span class="axis-val" id="valAccelY">-0.12 g</span>
+                    <span class="axis-val" id="valAccelY">+0.00 g</span>
                   </div>
                   <div class="axis-row">
-                    <span class="axis-lbl">Z (Yaw Axis):</span>
+                    <span class="axis-lbl">Z (Up Axis):</span>
                     <div class="bar-bg"><div class="bar-fill bar-z" id="barAccelZ" style="width: 70%;"></div></div>
-                    <span class="axis-val" id="valAccelZ">+0.98 g</span>
+                    <span class="axis-val" id="valAccelZ">+1.00 g</span>
                   </div>
                 </div>
               </div>
@@ -247,24 +276,172 @@
               <div class="sensor-section">
                 <div class="section-title">
                   <span><i class="fa-solid fa-rotate"></i> Gyroscope (°/s angular rate)</span>
-                  <span class="range-badge">±125 °/s Full Scale</span>
+                  <span class="range-badge" id="gyroRangeBadge">±125 °/s Full Scale</span>
                 </div>
                 <div class="axis-bars">
                   <div class="axis-row">
                     <span class="axis-lbl">GX (Roll rate):</span>
                     <div class="bar-bg"><div class="bar-fill bar-gx" id="barGyroX" style="width: 50%;"></div></div>
-                    <span class="axis-val" id="valGyroX">1.2 °/s</span>
+                    <span class="axis-val" id="valGyroX">0.0 °/s</span>
                   </div>
                   <div class="axis-row">
                     <span class="axis-lbl">GY (Pitch rate):</span>
                     <div class="bar-bg"><div class="bar-fill bar-gy" id="barGyroY" style="width: 50%;"></div></div>
-                    <span class="axis-val" id="valGyroY">-4.5 °/s</span>
+                    <span class="axis-val" id="valGyroY">0.0 °/s</span>
                   </div>
                   <div class="axis-row">
                     <span class="axis-lbl">GZ (Yaw rate):</span>
                     <div class="bar-bg"><div class="bar-fill bar-gz" id="barGyroZ" style="width: 50%;"></div></div>
-                    <span class="axis-val" id="valGyroZ">0.8 °/s</span>
+                    <span class="axis-val" id="valGyroZ">0.0 °/s</span>
                   </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Middle Row: 3D IMU Chip Visualization & Digital Low-Pass Filter Controls -->
+        <div class="imu-3d-and-filter-grid">
+          <!-- 3D IMU Chip & Board Orientation Card -->
+          <div class="card imu-3d-card" id="imu3dCard">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h3><i class="fa-solid fa-cube"></i> Live 3D IMU Chip & Board Orientation</h3>
+                <span class="pill pill-attitude" id="chipFlatStatusPill"><i class="fa-solid fa-table"></i> Top Up (Flat on Desk)</span>
+              </div>
+              <div class="viewport-actions">
+                <button class="btn btn-sm" id="btnReset3dView" title="Reset 3D Camera View"><i class="fa-solid fa-arrows-to-dot"></i> Reset View</button>
+                <button class="btn btn-sm active" id="btnToggle3dAxes" title="Toggle 3D Coordinate Axis Gizmo"><i class="fa-solid fa-crosshairs"></i> Axes</button>
+                <button class="btn btn-sm active" id="btnToggle3dGrid" title="Toggle Desk Plane Grid"><i class="fa-solid fa-border-all"></i> Desk</button>
+              </div>
+            </div>
+            <div class="card-body imu-3d-body">
+              <div class="imu-3d-canvas-container" id="imu3dContainer">
+                <canvas id="imu3dCanvas"></canvas>
+                <!-- 3D Overlay HUD -->
+                <div class="imu-3d-hud">
+                  <div class="hud-item"><span class="hud-lbl">Pitch (X):</span> <strong id="hudPitch">+0.0°</strong></div>
+                  <div class="hud-item"><span class="hud-lbl">Roll (Y):</span> <strong id="hudRoll">+0.0°</strong></div>
+                  <div class="hud-item"><span class="hud-lbl">Yaw (Z):</span> <strong id="hudYaw">0.0°</strong></div>
+                  <div class="hud-item"><span class="hud-lbl">G-Force:</span> <strong id="hudGravity">1.00 g (Z+)</strong></div>
+                </div>
+                <!-- 3D Legend -->
+                <div class="imu-3d-legend">
+                  <span class="axis-badge axis-x-badge"><span class="dot dot-red"></span> +X (Pitch)</span>
+                  <span class="axis-badge axis-y-badge"><span class="dot dot-green"></span> +Y (Roll)</span>
+                  <span class="axis-badge axis-z-badge"><span class="dot dot-blue"></span> +Z Top (Normal)</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Digital Low-Pass Filter Control & Calibration Panel -->
+          <div class="card filter-card" id="filterCard">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h3><i class="fa-solid fa-filter"></i> Digital Low-Pass Filters & DSP</h3>
+                <span class="pill pill-success" id="filterMasterStatusPill">Filters Active</span>
+              </div>
+              <div class="filter-actions">
+                <button class="btn btn-sm" id="btnResetFilters" title="Reset Filters to Balanced Defaults"><i class="fa-solid fa-rotate-left"></i> Defaults</button>
+              </div>
+            </div>
+            <div class="card-body flex-column">
+              <!-- Filter Mode Summary & Calibration Note -->
+              <div class="calibration-info-banner">
+                <div class="cal-item"><i class="fa-solid fa-microchip"></i> <strong>16-Bit ADC Math:</strong> 13107.2 LSB/g (±2.5g FS) • 262.14 LSB/dps (±125°/s FS)</div>
+                <div class="cal-item"><i class="fa-solid fa-check-double"></i> <strong>Desk Flat Orientation:</strong> Z = +1.00g (Normal Gravity), Pitch = 0°, Roll = 0°</div>
+              </div>
+
+              <div class="filter-controls-grid">
+                <!-- Accelerometer LPF Section -->
+                <div class="filter-block" id="accelFilterBlock">
+                  <div class="filter-block-header">
+                    <div class="filter-toggle-wrapper">
+                      <label class="switch">
+                        <input type="checkbox" id="chkAccelFilter" checked>
+                        <span class="slider round"></span>
+                      </label>
+                      <strong class="filter-name"><i class="fa-solid fa-gauge-simple-high"></i> Accel Filter</strong>
+                    </div>
+                    <span class="pill pill-success" id="accelFilterPill">LPF ON</span>
+                  </div>
+
+                  <div class="filter-settings">
+                    <div class="form-row">
+                      <label for="accelFilterOrder">Order:</label>
+                      <select id="accelFilterOrder" class="form-control form-control-sm">
+                        <option value="1">1st Order (EMA / Single-Pole)</option>
+                        <option value="2" selected>2nd Order (Butterworth Biquad)</option>
+                        <option value="3">3rd Order (Cascaded IIR)</option>
+                      </select>
+                    </div>
+                    <div class="form-row">
+                      <div class="slider-label-row">
+                        <label for="accelCutoffFreq">Cutoff Freq ($f_c$):</label>
+                        <span class="freq-display" id="lblAccelCutoff">2.0 Hz</span>
+                      </div>
+                      <div class="slider-with-input">
+                        <input type="range" id="accelCutoffFreq" min="0.2" max="20.0" step="0.2" value="2.0" class="range-slider">
+                        <input type="number" id="accelCutoffInput" min="0.2" max="20.0" step="0.2" value="2.0" class="number-input-sm">
+                      </div>
+                    </div>
+                    <div class="filter-presets">
+                      <span class="preset-label">Presets:</span>
+                      <button class="btn-preset" data-target="accel" data-freq="0.5" data-order="2">0.5Hz</button>
+                      <button class="btn-preset active" data-target="accel" data-freq="2.0" data-order="2">2.0Hz</button>
+                      <button class="btn-preset" data-target="accel" data-freq="5.0" data-order="2">5.0Hz</button>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Gyroscope LPF Section -->
+                <div class="filter-block" id="gyroFilterBlock">
+                  <div class="filter-block-header">
+                    <div class="filter-toggle-wrapper">
+                      <label class="switch">
+                        <input type="checkbox" id="chkGyroFilter" checked>
+                        <span class="slider round"></span>
+                      </label>
+                      <strong class="filter-name"><i class="fa-solid fa-rotate"></i> Gyro Filter</strong>
+                    </div>
+                    <span class="pill pill-success" id="gyroFilterPill">LPF ON</span>
+                  </div>
+
+                  <div class="filter-settings">
+                    <div class="form-row">
+                      <label for="gyroFilterOrder">Order:</label>
+                      <select id="gyroFilterOrder" class="form-control form-control-sm">
+                        <option value="1">1st Order (EMA / Single-Pole)</option>
+                        <option value="2" selected>2nd Order (Butterworth Biquad)</option>
+                        <option value="3">3rd Order (Cascaded IIR)</option>
+                      </select>
+                    </div>
+                    <div class="form-row">
+                      <div class="slider-label-row">
+                        <label for="gyroCutoffFreq">Cutoff Freq ($f_c$):</label>
+                        <span class="freq-display" id="lblGyroCutoff">5.0 Hz</span>
+                      </div>
+                      <div class="slider-with-input">
+                        <input type="range" id="gyroCutoffFreq" min="0.5" max="50.0" step="0.5" value="5.0" class="range-slider">
+                        <input type="number" id="gyroCutoffInput" min="0.5" max="50.0" step="0.5" value="5.0" class="number-input-sm">
+                      </div>
+                    </div>
+                    <div class="filter-presets">
+                      <span class="preset-label">Presets:</span>
+                      <button class="btn-preset" data-target="gyro" data-freq="2.0" data-order="2">2.0Hz</button>
+                      <button class="btn-preset active" data-target="gyro" data-freq="5.0" data-order="2">5.0Hz</button>
+                      <button class="btn-preset" data-target="gyro" data-freq="15.0" data-order="2">15.0Hz</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Live Filter Impact Indicator -->
+              <div class="filter-impact-status" id="filterImpactStatus">
+                <div class="impact-indicator active" id="impactIndicator">
+                  <i class="fa-solid fa-circle-check"></i>
+                  <span id="impactText">Filters actively smoothing <strong>Orientation (Pitch/Roll/Yaw)</strong>, <strong>G-Force</strong>, <strong>Angular Rate</strong>, and <strong>3D IMU Chip</strong> motion.</span>
                 </div>
               </div>
             </div>
