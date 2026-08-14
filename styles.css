@@ -268,6 +268,35 @@ body {
   font-size: 0.8rem;
 }
 
+.battery-val-container {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.battery-pill {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 0.1rem 0.4rem;
+}
+
+.battery-bar-track {
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: -0.2rem;
+  margin-bottom: 0.35rem;
+}
+
+.battery-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease, background-color 0.3s ease;
+}
+
 .form-group {
   margin-top: 0.6rem;
   display: flex;
@@ -307,7 +336,7 @@ body {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 1rem;
-  height: 280px;
+  min-height: 330px;
 }
 
 .pill {
@@ -318,6 +347,17 @@ body {
 }
 .pill-info { background: rgba(0, 198, 255, 0.15); color: var(--primary); }
 .pill-success { background: rgba(56, 239, 125, 0.15); color: var(--accent); }
+.pill-attitude {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.header-badges {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
 
 /* GPS Map Body */
 .map-body {
@@ -357,14 +397,100 @@ body {
   padding: 0.6rem;
 }
 
+.orientation-section {
+  background: rgba(0, 0, 0, 0.35);
+  border-color: rgba(0, 242, 254, 0.18);
+}
+
 .section-title {
   font-size: 0.75rem;
   font-weight: 600;
   color: var(--text-muted);
   margin-bottom: 0.4rem;
   display: flex;
+  justify-content: space-between;
   align-items: center;
   gap: 0.4rem;
+}
+
+.section-subtext {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+/* Euler / Attitude Orientation Grid */
+.euler-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0.5rem;
+}
+
+.euler-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.euler-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.euler-label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.euler-val {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--secondary);
+}
+
+.euler-bar-wrap {
+  position: relative;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.euler-center-mark {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.35);
+  z-index: 2;
+}
+
+.euler-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.25s ease, margin-left 0.25s ease;
+}
+
+.bar-pitch { background: linear-gradient(90deg, #f59e0b, #eab308); }
+.bar-roll { background: linear-gradient(90deg, #a855f7, #d946ef); }
+.bar-yaw { background: linear-gradient(90deg, #06b6d4, #00f2fe); }
+
+.euler-range {
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  text-align: center;
 }
 
 .axis-bars {
@@ -382,8 +508,9 @@ body {
 }
 
 .axis-lbl {
-  width: 90px;
+  width: 100px;
   color: var(--text-muted);
+  font-size: 0.72rem;
 }
 
 .bar-bg {
@@ -403,6 +530,9 @@ body {
 .bar-x { background: #ff4d6d; }
 .bar-y { background: #38ef7d; }
 .bar-z { background: #00c6ff; }
+.bar-gx { background: #f59e0b; }
+.bar-gy { background: #a855f7; }
+.bar-gz { background: #ec4899; }
 
 .axis-val {
   width: 55px;
@@ -415,10 +545,71 @@ body {
   color: var(--secondary);
 }
 
-/* Chart Container */
+/* Chart Container & Header Controls */
 .chart-card {
   flex: 1;
   min-height: 0;
+}
+
+.chart-title-area {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.chart-live-badge {
+  font-size: 0.72rem;
+  color: var(--secondary);
+  background: rgba(0, 242, 254, 0.1);
+  border: 1px solid rgba(0, 242, 254, 0.25);
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.chart-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.btn-group {
+  display: inline-flex;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.btn-group .btn {
+  border-radius: 0;
+  border: none;
+  border-right: 1px solid var(--border-color);
+  background: transparent;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.btn-group .btn:last-child {
+  border-right: none;
+}
+
+.btn-group .btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-main);
+}
+
+.btn-group .btn.active {
+  background: rgba(0, 198, 255, 0.2);
+  color: var(--primary);
+  font-weight: 700;
+  box-shadow: inset 0 0 8px rgba(0, 198, 255, 0.2);
 }
 
 .chart-wrapper {

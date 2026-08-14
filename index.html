@@ -66,9 +66,15 @@
             <span class="label">BLE Device Name</span>
             <span class="value" id="deviceName">--</span>
           </div>
-          <div class="info-row">
-            <span class="label">Tag Battery</span>
-            <span class="value" id="batteryValue">-- V</span>
+          <div class="info-row battery-info-row">
+            <span class="label"><i class="fa-solid fa-battery-three-quarters"></i> Tag Battery</span>
+            <div class="battery-val-container">
+              <span class="valueHighlight battery-pill" id="batteryPill">96%</span>
+              <span class="value" id="batteryValue">4.12 V</span>
+            </div>
+          </div>
+          <div class="battery-bar-track">
+            <div class="battery-bar-fill" id="batteryLevelFill" style="width: 96%;"></div>
           </div>
           <div class="info-row">
             <span class="label">Signal (RSSI)</span>
@@ -143,26 +149,71 @@
           <!-- Accelerometer & Gyroscope Sensor Gauges -->
           <div class="card imu-card">
             <div class="card-header">
-              <h3><i class="fa-solid fa-compass"></i> 6-DOF Motion Sensors (Ear Tag IMU)</h3>
-              <span class="pill pill-info" id="motionPill">Normal Motion</span>
+              <h3><i class="fa-solid fa-compass"></i> 6-DOF Motion & Attitude (Ear Tag IMU)</h3>
+              <div class="header-badges">
+                <span class="pill pill-attitude" id="attitudePill">Level (0°)</span>
+                <span class="pill pill-info" id="motionPill">Normal Motion</span>
+              </div>
             </div>
             <div class="card-body flex-column">
+              <!-- Orientation / Euler Angles (Pitch, Roll, Yaw) -->
+              <div class="sensor-section orientation-section">
+                <div class="section-title">
+                  <span><i class="fa-solid fa-arrows-spin"></i> Orientation & Attitude (Pitch / Roll / Yaw)</span>
+                  <span class="section-subtext" id="attitudeModeText">Live Inbound UART</span>
+                </div>
+                <div class="euler-grid">
+                  <div class="euler-card">
+                    <div class="euler-header">
+                      <span class="euler-label"><i class="fa-solid fa-arrows-up-down"></i> Pitch</span>
+                      <span class="euler-val" id="valPitch">+0.0°</span>
+                    </div>
+                    <div class="euler-bar-wrap">
+                      <div class="euler-center-mark"></div>
+                      <div class="euler-bar-fill bar-pitch" id="barPitch" style="width: 50%;"></div>
+                    </div>
+                    <span class="euler-range">-90° to +90°</span>
+                  </div>
+                  <div class="euler-card">
+                    <div class="euler-header">
+                      <span class="euler-label"><i class="fa-solid fa-arrows-left-right"></i> Roll</span>
+                      <span class="euler-val" id="valRoll">+0.0°</span>
+                    </div>
+                    <div class="euler-bar-wrap">
+                      <div class="euler-center-mark"></div>
+                      <div class="euler-bar-fill bar-roll" id="barRoll" style="width: 50%;"></div>
+                    </div>
+                    <span class="euler-range">-180° to +180°</span>
+                  </div>
+                  <div class="euler-card">
+                    <div class="euler-header">
+                      <span class="euler-label"><i class="fa-solid fa-compass"></i> Yaw / Hdg</span>
+                      <span class="euler-val" id="valYaw">0.0° N</span>
+                    </div>
+                    <div class="euler-bar-wrap">
+                      <div class="euler-bar-fill bar-yaw" id="barYaw" style="width: 0%;"></div>
+                    </div>
+                    <span class="euler-range">0° to 360°</span>
+                  </div>
+                </div>
+              </div>
+
               <!-- Accelerometer 3-Axis Reading -->
               <div class="sensor-section">
                 <div class="section-title"><i class="fa-solid fa-gauge"></i> Accelerometer (g-force)</div>
                 <div class="axis-bars">
                   <div class="axis-row">
-                    <span class="axis-lbl">X (Pitch):</span>
+                    <span class="axis-lbl">X (Pitch Axis):</span>
                     <div class="bar-bg"><div class="bar-fill bar-x" id="barAccelX" style="width: 50%;"></div></div>
                     <span class="axis-val" id="valAccelX">+0.04 g</span>
                   </div>
                   <div class="axis-row">
-                    <span class="axis-lbl">Y (Roll):</span>
+                    <span class="axis-lbl">Y (Roll Axis):</span>
                     <div class="bar-bg"><div class="bar-fill bar-y" id="barAccelY" style="width: 50%;"></div></div>
                     <span class="axis-val" id="valAccelY">-0.12 g</span>
                   </div>
                   <div class="axis-row">
-                    <span class="axis-lbl">Z (Yaw):</span>
+                    <span class="axis-lbl">Z (Yaw Axis):</span>
                     <div class="bar-bg"><div class="bar-fill bar-z" id="barAccelZ" style="width: 75%;"></div></div>
                     <span class="axis-val" id="valAccelZ">+0.98 g</span>
                   </div>
@@ -171,19 +222,22 @@
 
               <!-- Gyroscope 3-Axis Reading -->
               <div class="sensor-section">
-                <div class="section-title"><i class="fa-solid fa-rotate"></i> Gyroscope (°/s rotation)</div>
+                <div class="section-title"><i class="fa-solid fa-rotate"></i> Gyroscope (°/s angular rate)</div>
                 <div class="axis-bars">
                   <div class="axis-row">
                     <span class="axis-lbl">GX (Roll rate):</span>
-                    <span class="axis-val-wide" id="valGyroX">1.2 °/s</span>
+                    <div class="bar-bg"><div class="bar-fill bar-gx" id="barGyroX" style="width: 50%;"></div></div>
+                    <span class="axis-val" id="valGyroX">1.2 °/s</span>
                   </div>
                   <div class="axis-row">
                     <span class="axis-lbl">GY (Pitch rate):</span>
-                    <span class="axis-val-wide" id="valGyroY">-4.5 °/s</span>
+                    <div class="bar-bg"><div class="bar-fill bar-gy" id="barGyroY" style="width: 50%;"></div></div>
+                    <span class="axis-val" id="valGyroY">-4.5 °/s</span>
                   </div>
                   <div class="axis-row">
                     <span class="axis-lbl">GZ (Yaw rate):</span>
-                    <span class="axis-val-wide" id="valGyroZ">0.8 °/s</span>
+                    <div class="bar-bg"><div class="bar-fill bar-gz" id="barGyroZ" style="width: 50%;"></div></div>
+                    <span class="axis-val" id="valGyroZ">0.8 °/s</span>
                   </div>
                 </div>
               </div>
@@ -191,12 +245,25 @@
           </div>
         </div>
 
-        <!-- Real-time IMU Motion History Chart -->
+        <!-- Real-time IMU Motion History Chart (Accel & Gyro) -->
         <div class="card chart-card">
           <div class="card-header">
-            <h3><i class="fa-solid fa-chart-line"></i> Real-time Motion Acceleration History (3-Axis IMU)</h3>
+            <div class="chart-title-area">
+              <h3><i class="fa-solid fa-chart-line"></i> Real-time 6-DOF IMU Motion History (Accel & Gyro)</h3>
+              <span class="chart-live-badge" id="chartWindowBadge"><i class="fa-solid fa-clock"></i> Last 1 Min (60s)</span>
+            </div>
             <div class="chart-actions">
-              <button class="btn btn-sm" id="btnClearChart"><i class="fa-solid fa-trash-can"></i> Clear Graph</button>
+              <div class="btn-group" id="chartModeGroup" title="Filter plotted IMU signals">
+                <button class="btn btn-sm btn-filter active" data-mode="all">All (6-DOF)</button>
+                <button class="btn btn-sm btn-filter" data-mode="accel">Accel (g)</button>
+                <button class="btn btn-sm btn-filter" data-mode="gyro">Gyro (°/s)</button>
+              </div>
+              <div class="btn-group" id="chartWindowGroup" title="Time window display range">
+                <button class="btn btn-sm btn-window" data-window="30">30s</button>
+                <button class="btn btn-sm btn-window active" data-window="60">1 Min</button>
+                <button class="btn btn-sm btn-window" data-window="180">3 Min</button>
+              </div>
+              <button class="btn btn-sm" id="btnClearChart" title="Clear chart buffer"><i class="fa-solid fa-trash-can"></i> Clear</button>
             </div>
           </div>
           <div class="card-body">
