@@ -338,7 +338,35 @@
           </div>
         </div>
 
-        <!-- Middle Row: 3D IMU Chip Visualization & Digital Low-Pass Filter Controls -->
+        <!-- Real-time 6-DOF IMU Amplitude vs Time History Chart (Accel & Gyro) -->
+        <div class="card chart-card">
+          <div class="card-header">
+            <div class="chart-title-area">
+              <h3><i class="fa-solid fa-chart-line"></i> Real-Time 6-DOF Amplitude vs Time (Accel & Gyro)</h3>
+              <span class="chart-live-badge" id="chartWindowBadge"><i class="fa-solid fa-clock"></i> Last 1 Min (60s)</span>
+            </div>
+            <div class="chart-actions">
+              <div class="btn-group" id="chartModeGroup" title="Filter plotted IMU signals">
+                <button class="btn btn-sm btn-filter active" data-mode="all">All (6-DOF)</button>
+                <button class="btn btn-sm btn-filter" data-mode="accel">Accel (g)</button>
+                <button class="btn btn-sm btn-filter" data-mode="gyro">Gyro (°/s)</button>
+              </div>
+              <div class="btn-group" id="chartWindowGroup" title="Time window display range">
+                <button class="btn btn-sm btn-window" data-window="30">30s</button>
+                <button class="btn btn-sm btn-window active" data-window="60">1 Min</button>
+                <button class="btn btn-sm btn-window" data-window="180">3 Min</button>
+              </div>
+              <button class="btn btn-sm" id="btnClearChart" title="Clear chart buffer"><i class="fa-solid fa-trash-can"></i> Clear</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="chart-wrapper">
+              <canvas id="motionChart"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3D IMU Attitude Visualization & Digital Low-Pass Filter Controls -->
         <div class="imu-3d-and-filter-grid">
           <!-- 3D IMU Chip & Board Orientation Card -->
           <div class="card imu-3d-card" id="imu3dCard">
@@ -490,34 +518,6 @@
                   <span id="impactText">Filters actively smoothing <strong>Orientation (Pitch/Roll/Yaw)</strong>, <strong>G-Force</strong>, <strong>Angular Rate</strong>, and <strong>3D Model</strong>.</span>
                 </div>
               </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Real-time IMU Motion History Chart (Accel & Gyro) -->
-        <div class="card chart-card">
-          <div class="card-header">
-            <div class="chart-title-area">
-              <h3><i class="fa-solid fa-chart-line"></i> Real-time 6-DOF IMU Motion History (Accel & Gyro)</h3>
-              <span class="chart-live-badge" id="chartWindowBadge"><i class="fa-solid fa-clock"></i> Last 1 Min (60s)</span>
-            </div>
-            <div class="chart-actions">
-              <div class="btn-group" id="chartModeGroup" title="Filter plotted IMU signals">
-                <button class="btn btn-sm btn-filter active" data-mode="all">All (6-DOF)</button>
-                <button class="btn btn-sm btn-filter" data-mode="accel">Accel (g)</button>
-                <button class="btn btn-sm btn-filter" data-mode="gyro">Gyro (°/s)</button>
-              </div>
-              <div class="btn-group" id="chartWindowGroup" title="Time window display range">
-                <button class="btn btn-sm btn-window" data-window="30">30s</button>
-                <button class="btn btn-sm btn-window active" data-window="60">1 Min</button>
-                <button class="btn btn-sm btn-window" data-window="180">3 Min</button>
-              </div>
-              <button class="btn btn-sm" id="btnClearChart" title="Clear chart buffer"><i class="fa-solid fa-trash-can"></i> Clear</button>
-            </div>
-          </div>
-          <div class="card-body">
-            <div class="chart-wrapper">
-              <canvas id="motionChart"></canvas>
             </div>
           </div>
         </div>
