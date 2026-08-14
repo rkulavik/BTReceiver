@@ -1,29 +1,31 @@
-# Ranchbot & BLE Telemetry Receiver Application
+# Ranchbot & BLE / Serial Telemetry Receiver Application
 
-An interactive web application and Python client for scanning, connecting, and decoding Bluetooth Low Energy (BLE) telemetry broadcasts from Ranchbot and satellite/cellular water monitoring hardware.
+An interactive web application and Python client for scanning, connecting, and decoding direct **Web Serial (USB UART)** streams and **Bluetooth Low Energy (BLE)** telemetry broadcasts from Ranchbot, Seeed Xiao, and satellite/cellular water & livestock monitoring hardware.
 
 ## Features
 
-1. **Web Bluetooth Interface (`index.html`)**:
-   - Live GATT Connection & Status Manager (Connected / Disconnected / Scanning).
-   - Real-time **Water Tank Level Gauge** with animated liquid depth & capacity % calculation.
-   - **System Power & Battery Gauge**: Displays solar panel output wattage, internal device temperature, and battery voltage.
-   - **Real-Time Telemetry Chart**: Line graph plotting water depth history using Chart.js.
-   - **Packet Decoder Console**: Decodes raw byte payloads (Sync Header, Water Level mm, Max Tank Height, Battery mV, Solar mW, Temp °C, Pump & Solar flags).
-   - **Demo Simulator Mode**: Built-in simulator to test data streaming and decoding without physical BLE hardware present.
+1. **Web Serial (USB UART) & Web Bluetooth Interface (`index.html`)**:
+   - **Direct USB Serial Connection (Web Serial API)**: Stream raw UART feed from connected serial ports at 115200, 57600, 38400, 19200, or 9600 baud.
+   - **Bluetooth LE GATT Manager**: Connect and receive telemetry notifications over BLE (including Nordic UART Service - NUS).
+   - **Live Raw UART Feed Console**: Real-time monospaced ASCII text line stream and raw byte hex inspector with pause/resume and auto-scroll controls.
+   - **Cattle Tag GPS & IMU Dashboard**: Real-time Leaflet satellite map tracking cattle movement, 6-DOF IMU accelerometer/gyroscope gauges, and dynamic Chart.js motion history graph.
+   - **CSV Stream Recorder**: Record incoming serial/BLE packets and export complete telemetry records to CSV.
 
 2. **Python Desktop Receiver (`ble_receiver.py`)**:
    - Asynchronous BLE scanner and GATT notification subscriber using `bleak`.
-   - Automatic packet unpacking (`struct.unpack`) for 12-byte Ranchbot telemetry broadcasts.
+   - Automatic packet unpacking (`struct.unpack`) for 20-byte Ranchbot telemetry broadcasts.
 
 ## How to Run
 
 ### Web Application (Browser)
-1. Open `index.html` in Google Chrome or Microsoft Edge (which support the Web Bluetooth API).
-2. Click **"Scan & Connect Device"** to pair with a Bluetooth device nearby, OR click **"Toggle Demo Simulator"** to see live simulated telemetry broadcast parsing immediately!
+1. Open `index.html` in Google Chrome, Microsoft Edge, or Opera (which support the Web Serial and Web Bluetooth APIs).
+2. For direct USB UART connection: Plug in your serial device (FTDI, CP2102, CH340, Seeed Xiao USB), select your Baud Rate, and click **"Connect Serial / UART"**.
+3. For BLE connection: Click **"Connect Ear Tag (BLE)"** to pair with your Bluetooth LE device nearby.
+4. View the live ASCII text line feed or hex byte stream in the **Live Raw UART Feed & Telemetry** console!
 
 ### Python Script
 ```bash
 pip install bleak
 python ble_receiver.py
 ```
+

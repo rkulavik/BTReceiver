@@ -493,6 +493,7 @@ body {
   overflow: hidden;
   font-family: var(--font-mono);
   font-size: 0.78rem;
+  min-height: 180px;
 }
 
 .terminal-header {
@@ -520,7 +521,185 @@ body {
 .log-entry.error { color: var(--danger); }
 .log-entry.warn { color: var(--warning); }
 
+/* Header Action Controls */
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.btn-icon .btn-text {
+  font-size: 0.78rem;
+  margin-left: 0.25rem;
+  font-weight: 500;
+}
+
+/* CSV Stream Recorder Panel */
+.recorder-bar {
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.8rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.recorder-info {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.recorder-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  letter-spacing: 0.03em;
+}
+
+.recorder-status-badge.stopped {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-dim);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.recorder-status-badge.recording {
+  background: rgba(255, 77, 109, 0.15);
+  color: var(--danger);
+  border: 1px solid rgba(255, 77, 109, 0.4);
+}
+
+.recorder-status-badge.recording .status-dot {
+  animation: pulse-red 1.2s infinite ease-in-out;
+}
+
+.recorder-stats {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.stat-timer {
+  color: var(--secondary);
+  font-weight: 700;
+  background: rgba(0, 242, 254, 0.1);
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+}
+
+.stat-count {
+  color: var(--text-main);
+  font-weight: 600;
+}
+
+.stat-size {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.recorder-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.btn-record {
+  background: linear-gradient(135deg, #ff4d6d, #d90429);
+  color: #ffffff;
+  border: none;
+  box-shadow: 0 2px 10px rgba(255, 77, 109, 0.3);
+}
+
+.btn-record:hover {
+  box-shadow: 0 4px 15px rgba(255, 77, 109, 0.5);
+  transform: translateY(-1px);
+}
+
+.btn-record.is-recording {
+  background: linear-gradient(135deg, #ffb703, #fb8500);
+  color: #040914;
+  box-shadow: 0 2px 10px rgba(255, 183, 3, 0.4);
+}
+
+.stream-content-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Full Width Console Mode Styles */
+.dashboard-grid.full-width-active {
+  grid-template-columns: 1fr !important;
+}
+
+.dashboard-grid.full-width-active .device-info-card,
+.dashboard-grid.full-width-active .main-telemetry {
+  display: none !important;
+}
+
+.dashboard-grid.full-width-active .console-card {
+  grid-column: 1 / -1;
+  height: 100%;
+}
+
+.dashboard-grid.full-width-active .stream-content-wrapper {
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  gap: 1rem;
+  flex: 1;
+  min-height: 0;
+}
+
+.dashboard-grid.full-width-active .parsed-fields-box {
+  height: 100%;
+  overflow-y: auto;
+}
+
+@keyframes pulse-red {
+  0% { transform: scale(1); opacity: 1; box-shadow: 0 0 0 0 rgba(255, 77, 109, 0.7); }
+  70% { transform: scale(1.25); opacity: 0.7; box-shadow: 0 0 0 6px rgba(255, 77, 109, 0); }
+  100% { transform: scale(1); opacity: 1; box-shadow: 0 0 0 0 rgba(255, 77, 109, 0); }
+}
+
 @media (max-width: 1024px) {
   .dashboard-grid { grid-template-columns: 1fr; }
   .metrics-grid { grid-template-columns: 1fr; height: auto; }
+  .dashboard-grid.full-width-active .stream-content-wrapper {
+    grid-template-columns: 1fr;
+  }
 }
+
+/* Connection Status Badge Serial Active */
+.connection-status-badge.serial-connected {
+  background: rgba(0, 242, 254, 0.15);
+  color: var(--secondary);
+  border-color: rgba(0, 242, 254, 0.4);
+}
+
+.btn-icon.active {
+  background: rgba(0, 198, 255, 0.2);
+  color: var(--primary);
+  border: 1px solid rgba(0, 198, 255, 0.4);
+}
+
+.log-entry.uart-text {
+  color: #38ef7d;
+  font-family: var(--font-mono);
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+

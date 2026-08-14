@@ -1,9 +1,20 @@
-// Bluetooth & Application State
+// Bluetooth & Serial Application State
 let bleDevice = null;
 let gattServer = null;
-let isSimulating = false;
-let simulationInterval = null;
+let serialPort = null;
+let serialReader = null;
+let serialReadableStreamClosed = null;
+let serialLineBuffer = '';
+let autoScroll = true;
+let isStreamPaused = false;
 let packetCounter = 0;
+
+// Stream CSV Recorder & Layout State
+let isRecording = false;
+let recordedPackets = [];
+let recordingStartTime = null;
+let recordingTimerInterval = null;
+let isFullWidth = false;
 
 // Leaflet Map & Marker State
 let map = null;
@@ -15,13 +26,15 @@ let pathHistory = [];
 let motionChart = null;
 
 // DOM Elements
+const btnConnectSerial = document.getElementById('btnConnectSerial');
 const btnConnect = document.getElementById('btnConnect');
 const btnScanAll = document.getElementById('btnScanAll');
-const btnSimulate = document.getElementById('btnSimulate');
 const btnClearLog = document.getElementById('btnClearLog');
 const btnClearChart = document.getElementById('btnClearChart');
 const statusBadge = document.getElementById('statusBadge');
 const statusText = document.getElementById('statusText');
+const serialBaudSelect = document.getElementById('serialBaudSelect');
+const streamFormatSelect = document.getElementById('streamFormatSelect');
 const decoderSelect = document.getElementById('decoderSelect');
 
 // Device & Cow Info Elements
@@ -52,9 +65,23 @@ const valGyroY = document.getElementById('valGyroY');
 const valGyroZ = document.getElementById('valGyroZ');
 const motionPill = document.getElementById('motionPill');
 
-// Console & Parsed Grid
+// Console, Parsed Grid & Full-Width Elements
 const terminalLog = document.getElementById('terminalLog');
 const fieldsGrid = document.getElementById('fieldsGrid');
+const btnToggleFullWidth = document.getElementById('btnToggleFullWidth');
+const btnPauseStream = document.getElementById('btnPauseStream');
+const btnToggleAutoScroll = document.getElementById('btnToggleAutoScroll');
+const consoleCard = document.getElementById('consoleCard');
+
+// CSV Stream Recorder Elements
+const btnRecordToggle = document.getElementById('btnRecordToggle');
+const btnExportCsv = document.getElementById('btnExportCsv');
+const btnClearCsv = document.getElementById('btnClearCsv');
+const recorderBadge = document.getElementById('recorderBadge');
+const recorderStatusText = document.getElementById('recorderStatusText');
+const recorderTimer = document.getElementById('recorderTimer');
+const recorderCount = document.getElementById('recorderCount');
+const recorderSize = document.getElementById('recorderSize');
 
 // Standard & Custom BLE UUIDs
 const ENVIRONMENTAL_SENSING_SERVICE = 0x181a;
@@ -69,9 +96,11 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function setupEventListeners() {
+  if (btnConnectSerial) btnConnectSerial.addEventListener('click', handleConnectSerialButtonClick);
   btnConnect.addEventListener('click', handleConnectButtonClick);
   if (btnScanAll) btnScanAll.addEventListener('click', handleScanAllClick);
-  btnSimulate.addEventListener('click', toggleSimulation);
+  if (btnPauseStream) btnPauseStream.addEventListener('click', togglePauseStream);
+  if (btnToggleAutoScroll) btnToggleAutoScroll.addEventListener('click', toggleAutoScroll);
   btnClearLog.addEventListener('click', () => {
     terminalLog.innerHTML = '';
     logToConsole('system', 'Console log cleared.');
@@ -83,6 +112,12 @@ function setupEventListeners() {
     motionChart.data.datasets[2].data = [];
     motionChart.update();
   });
+
+  // CSV Recorder & Full Width Listeners
+  if (btnRecordToggle) btnRecordToggle.addEventListener('click', toggleRecording);
+  if (btnExportCsv) btnExportCsv.addEventListener('click', exportCsv);
+  if (btnClearCsv) btnClearCsv.addEventListener('click', clearCsvBuffer);
+  if (btnToggleFullWidth) btnToggleFullWidth.addEventListener('click', toggleFullWidthStream);
 }
 
 /* ==========================================================================
@@ -183,7 +218,7 @@ async function handleConnectButtonClick() {
   }
 
   if (!navigator.bluetooth) {
-    alert('Web Bluetooth is not supported in this browser environment. Click "Toggle Cow Tag Demo" to test live decoding!');
+    alert('Web Bluetooth is not supported in this browser environment. Use Web Serial API for USB UART connections.');
     return;
   }
 
@@ -454,10 +489,10 @@ function onDisconnected() {
 }
 
 /* ==========================================================================
-   Cow Tag Telemetry Payload Unpacker
+   Cow Tag Telemetry Payload Unpacker & Raw UART Stream Handler
    ========================================================================== */
 function handleCharacteristicValueChanged(event) {
-  decodeAndProcessPacket(event.target.value, 'BLE');
+  processRawUartChunk(event.target.value, 'BLE');
 }
 
 /**
@@ -541,6 +576,30 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
   }
 
   renderParsedFields(parsed);
+
+  // Store packet to CSV Recorder if recording is active
+  if (isRecording) {
+    const recordItem = {
+      timestamp_iso: new Date().toISOString(),
+      timestamp_local: new Date().toLocaleString(),
+      packet_number: packetCounter,
+      source: source,
+      tag_id: parsed['Ear Tag ID'] || (bleDevice && bleDevice.name ? bleDevice.name : 'COW-8492'),
+      lat: parsed['GPS Lat'] ? parsed['GPS Lat'].replace('°', '') : '',
+      lng: parsed['GPS Lng'] ? parsed['GPS Lng'].replace('°', '') : '',
+      accel_x: parsed['Accel X/Y/Z'] ? parsed['Accel X/Y/Z'].split(',')[0].replace('g', '').trim() : '',
+      accel_y: parsed['Accel X/Y/Z'] ? parsed['Accel X/Y/Z'].split(',')[1].replace('g', '').trim() : '',
+      accel_z: parsed['Accel X/Y/Z'] ? parsed['Accel X/Y/Z'].split(',')[2].replace('g', '').trim() : '',
+      gyro_x: parsed['Gyro X/Y/Z'] ? parsed['Gyro X/Y/Z'].split(',')[0].replace('°', '').trim() : '',
+      gyro_y: parsed['Gyro X/Y/Z'] ? parsed['Gyro X/Y/Z'].split(',')[1].replace('°', '').trim() : '',
+      gyro_z: parsed['Gyro X/Y/Z'] ? parsed['Gyro X/Y/Z'].split(',')[2].replace('°', '').trim() : '',
+      battery_v: parsed['Tag Battery'] ? parsed['Tag Battery'].replace('V', '').trim() : '',
+      activity_mode: parsed['Activity Mode'] || '',
+      raw_hex: rawHexStr
+    };
+    recordedPackets.push(recordItem);
+    updateRecorderStats();
+  }
 }
 
 /* ==========================================================================
@@ -618,7 +677,9 @@ function logToConsole(type, msg) {
   entry.className = `log-entry ${type}`;
   entry.innerHTML = `<span style="color: #64748b; margin-right: 8px;">[${time}]</span> ${escapeHtml(msg)}`;
   terminalLog.appendChild(entry);
-  terminalLog.scrollTop = terminalLog.scrollHeight;
+  if (autoScroll) {
+    terminalLog.scrollTop = terminalLog.scrollHeight;
+  }
 }
 
 function escapeHtml(str) {
@@ -626,60 +687,359 @@ function escapeHtml(str) {
 }
 
 /* ==========================================================================
-   Cattle Tag Broadcast Simulator (GPS + Accelerometer/Gyroscope Stream)
+   Web Serial API (USB-to-UART Direct Hardware Connection)
    ========================================================================== */
-function toggleSimulation() {
-  if (isSimulating) {
-    clearInterval(simulationInterval);
-    isSimulating = false;
-    btnSimulate.classList.remove('btn-primary');
-    btnSimulate.classList.add('btn-secondary');
-    btnSimulate.innerHTML = '<i class="fa-solid fa-vial"></i> Toggle Cow Tag Demo';
+async function handleConnectSerialButtonClick() {
+  if (serialPort) {
+    await disconnectSerialPort();
+    return;
+  }
+
+  if (!('serial' in navigator)) {
+    alert('Web Serial API is not supported in this browser environment. Please use Google Chrome, Microsoft Edge, or Opera.');
+    logToConsole('error', 'Web Serial API (navigator.serial) is unavailable in this browser.');
+    return;
+  }
+
+  try {
+    const selectedBaud = parseInt(serialBaudSelect.value, 10) || 115200;
+    logToConsole('system', `Requesting Serial (UART) Port connection at ${selectedBaud} baud...`);
+    
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: selectedBaud });
+
+    const portInfo = serialPort.getInfo();
+    const usbVendorId = portInfo.usbVendorId ? `0x${portInfo.usbVendorId.toString(16).toUpperCase()}` : 'UART';
+    const usbProductId = portInfo.usbProductId ? `0x${portInfo.usbProductId.toString(16).toUpperCase()}` : 'DEV';
+
+    updateStatus('serial-connected', `Serial Active (${selectedBaud}b)`);
+    updateDeviceOverview(`USB Serial Device (${usbVendorId}:${usbProductId})`, `PORT-${usbVendorId}`, true);
+    cowTagIdEl.textContent = `UART-${usbVendorId}`;
+    btnConnectSerial.className = 'btn btn-primary';
+    btnConnectSerial.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Disconnect Serial';
+
+    logToConsole('system', `[SERIAL CONNECTED] Port open at ${selectedBaud} baud.`);
+
+    // Start reading stream
+    readSerialStream();
+  } catch (err) {
+    logToConsole('error', `Serial Port Connection failed: ${err.message}`);
     updateStatus('disconnected', 'Disconnected');
-    updateDeviceOverview('--', '--', false);
-    logToConsole('system', 'Cow Tag Simulator stopped.');
-  } else {
-    if (bleDevice && bleDevice.gatt.connected) {
-      disconnectDevice();
+    serialPort = null;
+  }
+}
+
+async function readSerialStream() {
+  try {
+    const reader = serialPort.readable.getReader();
+    serialReader = reader;
+
+    while (serialPort && serialPort.readable) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        processRawUartChunk(value, 'SERIAL');
+      }
     }
-    isSimulating = true;
-    btnSimulate.classList.remove('btn-secondary');
-    btnSimulate.classList.add('btn-primary');
-    btnSimulate.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Simulator';
-    updateStatus('connected', 'Simulating Cow Tag');
-    updateDeviceOverview('Ranchbot Cattle Smart Tag #8492', 'TAG-99-4A-32', true);
-    logToConsole('system', 'Started Cattle Ear Tag GPS + 6-DOF IMU Telemetry Stream...');
+  } catch (err) {
+    if (serialPort) {
+      logToConsole('error', `Serial Stream Read Error: ${err.message}`);
+    }
+  } finally {
+    if (serialReader) {
+      try { serialReader.releaseLock(); } catch(e){}
+      serialReader = null;
+    }
+  }
+}
 
-    let curLat = 31.968600;
-    let curLng = -99.901800;
+async function disconnectSerialPort() {
+  if (serialReader) {
+    try {
+      await serialReader.cancel();
+    } catch (e) {}
+    serialReader = null;
+  }
+  if (serialPort) {
+    try {
+      await serialPort.close();
+    } catch (e) {}
+    serialPort = null;
+  }
 
-    simulationInterval = setInterval(() => {
-      // Simulate cow walking / grazing step movement on pasture
-      const dLat = (Math.random() - 0.45) * 0.00012;
-      const dLng = (Math.random() - 0.45) * 0.00012;
-      curLat += dLat;
-      curLng += dLng;
+  updateStatus('disconnected', 'Disconnected');
+  updateDeviceOverview('--', '--', false);
+  btnConnectSerial.className = 'btn btn-primary';
+  btnConnectSerial.innerHTML = '<i class="fa-solid fa-plug"></i> Connect Serial / UART';
+  logToConsole('warn', 'Serial UART Disconnected.');
+}
 
-      // Simulate 6-DOF IMU readings (Cow head motion while grazing)
-      const axRaw = Math.round((Math.random() - 0.5) * 350); // g * 1000
-      const ayRaw = Math.round((Math.random() - 0.5) * 450);
-      const azRaw = Math.round(980 + (Math.random() - 0.5) * 200);
+/**
+ * Process Raw UART Data from Serial or BLE
+ */
+function processRawUartChunk(chunkData, source = 'SERIAL') {
+  if (isStreamPaused) return;
 
-      // Pack 20-byte Cattle Tag Payload
-      const buffer = new ArrayBuffer(20);
-      const view = new DataView(buffer);
+  let textChunk = '';
+  let hexBytes = [];
+  let dataView = null;
 
-      view.setUint8(0, 0xCB); // Sync Header for Cattle Tag
-      view.setUint16(1, 8492, true); // Cow Tag #8492
-      view.setInt32(3, Math.round(curLat * 1e7), true); // Lat microdegrees
-      view.setInt32(7, Math.round(curLng * 1e7), true); // Lng microdegrees
-      view.setInt16(11, axRaw, true);
-      view.setInt16(13, ayRaw, true);
-      view.setInt16(15, azRaw, true);
-      view.setUint16(17, 3880, true); // 3.88V battery
-      view.setUint8(19, Math.random() > 0.3 ? 1 : 2); // Grazing or Walking activity
+  if (typeof chunkData === 'string') {
+    textChunk = chunkData;
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(chunkData);
+    for (let i = 0; i < bytes.length; i++) {
+      hexBytes.push(bytes[i].toString(16).padStart(2, '0').toUpperCase());
+    }
+  } else if (chunkData instanceof DataView || chunkData instanceof ArrayBuffer || ArrayBuffer.isView(chunkData)) {
+    if (chunkData instanceof DataView) {
+      dataView = chunkData;
+    } else {
+      dataView = new DataView(chunkData.buffer || chunkData, chunkData.byteOffset || 0, chunkData.byteLength);
+    }
+    const bytes = new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength);
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    textChunk = decoder.decode(bytes);
 
-      decodeAndProcessPacket(view, 'SIMULATOR');
-    }, 2000);
+    for (let i = 0; i < bytes.length; i++) {
+      hexBytes.push(bytes[i].toString(16).padStart(2, '0').toUpperCase());
+    }
+  }
+
+  const rawHexStr = hexBytes.join(' ');
+  const displayFormat = streamFormatSelect ? streamFormatSelect.value : 'text';
+
+  if (displayFormat === 'hex') {
+    logToConsole('rx', `[RAW HEX ${source}] ${rawHexStr}`);
+  } else {
+    // Text feed line-buffering
+    serialLineBuffer += textChunk;
+    const lines = serialLineBuffer.split(/\r?\n/);
+    serialLineBuffer = lines.pop(); // keep trailing partial line
+
+    for (const line of lines) {
+      if (line.length > 0) {
+        logToConsole('uart-text', `[${source}] ${line}`);
+      }
+    }
+  }
+
+  // If binary DataView is present or header match exists, decode binary payload
+  if (dataView && dataView.byteLength >= 16) {
+    const header = dataView.getUint8(0);
+    if (header === 0xCB) {
+      decodeAndProcessPacket(dataView, source);
+    }
+  }
+}
+
+function togglePauseStream() {
+  isStreamPaused = !isStreamPaused;
+  if (isStreamPaused) {
+    btnPauseStream.classList.add('active');
+    btnPauseStream.innerHTML = '<i class="fa-solid fa-play"></i>';
+    btnPauseStream.title = 'Resume Stream';
+    logToConsole('system', 'UART Stream PAUSED.');
+  } else {
+    btnPauseStream.classList.remove('active');
+    btnPauseStream.innerHTML = '<i class="fa-solid fa-pause"></i>';
+    btnPauseStream.title = 'Pause Stream';
+    logToConsole('system', 'UART Stream RESUMED.');
+  }
+}
+
+function toggleAutoScroll() {
+  autoScroll = !autoScroll;
+  if (autoScroll) {
+    btnToggleAutoScroll.classList.add('active');
+    logToConsole('system', 'Terminal Auto-Scroll ENABLED.');
+  } else {
+    btnToggleAutoScroll.classList.remove('active');
+    logToConsole('system', 'Terminal Auto-Scroll DISABLED.');
+  }
+}
+
+/* ==========================================================================
+   Bluetooth Telemetry Stream CSV Recorder Logic
+   ========================================================================== */
+function toggleRecording() {
+  if (isRecording) {
+    stopRecording();
+  } else {
+    startRecording();
+  }
+}
+
+function startRecording() {
+  isRecording = true;
+  recordingStartTime = Date.now();
+  
+  recorderBadge.className = 'recorder-status-badge recording';
+  recorderStatusText.textContent = 'RECORDING...';
+  btnRecordToggle.className = 'btn btn-sm btn-record is-recording';
+  btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Recording';
+  
+  if (btnExportCsv) btnExportCsv.removeAttribute('disabled');
+
+  recordingTimerInterval = setInterval(updateRecorderTimerDisplay, 1000);
+  updateRecorderTimerDisplay();
+  updateRecorderStats();
+
+  logToConsole('system', 'CSV Stream Recorder STARTED. Logging incoming BT packets...');
+}
+
+function stopRecording() {
+  isRecording = false;
+  clearInterval(recordingTimerInterval);
+  recordingTimerInterval = null;
+
+  recorderBadge.className = 'recorder-status-badge stopped';
+  recorderStatusText.textContent = 'REC IDLE';
+  btnRecordToggle.className = 'btn btn-sm btn-record';
+  btnRecordToggle.innerHTML = '<i class="fa-solid fa-circle"></i> Start Recording';
+
+  logToConsole('system', `CSV Stream Recorder STOPPED. Captured ${recordedPackets.length} total records.`);
+}
+
+function updateRecorderTimerDisplay() {
+  if (!recordingStartTime) {
+    recorderTimer.textContent = '00:00:00';
+    return;
+  }
+  const elapsedMs = Date.now() - recordingStartTime;
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const hrs = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+  const mins = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+  const secs = String(totalSeconds % 60).padStart(2, '0');
+  recorderTimer.textContent = `${hrs}:${mins}:${secs}`;
+}
+
+function updateRecorderStats() {
+  const count = recordedPackets.length;
+  recorderCount.textContent = `${count} record${count === 1 ? '' : 's'}`;
+  
+  // Approximate CSV file size in KB (~220 bytes per row)
+  const estBytes = count * 220;
+  const estKb = (estBytes / 1024).toFixed(1);
+  recorderSize.textContent = `(~${estKb} KB)`;
+
+  if (count > 0 && btnExportCsv) {
+    btnExportCsv.removeAttribute('disabled');
+  }
+}
+
+function exportCsv() {
+  if (recordedPackets.length === 0) {
+    alert('No recorded Bluetooth telemetry stream data to export. Click "Start Recording" to capture data.');
+    return;
+  }
+
+  const headers = [
+    'Timestamp (ISO)',
+    'Timestamp (Local)',
+    'Packet #',
+    'Source',
+    'Cow Tag ID',
+    'Latitude (°)',
+    'Longitude (°)',
+    'Accel X (g)',
+    'Accel Y (g)',
+    'Accel Z (g)',
+    'Gyro X (°/s)',
+    'Gyro Y (°/s)',
+    'Gyro Z (°/s)',
+    'Battery (V)',
+    'Activity Mode',
+    'Raw Hex Payload'
+  ];
+
+  const csvRows = [headers.join(',')];
+
+  for (const p of recordedPackets) {
+    const row = [
+      escapeCsvField(p.timestamp_iso),
+      escapeCsvField(p.timestamp_local),
+      p.packet_number,
+      escapeCsvField(p.source),
+      escapeCsvField(p.tag_id),
+      p.lat,
+      p.lng,
+      p.accel_x,
+      p.accel_y,
+      p.accel_z,
+      p.gyro_x,
+      p.gyro_y,
+      p.gyro_z,
+      p.battery_v,
+      escapeCsvField(p.activity_mode),
+      escapeCsvField(p.raw_hex)
+    ];
+    csvRows.push(row.join(','));
+  }
+
+  const csvContent = csvRows.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  
+  const now = new Date();
+  const dateStr = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const filename = `ranchbot_bt_stream_${dateStr}.csv`;
+
+  const link = document.createElement('a');
+  link.setAttribute('href', url);
+  link.setAttribute('download', filename);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+
+  logToConsole('system', `EXPORT SUCCESS: Saved ${recordedPackets.length} stream records to "${filename}".`);
+}
+
+function escapeCsvField(field) {
+  if (field === null || field === undefined) return '""';
+  const str = String(field).replace(/"/g, '""');
+  return `"${str}"`;
+}
+
+function clearCsvBuffer() {
+  if (isRecording) {
+    stopRecording();
+  }
+  recordedPackets = [];
+  recordingStartTime = null;
+  updateRecorderTimerDisplay();
+  updateRecorderStats();
+  if (btnExportCsv) btnExportCsv.setAttribute('disabled', 'true');
+  logToConsole('system', 'Recorded CSV telemetry buffer cleared.');
+}
+
+/* ==========================================================================
+   Full Width Telemetry Stream Layout Toggle
+   ========================================================================== */
+function toggleFullWidthStream() {
+  const dashboardGrid = document.querySelector('.dashboard-grid');
+  if (!dashboardGrid) return;
+
+  isFullWidth = !isFullWidth;
+  if (isFullWidth) {
+    dashboardGrid.classList.add('full-width-active');
+    btnToggleFullWidth.innerHTML = '<i class="fa-solid fa-compress"></i> <span class="btn-text">Restore View</span>';
+    btnToggleFullWidth.classList.add('btn-primary');
+    btnToggleFullWidth.title = 'Restore Standard 3-Column Dashboard View';
+    logToConsole('system', 'Telemetry Stream area expanded to FULL SCREEN WIDTH.');
+  } else {
+    dashboardGrid.classList.remove('full-width-active');
+    btnToggleFullWidth.innerHTML = '<i class="fa-solid fa-expand"></i> <span class="btn-text">Full Width</span>';
+    btnToggleFullWidth.classList.remove('btn-primary');
+    btnToggleFullWidth.title = 'Toggle Full Width Stream Area (Expand/Compress)';
+    logToConsole('system', 'Restored standard 3-column dashboard layout.');
+  }
+
+  // Allow Leaflet map to adjust bounds if restored
+  if (map) {
+    setTimeout(() => map.invalidateSize(), 250);
   }
 }

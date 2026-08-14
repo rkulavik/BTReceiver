@@ -37,14 +37,14 @@
           <span class="status-dot"></span>
           <span id="statusText">Disconnected</span>
         </div>
-        <button id="btnConnect" class="btn btn-primary">
-          <i class="fa-solid fa-bluetooth-b"></i> Connect Ear Tag
+        <button id="btnConnectSerial" class="btn btn-primary" title="Connect to device via Web Serial (USB UART)">
+          <i class="fa-solid fa-plug"></i> Connect Serial / UART
+        </button>
+        <button id="btnConnect" class="btn btn-secondary" title="Connect to device via Bluetooth Low Energy">
+          <i class="fa-solid fa-bluetooth-b"></i> Connect Ear Tag (BLE)
         </button>
         <button id="btnScanAll" class="btn btn-secondary" title="Unfiltered scan for all nearby Bluetooth devices">
-          <i class="fa-solid fa-radar"></i> Scan All BLE Devices
-        </button>
-        <button id="btnSimulate" class="btn btn-secondary">
-          <i class="fa-solid fa-vial"></i> Toggle Cow Tag Demo
+          <i class="fa-solid fa-radar"></i> Scan All BLE
         </button>
       </div>
     </header>
@@ -86,6 +86,24 @@
           <hr class="divider">
 
           <h3><i class="fa-solid fa-sliders"></i> Protocol Settings</h3>
+          <div class="form-group">
+            <label for="serialBaudSelect">Serial UART Baud Rate</label>
+            <select id="serialBaudSelect" class="form-control">
+              <option value="115200" selected>115200 baud</option>
+              <option value="57600">57600 baud</option>
+              <option value="38400">38400 baud</option>
+              <option value="19200">19200 baud</option>
+              <option value="9600">9600 baud</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="streamFormatSelect">UART Feed Display Mode</label>
+            <select id="streamFormatSelect" class="form-control">
+              <option value="text" selected>Raw ASCII / Text Stream</option>
+              <option value="hex">Raw Hex Bytes Inspector</option>
+              <option value="decoded">Decoded Binary Payload</option>
+            </select>
+          </div>
           <div class="form-group">
             <label for="decoderSelect">BLE Payload Unpacker</label>
             <select id="decoderSelect" class="form-control">
@@ -190,30 +208,70 @@
       </section>
 
       <!-- Right Panel: Packet Telemetry Console & Raw Hex Payload Inspector -->
-      <aside class="card console-card">
+      <aside class="card console-card" id="consoleCard">
         <div class="card-header">
-          <h2><i class="fa-solid fa-terminal"></i> BLE Telemetry Stream</h2>
-          <button class="btn btn-sm btn-icon" id="btnClearLog" title="Clear Terminal">
-            <i class="fa-solid fa-eraser"></i>
-          </button>
+          <h2><i class="fa-solid fa-terminal"></i> Live Raw UART Feed & Telemetry</h2>
+          <div class="header-actions">
+            <button class="btn btn-sm btn-icon" id="btnPauseStream" title="Pause / Resume Live Feed Stream">
+              <i class="fa-solid fa-pause"></i>
+            </button>
+            <button class="btn btn-sm btn-icon active" id="btnToggleAutoScroll" title="Toggle Auto-Scroll Terminal">
+              <i class="fa-solid fa-angles-down"></i>
+            </button>
+            <button class="btn btn-sm btn-icon" id="btnToggleFullWidth" title="Toggle Full Width Stream Area (Expand/Compress)">
+              <i class="fa-solid fa-expand"></i> <span class="btn-text">Full Width</span>
+            </button>
+            <button class="btn btn-sm btn-icon" id="btnClearLog" title="Clear Terminal">
+              <i class="fa-solid fa-eraser"></i>
+            </button>
+          </div>
         </div>
         <div class="card-body flex-column">
-          <!-- Parsed Fields Grid -->
-          <div class="parsed-fields-box">
-            <div class="box-title">Decoded Cattle Tag Payload</div>
-            <div class="fields-grid" id="fieldsGrid">
-              <div class="empty-state">Waiting for Cow Tag BLE packets...</div>
+          <!-- Stream CSV Recorder Panel -->
+          <div class="recorder-bar" id="recorderBar">
+            <div class="recorder-info">
+              <div class="recorder-status-badge stopped" id="recorderBadge">
+                <span class="status-dot"></span>
+                <span id="recorderStatusText">REC IDLE</span>
+              </div>
+              <div class="recorder-stats">
+                <span class="stat-timer" id="recorderTimer">00:00:00</span>
+                <span class="stat-count" id="recorderCount">0 records</span>
+                <span class="stat-size" id="recorderSize">(0 KB)</span>
+              </div>
+            </div>
+            <div class="recorder-controls">
+              <button id="btnRecordToggle" class="btn btn-sm btn-record">
+                <i class="fa-solid fa-circle"></i> Start Recording
+              </button>
+              <button id="btnExportCsv" class="btn btn-sm btn-secondary" disabled title="Export Recorded Data to CSV">
+                <i class="fa-solid fa-file-csv"></i> Export CSV
+              </button>
+              <button id="btnClearCsv" class="btn btn-sm btn-icon" title="Clear Recorded CSV Buffer">
+                <i class="fa-solid fa-trash-can"></i>
+              </button>
             </div>
           </div>
 
-          <!-- Hex Log Terminal -->
-          <div class="terminal-wrapper">
-            <div class="terminal-header">
-              <span>Time</span>
-              <span>Cow Tag Broadcast Event / Raw Hex</span>
+          <!-- Parsed Fields & Terminal Section -->
+          <div class="stream-content-wrapper">
+            <!-- Parsed Fields Grid -->
+            <div class="parsed-fields-box">
+              <div class="box-title">Decoded Cattle Tag Payload</div>
+              <div class="fields-grid" id="fieldsGrid">
+                <div class="empty-state">Waiting for device UART / BLE packets...</div>
+              </div>
             </div>
-            <div class="terminal-log" id="terminalLog">
-              <div class="log-entry system">[SYSTEM] Cattle Ear Tag Receiver ready. Click "Connect Ear Tag" or "Toggle Cow Tag Demo".</div>
+
+            <!-- Raw UART Log Terminal -->
+            <div class="terminal-wrapper">
+              <div class="terminal-header">
+                <span>Time</span>
+                <span>Raw UART Stream / Received Bytes</span>
+              </div>
+              <div class="terminal-log" id="terminalLog">
+                <div class="log-entry system">[SYSTEM] Ready for device feed. Click "Connect Serial / UART" (USB) or "Connect Ear Tag" (BLE).</div>
+              </div>
             </div>
           </div>
         </div>
