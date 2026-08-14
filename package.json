@@ -4,8 +4,9 @@
   "description": "Ranchbot & BLE Telemetry Receiver Application",
   "main": "app.js",
   "scripts": {
-    "start": "npx serve .",
-    "dev": "npx vite --open"
+    "start": "npx serve dist",
+    "dev": "npx vite --open",
+    "build": "node build.js"
   },
   "keywords": [
     "bluetooth",
