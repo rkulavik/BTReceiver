@@ -1,8 +1,10 @@
 // ==========================================================================
 // Ranchbot Cattle Ear Tag BLE & 6-DOF IMU Telemetry Receiver Application
 // 16-Bit Raw ADC IMU Calibration (±2.5G FS / ±125°/s FS)
-// Real-time 3D IMU Chip & Carrier Board Orientation Renderer (Three.js)
+// Real-time 60FPS 3D IMU Chip & Carrier Board Orientation Renderer (Three.js)
+// Center-Zero Bi-Directional Axis Gauges with Dynamic Glowing Ball Indicators
 // Independent Digital Low-Pass Filters (LPF) for Accel & Gyro
+// High-Performance RAF-Throttled Graph & 3D Render Loops
 // Last Connected Device Persistence & Scan Priority
 // ==========================================================================
 
@@ -50,6 +52,9 @@ let motionChart = null;
 let chartTimeWindowMs = 60000; // default 1 minute (60s)
 let chartFilterMode = 'all';    // 'all', 'accel', 'gyro'
 let chartBuffer = [];          // array of { time: number, label: string, ax, ay, az, gx, gy, gz }
+let chartNeedsUpdate = false;
+let lastChartRenderTime = 0;
+const CHART_RENDER_FPS_INTERVAL = 33; // ~30 FPS throttling for high-performance chart rendering
 
 // Three.js 3D IMU Chip Visualization State
 let scene3d = null;
@@ -59,10 +64,16 @@ let imuBoardGroup = null;
 let axesGizmoGroup = null;
 let deskGridHelper = null;
 let is3dInitialized = false;
+let is3dAnimating = false;
 let isMouseDragging3d = false;
 let previousMousePosition = { x: 0, y: 0 };
 let show3dAxes = true;
 let show3dGrid = true;
+
+// Slerp Quaternion Interpolation for 60FPS / 120FPS smooth continuous rotation
+let targetQuaternion = null;
+let currentQuaternion = null;
+let targetEuler = null;
 
 // Continuous IMU Latest State
 let currentImuState = {
@@ -226,15 +237,23 @@ const gpsFixPill = document.getElementById('gpsFixPill');
 const barAccelX = document.getElementById('barAccelX');
 const barAccelY = document.getElementById('barAccelY');
 const barAccelZ = document.getElementById('barAccelZ');
+const ballAccelX = document.getElementById('ballAccelX');
+const ballAccelY = document.getElementById('ballAccelY');
+const ballAccelZ = document.getElementById('ballAccelZ');
 const valAccelX = document.getElementById('valAccelX');
 const valAccelY = document.getElementById('valAccelY');
 const valAccelZ = document.getElementById('valAccelZ');
-const valGyroX = document.getElementById('valGyroX');
-const valGyroY = document.getElementById('valGyroY');
-const valGyroZ = document.getElementById('valGyroZ');
+
 const barGyroX = document.getElementById('barGyroX');
 const barGyroY = document.getElementById('barGyroY');
 const barGyroZ = document.getElementById('barGyroZ');
+const ballGyroX = document.getElementById('ballGyroX');
+const ballGyroY = document.getElementById('ballGyroY');
+const ballGyroZ = document.getElementById('ballGyroZ');
+const valGyroX = document.getElementById('valGyroX');
+const valGyroY = document.getElementById('valGyroY');
+const valGyroZ = document.getElementById('valGyroZ');
+
 const motionPill = document.getElementById('motionPill');
 const accelRangeBadge = document.getElementById('accelRangeBadge');
 const gyroRangeBadge = document.getElementById('gyroRangeBadge');
@@ -331,7 +350,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Set initial flat orientation (top of chip up on desk)
   updateIMUAndOrientation(0.00, 0.00, 1.00, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 'Default Position', 'At Rest');
   
-  logToConsole('system', 'Ranchbot Cow Tag BLE & GPS/IMU Receiver initialized. IMU configured for ±2.5G / ±125°/s (16-bit ADC).');
+  logToConsole('system', 'Ranchbot Cow Tag BLE & GPS/IMU Receiver initialized. 60FPS 3D & Bi-Directional Gauges ACTIVE.');
 });
 
 // ==========================================================================
@@ -376,7 +395,7 @@ function setupEventListeners() {
       accelFullScale = parseFloat(accelRangeSelect.value) || 2.5;
       accelLsbPerG = 32768.0 / accelFullScale;
       if (accelRangeBadge) {
-        accelRangeBadge.textContent = `±${accelFullScale} g Full Scale (${accelLsbPerG.toFixed(1)} LSB/g)`;
+        accelRangeBadge.textContent = `±${accelFullScale} g Full Scale (Center 0g)`;
       }
       if (motionChart) {
         motionChart.options.scales.y.min = -accelFullScale;
@@ -395,7 +414,7 @@ function setupEventListeners() {
       gyroFullScale = parseFloat(gyroRangeSelect.value) || 125.0;
       gyroLsbPerDps = 32768.0 / gyroFullScale;
       if (gyroRangeBadge) {
-        gyroRangeBadge.textContent = `±${gyroFullScale} °/s Full Scale (${gyroLsbPerDps.toFixed(1)} LSB/dps)`;
+        gyroRangeBadge.textContent = `±${gyroFullScale} °/s Full Scale (Center 0°/s)`;
       }
       if (motionChart) {
         motionChart.options.scales.y1.min = -gyroFullScale;
@@ -441,6 +460,7 @@ function setupEventListeners() {
       while (chartBuffer.length > 0 && chartBuffer[0].time < cutoff) {
         chartBuffer.shift();
       }
+      chartNeedsUpdate = true;
       rebuildChartFromBuffer();
     });
   }
@@ -686,7 +706,7 @@ async function handleLastDeviceReconnect() {
 }
 
 // ==========================================================================
-// 3D IMU Chip & Carrier Board Renderer (Three.js WebGL)
+// 3D IMU Chip & Carrier Board Renderer (Three.js WebGL - 60 FPS Engine)
 // ==========================================================================
 function init3DImuViewer() {
   const container = document.getElementById('imu3dContainer');
@@ -695,6 +715,11 @@ function init3DImuViewer() {
 
   const width = container.clientWidth || 300;
   const height = container.clientHeight || 280;
+
+  // Initialize Slerp Target & Current Quaternions
+  targetQuaternion = new THREE.Quaternion();
+  currentQuaternion = new THREE.Quaternion();
+  targetEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 
   // 1. Scene
   scene3d = new THREE.Scene();
@@ -706,13 +731,13 @@ function init3DImuViewer() {
   camera3d.lookAt(0, 0, 0);
 
   // 3. Renderer
-  renderer3d = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true });
+  renderer3d = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
   renderer3d.setSize(width, height);
   renderer3d.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer3d.shadowMap.enabled = true;
+  renderer3d.shadowMap.enabled = false; // Disabled shadowMap for 60fps maximum throughput
 
   // 4. Lighting
-  const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
   scene3d.add(ambientLight);
 
   const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
@@ -732,7 +757,7 @@ function init3DImuViewer() {
   imuBoardGroup = new THREE.Group();
   scene3d.add(imuBoardGroup);
 
-  // PCB Carrier Board (Dark Green FR4 / Matte Black substrate)
+  // PCB Carrier Board (Dark Green FR4 substrate)
   const pcbGeo = new THREE.BoxGeometry(3.6, 0.14, 2.6);
   const pcbMat = new THREE.MeshStandardMaterial({
     color: 0x113b2e,
@@ -867,7 +892,6 @@ function init3DImuViewer() {
     camera3d.lookAt(0, 0, 0);
 
     previousMousePosition = { x: e.clientX, y: e.clientY };
-    render3D();
   });
 
   container.addEventListener('wheel', (e) => {
@@ -876,7 +900,6 @@ function init3DImuViewer() {
     camera3d.position.multiplyScalar(zoomFactor);
     camera3d.position.clampLength(2.5, 16.0);
     camera3d.lookAt(0, 0, 0);
-    render3D();
   }, { passive: false });
 
   // Touch controls for mobile
@@ -907,23 +930,39 @@ function init3DImuViewer() {
 
       lastTouchX = e.touches[0].clientX;
       lastTouchY = e.touches[0].clientY;
-      render3D();
     }
   }, { passive: true });
 
   is3dInitialized = true;
-  render3D();
+  start3DAnimationLoop();
+}
+
+function start3DAnimationLoop() {
+  if (is3dAnimating) return;
+  is3dAnimating = true;
+
+  function animate() {
+    requestAnimationFrame(animate);
+    if (is3dInitialized && imuBoardGroup && targetQuaternion) {
+      // Ultra-responsive slerp (0.45 per frame -> instant, silky-smooth 60/120fps motion tracking)
+      currentQuaternion.slerp(targetQuaternion, 0.45);
+      imuBoardGroup.quaternion.copy(currentQuaternion);
+      render3D();
+    }
+  }
+  requestAnimationFrame(animate);
 }
 
 function update3DOrientation(pitchDeg, rollDeg, yawDeg, totalG = 1.0, isFlat = true) {
-  if (!is3dInitialized || !imuBoardGroup) return;
+  if (!is3dInitialized || !targetQuaternion) return;
 
   const pitchRad = (pitchDeg * Math.PI) / 180.0;
   const rollRad = (rollDeg * Math.PI) / 180.0;
   const yawRad = (yawDeg * Math.PI) / 180.0;
 
-  // Apply rotation matching physical board (Pitch = rotation on X, Roll = rotation on Z, Yaw = rotation on Y)
-  imuBoardGroup.rotation.set(-pitchRad, -yawRad, rollRad, 'YXZ');
+  // Set target quaternion for continuous 60fps slerp loop (Pitch = X, Roll = Z, Yaw = Y)
+  targetEuler.set(-pitchRad, -yawRad, rollRad, 'YXZ');
+  targetQuaternion.setFromEuler(targetEuler);
 
   // Update 3D HUD overlay
   if (hudPitch) hudPitch.textContent = `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}°`;
@@ -940,8 +979,6 @@ function update3DOrientation(pitchDeg, rollDeg, yawDeg, totalG = 1.0, isFlat = t
       chipFlatStatusPill.innerHTML = `<i class="fa-solid fa-arrows-spin"></i> Tilted (P:${pitchDeg.toFixed(0)}° R:${rollDeg.toFixed(0)}°)`;
     }
   }
-
-  render3D();
 }
 
 function render3D() {
@@ -954,7 +991,6 @@ function reset3DView() {
   if (camera3d) {
     camera3d.position.set(4.8, 4.2, 5.8);
     camera3d.lookAt(0, 0, 0);
-    render3D();
   }
 }
 
@@ -963,7 +999,6 @@ function toggle3DAxes() {
     show3dAxes = !show3dAxes;
     axesGizmoGroup.visible = show3dAxes;
     if (btnToggle3dAxes) btnToggle3dAxes.classList.toggle('active', show3dAxes);
-    render3D();
   }
 }
 
@@ -972,7 +1007,27 @@ function toggle3DGrid() {
     show3dGrid = !show3dGrid;
     deskGridHelper.visible = show3dGrid;
     if (btnToggle3dGrid) btnToggle3dGrid.classList.toggle('active', show3dGrid);
-    render3D();
+  }
+}
+
+// ==========================================================================
+// Center-Zero Bi-Directional Axis Bar & Ball Indicator Helper
+// ==========================================================================
+function updateBiDirectionalAxis(barEl, ballEl, val, maxScale) {
+  if (!barEl) return;
+  const num = parseFloat(val) || 0;
+  const clamped = Math.max(-maxScale, Math.min(maxScale, num));
+  const ratio = clamped / maxScale; // -1.0 to +1.0
+  const pct = Math.abs(ratio) * 50.0; // 0% to 50%
+
+  if (ratio >= 0) {
+    barEl.style.left = '50%';
+    barEl.style.width = `${pct}%`;
+    if (ballEl) ballEl.style.left = `${50.0 + pct}%`;
+  } else {
+    barEl.style.left = `${50.0 - pct}%`;
+    barEl.style.width = `${pct}%`;
+    if (ballEl) ballEl.style.left = `${50.0 - pct}%`;
   }
 }
 
@@ -1049,25 +1104,23 @@ function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawG
   currentImuState.roll = numRoll;
   currentImuState.yaw = numYaw;
 
-  // 1. Update Accelerometer Values & Bars (Constrained to Full Scale e.g. ±2.5g)
+  // 1. Update Accelerometer Values, Center-Zero Fills & Dynamic Balls (±2.5g)
   if (valAccelX) valAccelX.textContent = `${ax >= 0 ? '+' : ''}${ax.toFixed(2)} g`;
   if (valAccelY) valAccelY.textContent = `${ay >= 0 ? '+' : ''}${ay.toFixed(2)} g`;
   if (valAccelZ) valAccelZ.textContent = `${az >= 0 ? '+' : ''}${az.toFixed(2)} g`;
 
-  const maxG = accelFullScale;
-  if (barAccelX) barAccelX.style.width = `${Math.min(100, Math.max(0, ((ax + maxG) / (maxG * 2.0)) * 100))}%`;
-  if (barAccelY) barAccelY.style.width = `${Math.min(100, Math.max(0, ((ay + maxG) / (maxG * 2.0)) * 100))}%`;
-  if (barAccelZ) barAccelZ.style.width = `${Math.min(100, Math.max(0, ((az + maxG) / (maxG * 2.0)) * 100))}%`;
+  updateBiDirectionalAxis(barAccelX, ballAccelX, ax, accelFullScale);
+  updateBiDirectionalAxis(barAccelY, ballAccelY, ay, accelFullScale);
+  updateBiDirectionalAxis(barAccelZ, ballAccelZ, az, accelFullScale);
 
-  // 2. Update Gyroscope Values & Bars (Constrained to Full Scale e.g. ±125°/s)
+  // 2. Update Gyroscope Values, Center-Zero Fills & Dynamic Balls (±125°/s)
   if (valGyroX) valGyroX.textContent = `${gx >= 0 ? '+' : ''}${gx.toFixed(1)} °/s`;
   if (valGyroY) valGyroY.textContent = `${gy >= 0 ? '+' : ''}${gy.toFixed(1)} °/s`;
   if (valGyroZ) valGyroZ.textContent = `${gz >= 0 ? '+' : ''}${gz.toFixed(1)} °/s`;
 
-  const maxDps = gyroFullScale;
-  if (barGyroX) barGyroX.style.width = `${Math.min(100, Math.max(0, ((gx + maxDps) / (maxDps * 2.0)) * 100))}%`;
-  if (barGyroY) barGyroY.style.width = `${Math.min(100, Math.max(0, ((gy + maxDps) / (maxDps * 2.0)) * 100))}%`;
-  if (barGyroZ) barGyroZ.style.width = `${Math.min(100, Math.max(0, ((gz + maxDps) / (maxDps * 2.0)) * 100))}%`;
+  updateBiDirectionalAxis(barGyroX, ballGyroX, gx, gyroFullScale);
+  updateBiDirectionalAxis(barGyroY, ballGyroY, gy, gyroFullScale);
+  updateBiDirectionalAxis(barGyroZ, ballGyroZ, gz, gyroFullScale);
 
   // 3. Update Euler Gauges
   if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
@@ -2043,7 +2096,7 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
 }
 
 // ==========================================================================
-// Chart.js 6-DOF IMU Motion History Setup
+// Chart.js 6-DOF IMU Motion History Setup (High-Performance Engine)
 // ==========================================================================
 function initChart() {
   const chartCanvas = document.getElementById('motionChart');
@@ -2104,6 +2157,7 @@ function initChart() {
   });
 
   applyChartFilterMode();
+  startChartRenderLoop();
 }
 
 function addChartData(timeLabel, ax, ay, az, gx = 0, gy = 0, gz = 0) {
@@ -2126,7 +2180,20 @@ function addChartData(timeLabel, ax, ay, az, gx = 0, gy = 0, gz = 0) {
     chartBuffer.shift();
   }
 
-  rebuildChartFromBuffer();
+  chartNeedsUpdate = true;
+}
+
+function startChartRenderLoop() {
+  function loop(timestamp) {
+    requestAnimationFrame(loop);
+
+    if (chartNeedsUpdate && (timestamp - lastChartRenderTime >= CHART_RENDER_FPS_INTERVAL)) {
+      lastChartRenderTime = timestamp;
+      chartNeedsUpdate = false;
+      rebuildChartFromBuffer();
+    }
+  }
+  requestAnimationFrame(loop);
 }
 
 function rebuildChartFromBuffer() {
@@ -2451,30 +2518,32 @@ function toggleSimulatorStream() {
   if (isSimulatorRunning) {
     btnSimulateStream.classList.add('btn-primary');
     btnSimulateStream.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Test';
-    logToConsole('system', '[SIMULATOR] Test 6-DOF IMU & 3D Attitude UART stream generator STARTED.');
+    logToConsole('system', '[SIMULATOR] High-Speed 6-DOF IMU & 3D Attitude Stream Generator STARTED (20 Hz).');
 
     let simLat = 31.968600;
     let simLng = -99.901800;
     let count = 0;
 
+    // Run at 20 Hz (50ms) for high-speed continuous motion and graph validation
     simulatorInterval = setInterval(() => {
       count++;
-      simLat += (Math.random() - 0.5) * 0.00015;
-      simLng += (Math.random() - 0.5) * 0.00015;
+      simLat += (Math.random() - 0.5) * 0.00005;
+      simLng += (Math.random() - 0.5) * 0.00005;
 
+      const t = count * 0.08;
       // Realistic physical movements within ±2.5g and ±125°/s
-      const ax = (Math.sin(count * 0.3) * 0.65).toFixed(3);
-      const ay = (Math.cos(count * 0.25) * 0.45).toFixed(3);
-      const az = (0.98 + Math.sin(count * 0.15) * 0.18).toFixed(3);
+      const ax = (Math.sin(t * 1.5) * 0.85).toFixed(3);
+      const ay = (Math.cos(t * 1.2) * 0.65).toFixed(3);
+      const az = (0.98 + Math.sin(t * 0.8) * 0.25).toFixed(3);
 
-      const gx = (Math.cos(count * 0.35) * 22.0).toFixed(1);
-      const gy = (Math.sin(count * 0.3) * 28.0).toFixed(1);
-      const gz = (Math.sin(count * 0.2) * 12.0).toFixed(1);
+      const gx = (Math.cos(t * 1.8) * 45.0).toFixed(1);
+      const gy = (Math.sin(t * 1.5) * 55.0).toFixed(1);
+      const gz = (Math.sin(t * 0.9) * 25.0).toFixed(1);
 
-      const pitch = (Math.sin(count * 0.3) * 25.0).toFixed(2);
-      const roll = (Math.cos(count * 0.25) * 18.0).toFixed(2);
-      const yaw = ((count * 4.0) % 360).toFixed(2);
-      const battMv = Math.max(3400, Math.round(4120 - count * 1.5));
+      const pitch = (Math.sin(t * 1.5) * 35.0).toFixed(2);
+      const roll = (Math.cos(t * 1.2) * 28.0).toFixed(2);
+      const yaw = ((t * 20.0) % 360).toFixed(2);
+      const battMv = Math.max(3400, Math.round(4120 - (count * 0.05)));
       const battPct = Math.round(Math.min(100, Math.max(0, ((battMv - 3300) / 900) * 100)));
 
       // 16-Bit Signed ADC Values based on ±2.5g (13107.2 LSB/g) and ±125°/s (262.144 LSB/dps)
@@ -2485,17 +2554,14 @@ function toggleSimulatorStream() {
       const rawGy = Math.round(parseFloat(gy) * gyroLsbPerDps);
       const rawGz = Math.round(parseFloat(gz) * gyroLsbPerDps);
 
-      const mode = count % 5;
+      const mode = count % 4;
       if (mode === 0) {
-        const textMsg = `[10:56:35 AM] [BLE] $IMU,${280 + count},${482000 + count * 20},${rawAx},${rawAy},${rawAz},${rawGx},${rawGy},${rawGz},${pitch},${roll},${yaw}\n`;
+        const textMsg = `$IMU,${280 + count},${482000 + count * 20},${rawAx},${rawAy},${rawAz},${rawGx},${rawGy},${rawGz},${pitch},${roll},${yaw}\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
       } else if (mode === 1) {
-        const textMsg = `[10:56:36 AM] [BLE] [00:08:16.509,575] <inf> cowtag_fifo: BATTERY: ${battPct}% (${battMv} mV)\n`;
-        processRawUartChunk(textMsg, 'SIM_UART');
-      } else if (mode === 2) {
         const textMsg = `$RPY,${roll},${pitch},${yaw}\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
-      } else if (mode === 3) {
+      } else if (mode === 2) {
         const textMsg = `ACCEL: ${ax}, ${ay}, ${az}\nGYRO: ${gx}, ${gy}, ${gz}\n`;
         processRawUartChunk(textMsg, 'SIM_UART');
       } else {
@@ -2512,7 +2578,7 @@ function toggleSimulatorStream() {
         view.setUint8(19, 1);
         processRawUartChunk(view, 'SIM_BLE');
       }
-    }, 1000);
+    }, 50); // 20 Hz
   } else {
     clearInterval(simulatorInterval);
     simulatorInterval = null;
