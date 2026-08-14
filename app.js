@@ -2037,10 +2037,19 @@ function updateStatus(state, text) {
 }
 
 // ==========================================================================
-// Web Bluetooth API Connection & Priority Scanning
+// Web Bluetooth API: Rock-Solid Connection & Auto-Reconnect Supervisor
 // ==========================================================================
+let isUserIntentionalDisconnect = false;
+let bleReconnectAttempts = 0;
+const MAX_BLE_RECONNECT_ATTEMPTS = 5;
+let bleReconnectTimer = null;
+let bleAutoReconnectEnabled = true;
+let bleWatchdogTimer = null;
+let lastBlePacketCount = 0;
+let bleSilentPeriodSeconds = 0;
+
 async function handleConnectButtonClick() {
-  if (bleDevice && bleDevice.gatt.connected) {
+  if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) {
     disconnectDevice();
     return;
   }
@@ -2051,6 +2060,10 @@ async function handleConnectButtonClick() {
   }
 
   try {
+    isUserIntentionalDisconnect = false;
+    bleReconnectAttempts = 0;
+    if (bleReconnectTimer) clearTimeout(bleReconnectTimer);
+
     updateStatus('scanning', 'Scanning BLE...');
     logToConsole('system', 'Scanning for Cow Tag & nearby BLE devices...');
 
@@ -2083,22 +2096,25 @@ async function handleConnectButtonClick() {
     logToConsole('system', `Tag Selected: "${deviceName}" (ID: ${bleDevice.id})`);
     saveLastConnectedBle(deviceName, bleDevice.id);
 
+    bleDevice.removeEventListener('gattserverdisconnected', onDisconnected);
     bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
     updateDeviceOverview(deviceName, bleDevice.id, true);
     cowTagIdEl.textContent = deviceName;
     updateStatus('connected', 'Tag Active');
     btnConnect.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Stop Tracking Tag';
 
-    if (bleDevice.watchAdvertisements) {
-      bleDevice.addEventListener('advertisementreceived', handleAdvertisementReceived);
-      try { await bleDevice.watchAdvertisements(); } catch (e) {}
-    }
-
     try {
-      gattServer = await connectGattWithRetry(bleDevice, 2);
+      gattServer = await connectGattWithRetry(bleDevice, 3);
       await setupBLEDataNotifications(gattServer);
+      startBleLivenessWatchdog();
     } catch (gattErr) {
       logToConsole('warn', `GATT notice: "${gattErr.message}". Defaulting to Broadcast Telemetry Mode.`);
+      if (bleDevice.watchAdvertisements) {
+        bleDevice.removeEventListener('advertisementreceived', handleAdvertisementReceived);
+        bleDevice.addEventListener('advertisementreceived', handleAdvertisementReceived);
+        try { await bleDevice.watchAdvertisements(); } catch (e) {}
+      }
     }
 
   } catch (error) {
@@ -2108,21 +2124,39 @@ async function handleConnectButtonClick() {
 }
 
 async function handleScanAllClick() {
-  if (bleDevice && bleDevice.gatt.connected) {
+  if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) {
     disconnectDevice();
     return;
   }
 
   try {
+    isUserIntentionalDisconnect = false;
+    bleReconnectAttempts = 0;
+    if (bleReconnectTimer) clearTimeout(bleReconnectTimer);
+
     updateStatus('scanning', 'Scanning All BLE...');
-    const optionalServicesList = [ENVIRONMENTAL_SENSING_SERVICE, '6e400001-b5a3-f393-e0a9-e50e24dcca9e', '0000ffe0-0000-1000-8000-00805f9b34fb'];
+    const optionalServicesList = [
+      ENVIRONMENTAL_SENSING_SERVICE,
+      '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+      '0000ffe0-0000-1000-8000-00805f9b34fb',
+      '0000180f-0000-1000-8000-00805f9b34fb'
+    ];
     bleDevice = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: optionalServicesList });
 
     const deviceName = bleDevice.name || 'XIAO-COWTAG';
     saveLastConnectedBle(deviceName, bleDevice.id);
+
+    bleDevice.removeEventListener('gattserverdisconnected', onDisconnected);
     bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+
     updateDeviceOverview(deviceName, bleDevice.id, true);
+    cowTagIdEl.textContent = deviceName;
     updateStatus('connected', 'Tag Active');
+    btnConnect.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Stop Tracking Tag';
+
+    gattServer = await connectGattWithRetry(bleDevice, 3);
+    await setupBLEDataNotifications(gattServer);
+    startBleLivenessWatchdog();
   } catch (e) {
     updateStatus('disconnected', 'Disconnected');
   }
@@ -2144,39 +2178,160 @@ async function connectGattWithRetry(device, maxAttempts = 3) {
   while (attempt < maxAttempts) {
     try {
       attempt++;
+      logToConsole('system', `Connecting to GATT server (attempt ${attempt}/${maxAttempts})...`);
       return await device.gatt.connect();
     } catch (err) {
+      logToConsole('warn', `GATT connect attempt ${attempt} notice: ${err.message}`);
       if (attempt >= maxAttempts) throw err;
-      await new Promise(r => setTimeout(r, 400));
+      await new Promise(r => setTimeout(r, 600));
     }
   }
 }
 
 async function setupBLEDataNotifications(server) {
+  let subscribedCount = 0;
   try {
     const services = await server.getPrimaryServices();
     for (const service of services) {
-      const chars = await service.getCharacteristics();
-      for (const char of chars) {
-        if (char.properties.notify || char.properties.indicate) {
-          await char.startNotifications();
-          char.addEventListener('characteristicvaluechanged', handleCharacteristicValueChanged);
+      try {
+        const chars = await service.getCharacteristics();
+        for (const char of chars) {
+          if (char.properties.notify || char.properties.indicate) {
+            try {
+              await char.startNotifications();
+              char.removeEventListener('characteristicvaluechanged', handleCharacteristicValueChanged);
+              char.addEventListener('characteristicvaluechanged', handleCharacteristicValueChanged);
+              subscribedCount++;
+              logToConsole('system', `Subscribed to BLE characteristic: ${char.uuid.slice(0, 8)}...`);
+            } catch (subErr) {
+              logToConsole('warn', `Could not subscribe to ${char.uuid.slice(0, 8)}: ${subErr.message}`);
+            }
+          }
         }
+      } catch (charErr) {
+        logToConsole('warn', `Service ${service.uuid.slice(0, 8)} query notice: ${charErr.message}`);
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    logToConsole('warn', `GATT service discovery notice: ${e.message}`);
+  }
+
+  if (subscribedCount > 0) {
+    logToConsole('system', `✓ BLE Data Stream ACTIVE (${subscribedCount} notification channel${subscribedCount > 1 ? 's' : ''}).`);
+  }
+}
+
+function startBleLivenessWatchdog() {
+  stopBleLivenessWatchdog();
+  bleSilentPeriodSeconds = 0;
+  lastBlePacketCount = packetCounter;
+
+  bleWatchdogTimer = setInterval(() => {
+    if (!bleDevice || !gattServer || !gattServer.connected) {
+      if (bleDevice && !isUserIntentionalDisconnect) {
+        onDisconnected();
+      }
+      return;
+    }
+
+    if (packetCounter === lastBlePacketCount) {
+      bleSilentPeriodSeconds += 4;
+      if (bleSilentPeriodSeconds >= 16) {
+        logToConsole('warn', `[BLE-WATCHDOG] No BLE packets received for ${bleSilentPeriodSeconds}s. Verifying link...`);
+        if (!gattServer.connected) {
+          onDisconnected();
+        }
+      }
+    } else {
+      bleSilentPeriodSeconds = 0;
+      lastBlePacketCount = packetCounter;
+    }
+  }, 4000);
+}
+
+function stopBleLivenessWatchdog() {
+  if (bleWatchdogTimer) {
+    clearInterval(bleWatchdogTimer);
+    bleWatchdogTimer = null;
+  }
 }
 
 function disconnectDevice() {
-  if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
+  isUserIntentionalDisconnect = true;
+  stopBleLivenessWatchdog();
+  if (bleReconnectTimer) clearTimeout(bleReconnectTimer);
+  bleReconnectAttempts = 0;
+
+  if (bleDevice && bleDevice.gatt && bleDevice.gatt.connected) {
+    bleDevice.gatt.disconnect();
+  }
   onDisconnected();
 }
 
 function onDisconnected() {
-  updateStatus('disconnected', 'Disconnected');
-  updateDeviceOverview('--', '--', false);
-  btnConnect.innerHTML = '<i class="fa-solid fa-bluetooth-b"></i> Connect Ear Tag';
-  logToConsole('warn', 'Cow Tag BLE Disconnected.');
+  stopBleLivenessWatchdog();
+
+  if (isUserIntentionalDisconnect) {
+    updateStatus('disconnected', 'Disconnected');
+    updateDeviceOverview('--', '--', false);
+    btnConnect.innerHTML = '<i class="fa-solid fa-bluetooth-b"></i> Connect Ear Tag';
+    logToConsole('system', 'Cow Tag BLE Disconnected by user.');
+    return;
+  }
+
+  // Unexpected disconnection: Trigger Auto-Reconnect Supervisor
+  logToConsole('warn', '⚠️ BLE link lost! Initiating Auto-Reconnect Supervisor...');
+  recordStreamIssue('warn', 'warn', 'BLE connection lost unexpectedly. Starting auto-reconnect supervisor...');
+
+  if (bleAutoReconnectEnabled && bleDevice) {
+    startBleAutoReconnect();
+  } else {
+    updateStatus('disconnected', 'Disconnected');
+    updateDeviceOverview('--', '--', false);
+    btnConnect.innerHTML = '<i class="fa-solid fa-bluetooth-b"></i> Reconnect Ear Tag';
+  }
+}
+
+async function startBleAutoReconnect() {
+  if (bleReconnectTimer) clearTimeout(bleReconnectTimer);
+
+  if (bleReconnectAttempts >= MAX_BLE_RECONNECT_ATTEMPTS) {
+    updateStatus('disconnected', 'Retries Exhausted');
+    updateDeviceOverview('--', '--', false);
+    logToConsole('error', `❌ Auto-reconnect failed after ${MAX_BLE_RECONNECT_ATTEMPTS} attempts. Click "Connect Ear Tag" or "Reconnect" to resume.`);
+    recordStreamIssue('error', 'error', `BLE Auto-reconnect failed after ${MAX_BLE_RECONNECT_ATTEMPTS} attempts.`);
+    btnConnect.innerHTML = '<i class="fa-solid fa-rotate-right"></i> Retry BLE Connect';
+    return;
+  }
+
+  bleReconnectAttempts++;
+  const backoffMs = Math.min(8000, 1000 * Math.pow(1.5, bleReconnectAttempts - 1));
+
+  updateStatus('reconnecting', `Reconnecting (${bleReconnectAttempts}/${MAX_BLE_RECONNECT_ATTEMPTS})...`);
+  logToConsole('system', `[BLE-SUPERVISOR] Auto-reconnect attempt ${bleReconnectAttempts}/${MAX_BLE_RECONNECT_ATTEMPTS} in ${(backoffMs / 1000).toFixed(1)}s...`);
+
+  bleReconnectTimer = setTimeout(async () => {
+    try {
+      if (!bleDevice) return;
+      logToConsole('system', `Re-establishing GATT connection with "${bleDevice.name || 'Saved Tag'}"...`);
+
+      gattServer = await connectGattWithRetry(bleDevice, 2);
+      await setupBLEDataNotifications(gattServer);
+
+      // Successfully reconnected!
+      bleReconnectAttempts = 0;
+      updateStatus('connected', 'Tag Reconnected');
+      updateDeviceOverview(bleDevice.name || 'Xiao-cowtag', bleDevice.id, true);
+      cowTagIdEl.textContent = bleDevice.name || 'Xiao-cowtag';
+      btnConnect.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Stop Tracking Tag';
+      logToConsole('system', `✓ BLE AUTO-RECONNECT SUCCESSFUL! Connected to "${bleDevice.name || 'Cow Tag'}".`);
+      recordStreamIssue('warn', 'alert', '✓ BLE link restored automatically by Auto-Reconnect Supervisor.');
+      startBleLivenessWatchdog();
+    } catch (err) {
+      logToConsole('warn', `Reconnect attempt ${bleReconnectAttempts} failed: ${err.message}`);
+      startBleAutoReconnect();
+    }
+  }, backoffMs);
 }
 
 function handleCharacteristicValueChanged(event) {
