@@ -809,6 +809,8 @@ body {
   border-radius: 4px;
   pointer-events: none;
   z-index: 1;
+  will-change: width, left;
+  transform: translateZ(0);
 }
 
 .bar-ball {
@@ -817,11 +819,12 @@ body {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  transform: translate(-50%, -50%);
+  transform: translate3d(-50%, -50%, 0);
   border: 1.5px solid #ffffff;
   z-index: 3;
   pointer-events: none;
   box-shadow: 0 0 8px currentColor;
+  will-change: left, transform;
 }
 
 .bar-x { background: #ff4d6d; }
@@ -1794,6 +1797,8 @@ input:checked + .slider:before {
   flex-direction: column;
   gap: 0.3rem;
   -webkit-overflow-scrolling: touch;
+  contain: content;
+  content-visibility: auto;
 }
 
 .log-entry {
