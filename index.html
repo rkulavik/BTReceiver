@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>Ranchbot Cow Tag BLE Receiver & GPS Tracker</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -38,21 +38,41 @@
           <span id="statusText">Disconnected</span>
         </div>
         <button id="btnConnectSerial" class="btn btn-primary" title="Connect to device via Web Serial (USB UART)">
-          <i class="fa-solid fa-plug"></i> Connect Serial / UART
+          <i class="fa-solid fa-plug"></i> <span class="btn-text">Connect Serial</span>
         </button>
         <button id="btnConnect" class="btn btn-secondary" title="Connect to device via Bluetooth Low Energy">
-          <i class="fa-solid fa-bluetooth-b"></i> Connect Ear Tag (BLE)
+          <i class="fa-solid fa-bluetooth-b"></i> <span class="btn-text">Connect Ear Tag</span>
         </button>
         <button id="btnScanAll" class="btn btn-secondary" title="Unfiltered scan for all nearby Bluetooth devices">
-          <i class="fa-solid fa-radar"></i> Scan All BLE
+          <i class="fa-solid fa-radar"></i> <span class="btn-text">Scan All</span>
         </button>
       </div>
     </header>
 
+    <!-- Mobile View Switcher / Quick Navigation Tabs (Visible on < 860px) -->
+    <nav class="mobile-tab-nav" id="mobileTabNav" aria-label="Mobile Navigation">
+      <button class="mobile-tab-btn active" data-tab="telemetry" id="tabBtnTelemetry">
+        <i class="fa-solid fa-gauge-high"></i>
+        <span>Map & IMU</span>
+      </button>
+      <button class="mobile-tab-btn" data-tab="console" id="tabBtnConsole">
+        <i class="fa-solid fa-terminal"></i>
+        <span>UART & Logs</span>
+      </button>
+      <button class="mobile-tab-btn" data-tab="device" id="tabBtnDevice">
+        <i class="fa-solid fa-sliders"></i>
+        <span>Tag & Settings</span>
+      </button>
+      <button class="mobile-tab-btn" data-tab="all" id="tabBtnAll">
+        <i class="fa-solid fa-table-columns"></i>
+        <span>All Cards</span>
+      </button>
+    </nav>
+
     <!-- Main Dashboard Grid -->
     <main class="dashboard-grid">
       <!-- Left Sidebar: Cattle Tag Specs & Device Info -->
-      <aside class="card device-info-card">
+      <aside class="card device-info-card" id="deviceInfoCard">
         <div class="card-header">
           <h2><i class="fa-solid fa-tag"></i> Cattle Tag Overview</h2>
           <span class="badge" id="deviceTypeBadge">No Tag</span>
@@ -126,7 +146,7 @@
       </aside>
 
       <!-- Center Section: GPS Pasture Map & 6-DOF Motion Metrics -->
-      <section class="main-telemetry">
+      <section class="main-telemetry" id="mainTelemetrySection">
         <!-- Top Metrics: Live GPS Map + IMU Motion Status -->
         <div class="metrics-grid">
           <!-- Live Cattle GPS Location Map -->
@@ -138,10 +158,10 @@
             <div class="card-body map-body">
               <div id="map"></div>
               <div class="gps-coords-bar">
-                <span>Lat: <strong id="lblLat">31.968600</strong>°</span>
-                <span>Lng: <strong id="lblLng">-99.901800</strong>°</span>
-                <span>Alt: <strong id="lblAlt">412 m</strong></span>
-                <span>Speed: <strong id="lblSpeed">1.2 km/h</strong></span>
+                <div class="gps-coord-item"><span class="gps-label">Lat:</span> <strong id="lblLat">31.968600</strong>°</div>
+                <div class="gps-coord-item"><span class="gps-label">Lng:</span> <strong id="lblLng">-99.901800</strong>°</div>
+                <div class="gps-coord-item"><span class="gps-label">Alt:</span> <strong id="lblAlt">412 m</strong></div>
+                <div class="gps-coord-item"><span class="gps-label">Speed:</span> <strong id="lblSpeed">1.2 km/h</strong></div>
               </div>
             </div>
           </div>

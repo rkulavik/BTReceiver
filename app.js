@@ -127,11 +127,17 @@ const recorderSize = document.getElementById('recorderSize');
 const ENVIRONMENTAL_SENSING_SERVICE = 0x181a;
 const TAG_SERVICE_UUID = '0000181a-0000-1000-8000-00805f9b34fb';
 
+// DOM Elements
+const mobileTabNav = document.getElementById('mobileTabNav');
+const dashboardGrid = document.querySelector('.dashboard-grid');
+
 // Initialize Application
 document.addEventListener('DOMContentLoaded', () => {
   initMap();
   initChart();
   setupEventListeners();
+  setupMobileTabs();
+  setupResponsiveHandlers();
   logToConsole('system', 'Ranchbot Cow Tag BLE & GPS/IMU Receiver initialized.');
 });
 
@@ -201,6 +207,64 @@ function setupEventListeners() {
   if (btnExportCsv) btnExportCsv.addEventListener('click', exportCsv);
   if (btnClearCsv) btnClearCsv.addEventListener('click', clearCsvBuffer);
   if (btnToggleFullWidth) btnToggleFullWidth.addEventListener('click', toggleFullWidthStream);
+}
+
+/**
+ * Mobile App-Like Quick Tab Switcher
+ */
+function setupMobileTabs() {
+  if (!mobileTabNav) return;
+
+  // Set initial state
+  if (dashboardGrid && !dashboardGrid.dataset.mobileTab) {
+    dashboardGrid.dataset.mobileTab = 'telemetry';
+  }
+
+  mobileTabNav.addEventListener('click', (e) => {
+    const btn = e.target.closest('.mobile-tab-btn');
+    if (!btn) return;
+
+    const targetTab = btn.dataset.tab || 'telemetry';
+
+    // Update active button state
+    mobileTabNav.querySelectorAll('.mobile-tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+
+    // Update dashboard grid attribute for CSS view filtering
+    if (dashboardGrid) {
+      dashboardGrid.dataset.mobileTab = targetTab;
+    }
+
+    // Trigger Leaflet & Chart.js dimension recalculation
+    setTimeout(() => {
+      if (map) map.invalidateSize();
+      if (motionChart) motionChart.resize();
+    }, 100);
+
+    // Optional smooth scroll to top of content on mobile tab change
+    if (window.innerWidth <= 860) {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  });
+}
+
+/**
+ * Setup Window Resize & Orientation Change Handlers
+ */
+function setupResponsiveHandlers() {
+  let resizeTimeout = null;
+  const handleResize = () => {
+    clearTimeout(resizeTimeout);
+    resizeTimeout = setTimeout(() => {
+      if (map) map.invalidateSize();
+      if (motionChart) motionChart.resize();
+    }, 150);
+  };
+
+  window.addEventListener('resize', handleResize);
+  window.addEventListener('orientationchange', () => {
+    setTimeout(handleResize, 200);
+  });
 }
 
 /* ==========================================================================
