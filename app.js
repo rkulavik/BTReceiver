@@ -1671,6 +1671,7 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
             roll: extracted.roll || '',
             yaw: extracted.yaw || '',
             battery_v: extracted.battery_v || '',
+            battery_pct: extracted.battery_pct || '',
             activity_mode: extracted.activity_mode || 'UART Serial',
             payload_text: trimmed,
             raw_hex: rawHexStr
@@ -1739,11 +1740,98 @@ function toggleAutoScroll() {
 }
 
 /* ==========================================================================
-   Telemetry Stream & Direct-to-File CSV Recorder
+   Telemetry Stream & Direct CSV Recorder Engine (100% Guaranteed Non-Zero Files)
    ========================================================================== */
-/* ==========================================================================
-   Telemetry Stream & Direct-to-File CSV Recorder (Safe Async Write Queue)
-   ========================================================================== */
+const CSV_HEADERS = [
+  'Timestamp (ISO)',
+  'Timestamp (Local)',
+  'Packet #',
+  'Source',
+  'Cow Tag ID',
+  'Data Type',
+  'Latitude (°)',
+  'Longitude (°)',
+  'Accel X (g)',
+  'Accel Y (g)',
+  'Accel Z (g)',
+  'Gyro X (°/s)',
+  'Gyro Y (°/s)',
+  'Gyro Z (°/s)',
+  'Pitch (°)',
+  'Roll (°)',
+  'Yaw (°)',
+  'Battery (V)',
+  'Battery (%)',
+  'Activity Mode',
+  'Payload Text / Raw Line',
+  'Raw Hex Payload'
+];
+
+function escapeCsvField(field) {
+  if (field === null || field === undefined) return '""';
+  const str = String(field).replace(/"/g, '""');
+  return `"${str}"`;
+}
+
+function buildCsvRow(p) {
+  const row = [
+    escapeCsvField(p.timestamp_iso || new Date().toISOString()),
+    escapeCsvField(p.timestamp_local || new Date().toLocaleString()),
+    p.packet_number !== undefined ? p.packet_number : '',
+    escapeCsvField(p.source || 'UART'),
+    escapeCsvField(p.tag_id || 'COW-TAG'),
+    escapeCsvField(p.data_type || 'TELEMETRY'),
+    p.lat !== undefined ? p.lat : '',
+    p.lng !== undefined ? p.lng : '',
+    p.accel_x !== undefined ? p.accel_x : '',
+    p.accel_y !== undefined ? p.accel_y : '',
+    p.accel_z !== undefined ? p.accel_z : '',
+    p.gyro_x !== undefined ? p.gyro_x : '',
+    p.gyro_y !== undefined ? p.gyro_y : '',
+    p.gyro_z !== undefined ? p.gyro_z : '',
+    p.pitch !== undefined ? p.pitch : '',
+    p.roll !== undefined ? p.roll : '',
+    p.yaw !== undefined ? p.yaw : '',
+    p.battery_v !== undefined ? p.battery_v : '',
+    p.battery_pct !== undefined ? p.battery_pct : '',
+    escapeCsvField(p.activity_mode || ''),
+    escapeCsvField(p.payload_text || ''),
+    escapeCsvField(p.raw_hex || '')
+  ];
+  return row.join(',');
+}
+
+function downloadCsvFile(filename, records) {
+  if (!records || records.length === 0) {
+    logToConsole('warn', 'No telemetry records captured to export.');
+    alert('No telemetry records captured to export. Start recording while data is streaming.');
+    return;
+  }
+
+  const csvLines = ['\uFEFF' + CSV_HEADERS.join(',')];
+  for (const r of records) {
+    csvLines.push(buildCsvRow(r));
+  }
+
+  const csvContent = csvLines.join('\r\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  
+  const link = document.createElement('a');
+  link.setAttribute('href', url);
+  link.setAttribute('download', filename || `ranchbot_uart_stream_${Date.now()}.csv`);
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+
+  setTimeout(() => {
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }, 500);
+
+  logToConsole('system', `✓ FILE SAVED: "${link.download}" (${records.length} records, ${(blob.size / 1024).toFixed(1)} KB).`);
+}
+
 function toggleRecording() {
   if (isRecording) {
     stopRecording();
@@ -1752,130 +1840,42 @@ function toggleRecording() {
   }
 }
 
-async function startRecording() {
+function startRecording() {
   if (isRecording) return;
 
   const now = new Date();
   const dateStr = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const defaultFilename = `ranchbot_uart_stream_${dateStr}.csv`;
-  pendingWriteQueue = [];
-  totalBytesWrittenToFile = 0;
+  activeRecordingFileName = `ranchbot_uart_stream_${dateStr}.csv`;
 
-  const headers = [
-    'Timestamp (ISO)',
-    'Timestamp (Local)',
-    'Packet #',
-    'Source',
-    'Cow Tag ID',
-    'Data Type',
-    'Latitude (°)',
-    'Longitude (°)',
-    'Accel X (g)',
-    'Accel Y (g)',
-    'Accel Z (g)',
-    'Gyro X (°/s)',
-    'Gyro Y (°/s)',
-    'Gyro Z (°/s)',
-    'Pitch (°)',
-    'Roll (°)',
-    'Yaw (°)',
-    'Battery (V)',
-    'Activity Mode',
-    'Payload Text / Raw Line',
-    'Raw Hex Payload'
-  ];
-  const headerLine = '\uFEFF' + headers.join(',') + '\r\n';
-
-  // 1. Prompt user to select target file destination on disk
-  try {
-    if ('showSaveFilePicker' in window) {
-      logToConsole('system', 'Select recording file destination...');
-      fileHandle = await window.showSaveFilePicker({
-        suggestedName: defaultFilename,
-        types: [
-          {
-            description: 'CSV File (*.csv)',
-            accept: { 'text/csv': ['.csv'] }
-          },
-          {
-            description: 'Log / Text File (*.log, *.txt)',
-            accept: { 'text/plain': ['.log', '.txt'] }
-          }
-        ]
-      });
-
-      activeRecordingFileName = fileHandle.name;
-      fileWritableStream = await fileHandle.createWritable({ keepExistingData: false });
-      
-      // Write CSV headers immediately to file stream
-      await fileWritableStream.write(headerLine);
-      totalBytesWrittenToFile += headerLine.length;
-      logToConsole('system', `[LIVE DISK STREAM] Writing data directly to file: "${activeRecordingFileName}"`);
-    } else {
-      // Fallback for browsers without File System Access API
-      const userChoice = prompt('Enter a filename to record incoming telemetry to:', defaultFilename);
-      if (!userChoice) {
-        logToConsole('warn', 'Recording cancelled (no filename provided).');
-        return;
-      }
-      activeRecordingFileName = userChoice.trim().endsWith('.csv') ? userChoice.trim() : `${userChoice.trim()}.csv`;
-      fileHandle = null;
-      fileWritableStream = null;
-      logToConsole('system', `[BUFFER RECORDING] Recording to memory for "${activeRecordingFileName}" (auto-downloads on Stop).`);
-    }
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      logToConsole('warn', 'Recording cancelled by user.');
-      return;
-    }
-    logToConsole('warn', `Direct file access not available (${err.message}). Using safe memory buffer recording.`);
-    const userChoice = prompt('Enter filename to record to:', defaultFilename);
-    if (!userChoice) return;
-    activeRecordingFileName = userChoice.trim();
-    fileHandle = null;
-    fileWritableStream = null;
-  }
-
+  recordedPackets = [];
   isRecording = true;
   recordingStartTime = Date.now();
 
-  recorderBadge.className = 'recorder-status-badge recording';
-  recorderStatusText.textContent = 'RECORDING...';
+  // Update UI indicators
+  if (recorderBadge) {
+    recorderBadge.className = 'recorder-status-badge recording';
+    recorderStatusText.textContent = 'RECORDING...';
+  }
   if (recorderFilePill) {
     recorderFilePill.classList.add('active');
     recorderFilenameText.textContent = activeRecordingFileName;
-    recorderFilenameText.title = `Live Recording to: ${activeRecordingFileName}`;
+    recorderFilenameText.title = `Live Recording: ${activeRecordingFileName}`;
   }
 
-  btnRecordToggle.className = 'btn btn-sm btn-record is-recording';
-  btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop & Save File';
-  if (btnExportCsv) btnExportCsv.removeAttribute('disabled');
+  if (btnRecordToggle) {
+    btnRecordToggle.className = 'btn btn-sm btn-record is-recording';
+    btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop & Save File';
+  }
+  if (btnExportCsv) {
+    btnExportCsv.removeAttribute('disabled');
+  }
 
+  if (recordingTimerInterval) clearInterval(recordingTimerInterval);
   recordingTimerInterval = setInterval(updateRecorderTimerDisplay, 1000);
   updateRecorderTimerDisplay();
   updateRecorderStats();
 
-  logToConsole('system', `CSV Stream Recorder ACTIVE. Capturing all incoming 6-DOF UART & BLE telemetry...`);
-}
-
-async function pumpFileWriteQueue() {
-  if (isFlushingWriteQueue || pendingWriteQueue.length === 0 || !fileWritableStream) return;
-  isFlushingWriteQueue = true;
-
-  try {
-    while (pendingWriteQueue.length > 0 && fileWritableStream) {
-      const batch = pendingWriteQueue.splice(0, 50);
-      const chunkStr = batch.join('');
-      await fileWritableStream.write(chunkStr);
-      totalBytesWrittenToFile += chunkStr.length;
-    }
-  } catch (err) {
-    console.error('Safe file write error:', err);
-    logToConsole('warn', `Disk stream write notice: ${err.message}. Data safely preserved in memory buffer.`);
-    fileWritableStream = null;
-  } finally {
-    isFlushingWriteQueue = false;
-  }
+  logToConsole('system', `[RECORDER STARTED] Capturing telemetry to "${activeRecordingFileName}". Click "Stop & Save File" to save.`);
 }
 
 function writeRecordToFileAndBuffer(recordItem) {
@@ -1883,83 +1883,42 @@ function writeRecordToFileAndBuffer(recordItem) {
 
   recordedPackets.push(recordItem);
   updateRecorderStats();
-
-  const row = [
-    escapeCsvField(recordItem.timestamp_iso),
-    escapeCsvField(recordItem.timestamp_local),
-    recordItem.packet_number,
-    escapeCsvField(recordItem.source),
-    escapeCsvField(recordItem.tag_id),
-    escapeCsvField(recordItem.data_type || 'TELEMETRY'),
-    recordItem.lat,
-    recordItem.lng,
-    recordItem.accel_x,
-    recordItem.accel_y,
-    recordItem.accel_z,
-    recordItem.gyro_x,
-    recordItem.gyro_y,
-    recordItem.gyro_z,
-    recordItem.pitch !== undefined ? recordItem.pitch : '',
-    recordItem.roll !== undefined ? recordItem.roll : '',
-    recordItem.yaw !== undefined ? recordItem.yaw : '',
-    recordItem.battery_v,
-    escapeCsvField(recordItem.activity_mode),
-    escapeCsvField(recordItem.payload_text || ''),
-    escapeCsvField(recordItem.raw_hex || '')
-  ];
-
-  const csvLine = row.join(',') + '\r\n';
-
-  if (fileWritableStream) {
-    pendingWriteQueue.push(csvLine);
-    pumpFileWriteQueue();
-  }
 }
 
-async function stopRecording() {
+function stopRecording() {
   if (!isRecording) return;
   isRecording = false;
 
-  clearInterval(recordingTimerInterval);
-  recordingTimerInterval = null;
+  if (recordingTimerInterval) {
+    clearInterval(recordingTimerInterval);
+    recordingTimerInterval = null;
+  }
 
-  recorderBadge.className = 'recorder-status-badge stopped';
-  recorderStatusText.textContent = 'REC IDLE';
-  btnRecordToggle.className = 'btn btn-sm btn-record';
-  btnRecordToggle.innerHTML = '<i class="fa-solid fa-circle"></i> Start Recording';
+  if (recorderBadge) {
+    recorderBadge.className = 'recorder-status-badge stopped';
+    recorderStatusText.textContent = 'REC IDLE';
+  }
+  if (btnRecordToggle) {
+    btnRecordToggle.className = 'btn btn-sm btn-record';
+    btnRecordToggle.innerHTML = '<i class="fa-solid fa-circle"></i> Start Recording';
+  }
 
-  // Flush remaining queued writes and close live disk stream
-  if (fileWritableStream) {
-    try {
-      while (isFlushingWriteQueue || pendingWriteQueue.length > 0) {
-        await pumpFileWriteQueue();
-        if (pendingWriteQueue.length === 0) break;
-        await new Promise(r => setTimeout(r, 40));
-      }
-      await fileWritableStream.close();
-      logToConsole('system', `✓ FILE CLOSED & SAVED: "${activeRecordingFileName}" written to disk (${recordedPackets.length} records, ${totalBytesWrittenToFile} bytes).`);
-      fileWritableStream = null;
-    } catch (e) {
-      logToConsole('warn', `Disk stream flush notice (${e.message}). Downloading full recorded data via fallback export...`);
-      fileWritableStream = null;
-      exportCsvWithFilename(activeRecordingFileName);
-    }
-  } else if (recordedPackets.length > 0) {
-    // If we used memory fallback, auto-download the file with the chosen name
-    exportCsvWithFilename(activeRecordingFileName);
+  const count = recordedPackets.length;
+  if (count > 0) {
+    downloadCsvFile(activeRecordingFileName, recordedPackets);
+  } else {
+    logToConsole('warn', 'Recording stopped with 0 records captured.');
   }
 
   if (recorderFilePill) {
     recorderFilePill.classList.remove('active');
-    recorderFilenameText.textContent = `Saved: ${activeRecordingFileName}`;
+    recorderFilenameText.textContent = count > 0 ? `Saved: ${activeRecordingFileName}` : 'No file selected';
   }
-
-  logToConsole('system', `Recording completed. Total captured records: ${recordedPackets.length}`);
 }
 
 function updateRecorderTimerDisplay() {
   if (!recordingStartTime) {
-    recorderTimer.textContent = '00:00:00';
+    if (recorderTimer) recorderTimer.textContent = '00:00:00';
     return;
   }
   const elapsedMs = Date.now() - recordingStartTime;
@@ -1967,16 +1926,16 @@ function updateRecorderTimerDisplay() {
   const hrs = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
   const mins = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
   const secs = String(totalSeconds % 60).padStart(2, '0');
-  recorderTimer.textContent = `${hrs}:${mins}:${secs}`;
+  if (recorderTimer) recorderTimer.textContent = `${hrs}:${mins}:${secs}`;
 }
 
 function updateRecorderStats() {
   const count = recordedPackets.length;
-  recorderCount.textContent = `${count} record${count === 1 ? '' : 's'}`;
+  if (recorderCount) recorderCount.textContent = `${count} record${count === 1 ? '' : 's'}`;
   
-  const estBytes = totalBytesWrittenToFile > 0 ? totalBytesWrittenToFile : (count * 240);
+  const estBytes = count * 240;
   const estKb = (estBytes / 1024).toFixed(1);
-  recorderSize.textContent = `(~${estKb} KB)`;
+  if (recorderSize) recorderSize.textContent = `(~${estKb} KB)`;
 
   if (count > 0 && btnExportCsv) {
     btnExportCsv.removeAttribute('disabled');
@@ -1984,88 +1943,12 @@ function updateRecorderStats() {
 }
 
 function exportCsv() {
-  const defaultName = activeRecordingFileName || `ranchbot_uart_stream_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`;
-  exportCsvWithFilename(defaultName);
-}
-
-function exportCsvWithFilename(filename) {
   if (recordedPackets.length === 0) {
-    alert('No recorded stream data to export. Click "Start Recording" to capture incoming data.');
+    alert('No recorded stream data to export. Click "Start Recording" or "Test Stream" to capture data.');
     return;
   }
-
-  const headers = [
-    'Timestamp (ISO)',
-    'Timestamp (Local)',
-    'Packet #',
-    'Source',
-    'Cow Tag ID',
-    'Data Type',
-    'Latitude (°)',
-    'Longitude (°)',
-    'Accel X (g)',
-    'Accel Y (g)',
-    'Accel Z (g)',
-    'Gyro X (°/s)',
-    'Gyro Y (°/s)',
-    'Gyro Z (°/s)',
-    'Pitch (°)',
-    'Roll (°)',
-    'Yaw (°)',
-    'Battery (V)',
-    'Activity Mode',
-    'Payload Text / Raw Line',
-    'Raw Hex Payload'
-  ];
-
-  const csvRows = ['\uFEFF' + headers.join(',')];
-
-  for (const p of recordedPackets) {
-    const row = [
-      escapeCsvField(p.timestamp_iso),
-      escapeCsvField(p.timestamp_local),
-      p.packet_number,
-      escapeCsvField(p.source),
-      escapeCsvField(p.tag_id),
-      escapeCsvField(p.data_type || 'TELEMETRY'),
-      p.lat,
-      p.lng,
-      p.accel_x,
-      p.accel_y,
-      p.accel_z,
-      p.gyro_x,
-      p.gyro_y,
-      p.gyro_z,
-      p.pitch !== undefined ? p.pitch : '',
-      p.roll !== undefined ? p.roll : '',
-      p.yaw !== undefined ? p.yaw : '',
-      p.battery_v,
-      escapeCsvField(p.activity_mode),
-      escapeCsvField(p.payload_text || ''),
-      escapeCsvField(p.raw_hex)
-    ];
-    csvRows.push(row.join(','));
-  }
-
-  const csvContent = csvRows.join('\r\n');
-  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  
-  const link = document.createElement('a');
-  link.setAttribute('href', url);
-  link.setAttribute('download', filename);
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
-
-  logToConsole('system', `EXPORT SUCCESS: Saved ${recordedPackets.length} stream records to "${filename}".`);
-}
-
-function escapeCsvField(field) {
-  if (field === null || field === undefined) return '""';
-  const str = String(field).replace(/"/g, '""');
-  return `"${str}"`;
+  const defaultName = activeRecordingFileName || `ranchbot_uart_stream_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`;
+  downloadCsvFile(defaultName, recordedPackets);
 }
 
 function clearCsvBuffer() {
@@ -2073,8 +1956,6 @@ function clearCsvBuffer() {
     stopRecording();
   }
   recordedPackets = [];
-  pendingWriteQueue = [];
-  totalBytesWrittenToFile = 0;
   recordingStartTime = null;
   updateRecorderTimerDisplay();
   updateRecorderStats();
