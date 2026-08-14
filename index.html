@@ -198,20 +198,34 @@
           <!-- Accelerometer & Gyroscope Sensor Gauges -->
           <div class="card imu-card">
             <div class="card-header">
-              <h3><i class="fa-solid fa-compass"></i> 6-DOF Motion & Attitude (Ear Tag IMU)</h3>
-              <div class="header-badges">
-                <span class="pill pill-attitude" id="attitudePill">Flat (Top Up)</span>
-                <span class="pill pill-info" id="motionPill">At Rest</span>
+              <div class="header-title-group">
+                <h2><i class="fa-solid fa-compass"></i> Live IMU Telemetry & 6-DOF Attitude</h2>
+                <span class="pill pill-info" id="motionPill">GRAZING / RESTING</span>
+              </div>
+              <div class="imu-cal-actions">
+                <button class="btn btn-sm btn-tare" id="btnTareImu" title="Zero out sensor bias and gyro drift while resting on desk">
+                  <i class="fa-solid fa-crosshairs"></i> Tare / Zero Rest
+                </button>
+                <button class="btn btn-sm btn-icon" id="btnResetTare" title="Reset Tare Biases to Factory Default">
+                  <i class="fa-solid fa-rotate-left"></i>
+                </button>
               </div>
             </div>
             <div class="card-body flex-column">
-              <!-- Orientation / Euler Angles (Pitch, Roll, Yaw) -->
-              <div class="sensor-section orientation-section">
-                <div class="section-title">
-                  <span><i class="fa-solid fa-arrows-spin"></i> Orientation & Attitude (Pitch / Roll / Yaw)</span>
-                  <span class="section-subtext" id="attitudeModeText">Live IMU</span>
+              <!-- Tare Calibration Progress Banner -->
+              <div class="tare-progress-container" id="tareProgressContainer" style="display: none;">
+                <div class="tare-progress-bar" id="tareProgressBar" style="width: 0%;"></div>
+                <span class="tare-progress-text" id="tareProgressText">Sampling stationary resting offsets (0/50)... Keep IMU still on desk!</span>
+              </div>
+
+              <!-- Attitude Angles (Euler: Pitch, Roll, Yaw) -->
+              <div class="euler-display-group">
+                <div class="euler-header-top">
+                  <span class="sec-label"><i class="fa-solid fa-arrows-spin"></i> Computed Attitude & Orientation</span>
+                  <span class="attitude-mode" id="attitudeModeText">Madgwick 6-DOF Fusion</span>
+                  <span class="pill pill-attitude" id="attitudePill">Level (0°)</span>
                 </div>
-                <div class="euler-grid">
+                <div class="euler-cards-grid">
                   <div class="euler-card">
                     <div class="euler-header">
                       <span class="euler-label"><i class="fa-solid fa-arrows-up-down"></i> Pitch</span>
@@ -330,13 +344,17 @@
           <div class="card imu-3d-card" id="imu3dCard">
             <div class="card-header">
               <div class="header-title-group">
-                <h3><i class="fa-solid fa-cube"></i> Live 3D IMU Chip & Board Orientation</h3>
+                <h3><i class="fa-solid fa-cube"></i> Live 3D Attitude & Model</h3>
+                <div class="model-switch-btn-group" id="modelSwitchGroup">
+                  <button class="btn btn-sm active" id="btnModelChip" title="Bare IMU Chip & Carrier Board"><i class="fa-solid fa-microchip"></i> Chip</button>
+                  <button class="btn btn-sm" id="btnModelTag" title="Realistic Livestock Ear Tag"><i class="fa-solid fa-tag"></i> Ear Tag</button>
+                </div>
                 <span class="pill pill-attitude" id="chipFlatStatusPill"><i class="fa-solid fa-table"></i> Top Up (Flat on Desk)</span>
               </div>
               <div class="viewport-actions">
-                <button class="btn btn-sm" id="btnReset3dView" title="Reset 3D Camera View"><i class="fa-solid fa-arrows-to-dot"></i> Reset View</button>
+                <button class="btn btn-sm" id="btnReset3dView" title="Reset 3D Camera View"><i class="fa-solid fa-arrows-to-dot"></i> Reset</button>
                 <button class="btn btn-sm active" id="btnToggle3dAxes" title="Toggle 3D Coordinate Axis Gizmo"><i class="fa-solid fa-crosshairs"></i> Axes</button>
-                <button class="btn btn-sm active" id="btnToggle3dGrid" title="Toggle Desk Plane Grid"><i class="fa-solid fa-border-all"></i> Desk</button>
+                <button class="btn btn-sm active" id="btnToggle3dGrid" title="Toggle Desk Plane Grid"><i class="fa-solid fa-border-all"></i> Grid</button>
               </div>
             </div>
             <div class="card-body imu-3d-body">
@@ -363,7 +381,7 @@
           <div class="card filter-card" id="filterCard">
             <div class="card-header">
               <div class="header-title-group">
-                <h3><i class="fa-solid fa-filter"></i> Digital Low-Pass Filters & DSP</h3>
+                <h3><i class="fa-solid fa-filter"></i> Filters & 6-DOF Fusion</h3>
                 <span class="pill pill-success" id="filterMasterStatusPill">Filters Active</span>
               </div>
               <div class="filter-actions">
@@ -371,10 +389,14 @@
               </div>
             </div>
             <div class="card-body flex-column">
-              <!-- Filter Mode Summary & Calibration Note -->
-              <div class="calibration-info-banner">
-                <div class="cal-item"><i class="fa-solid fa-microchip"></i> <strong>16-Bit ADC Math:</strong> 13107.2 LSB/g (±2.5g FS) • 262.14 LSB/dps (±125°/s FS)</div>
-                <div class="cal-item"><i class="fa-solid fa-check-double"></i> <strong>Desk Flat Orientation:</strong> Z = +1.00g (Normal Gravity), Pitch = 0°, Roll = 0°</div>
+              <!-- Sensor Fusion Mode Selection -->
+              <div class="fusion-selector-row">
+                <label for="fusionModeSelect"><i class="fa-solid fa-compass-drafting"></i> <strong>Attitude Fusion:</strong></label>
+                <select id="fusionModeSelect" class="form-control form-control-sm fusion-select">
+                  <option value="madgwick" selected>Madgwick 6-DOF AHRS (Recommended)</option>
+                  <option value="complementary">Complementary Filter (α = 0.96)</option>
+                  <option value="accel_trig">Accelerometer Trigonometry (Raw Gravity)</option>
+                </select>
               </div>
 
               <div class="filter-controls-grid">
@@ -465,7 +487,7 @@
               <div class="filter-impact-status" id="filterImpactStatus">
                 <div class="impact-indicator active" id="impactIndicator">
                   <i class="fa-solid fa-circle-check"></i>
-                  <span id="impactText">Filters actively smoothing <strong>Orientation (Pitch/Roll/Yaw)</strong>, <strong>G-Force</strong>, <strong>Angular Rate</strong>, and <strong>3D IMU Chip</strong> motion.</span>
+                  <span id="impactText">Filters actively smoothing <strong>Orientation (Pitch/Roll/Yaw)</strong>, <strong>G-Force</strong>, <strong>Angular Rate</strong>, and <strong>3D Model</strong>.</span>
                 </div>
               </div>
             </div>
@@ -496,6 +518,88 @@
           <div class="card-body">
             <div class="chart-wrapper">
               <canvas id="motionChart"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Bottom Row: Real-time FFT Vibration Spectrum & CSV Telemetry Playback Engine -->
+        <div class="fft-and-replay-grid">
+          <!-- Real-time FFT Vibration & Gait Spectrum -->
+          <div class="card fft-card" id="fftCard">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h3><i class="fa-solid fa-wave-square"></i> Real-Time FFT Vibration & Gait Spectrum</h3>
+                <span class="pill pill-info" id="fftActivityBadge">Resting</span>
+              </div>
+              <div class="fft-metrics">
+                <span class="fft-stat">Peak: <strong id="fftPeakFreq">0.0 Hz</strong></span>
+                <span class="fft-stat">RMS: <strong id="fftRmsEnergy">0.00 g</strong></span>
+              </div>
+            </div>
+            <div class="card-body fft-body">
+              <div class="fft-canvas-container">
+                <canvas id="fftCanvas"></canvas>
+              </div>
+              <div class="fft-freq-labels">
+                <span>0 Hz</span>
+                <span>5 Hz (Gait / Run)</span>
+                <span>10 Hz</span>
+                <span>15 Hz (Tremor)</span>
+                <span>20 Hz</span>
+                <span>25 Hz</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Telemetry Replay & CSV Playback Engine Card -->
+          <div class="card replay-card" id="replayCard">
+            <div class="card-header">
+              <div class="header-title-group">
+                <h3><i class="fa-solid fa-film"></i> Telemetry Replay & CSV Playback</h3>
+                <span class="pill pill-secondary" id="replayStatusPill">No File Loaded</span>
+              </div>
+              <div class="replay-actions">
+                <input type="file" id="csvFileInput" accept=".csv" style="display:none;">
+                <button class="btn btn-sm" id="btnLoadCsvFile" title="Load recorded CSV file to replay"><i class="fa-solid fa-folder-open"></i> Load CSV</button>
+                <button class="btn btn-sm" id="btnEjectCsvFile" style="display:none;" title="Eject current CSV file"><i class="fa-solid fa-eject"></i> Eject</button>
+              </div>
+            </div>
+            <div class="card-body flex-column replay-body">
+              <!-- Drop Zone when no file is loaded -->
+              <div class="csv-drop-zone" id="csvDropZone">
+                <i class="fa-solid fa-cloud-arrow-up drop-icon"></i>
+                <p class="drop-text">Drag & Drop recorded <strong>.CSV Telemetry</strong> file here, or click <strong>Load CSV</strong> above</p>
+                <span class="drop-subtext">Replay 3D attitude, 6-DOF charts, GPS track & gauges with timeline scrubbing</span>
+              </div>
+
+              <!-- Active Playback Player Controls (Hidden until file is loaded) -->
+              <div class="csv-player-container" id="csvPlayerContainer" style="display: none;">
+                <div class="replay-file-header">
+                  <span class="replay-filename" id="replayFilenameText">ranchbot_session.csv</span>
+                  <span class="replay-record-count" id="replayRecordCount">0 rows</span>
+                </div>
+
+                <!-- Timeline Scrubber -->
+                <div class="timeline-row">
+                  <span class="time-readout" id="replayCurrentTime">00:00:00</span>
+                  <input type="range" id="replayTimelineSlider" min="0" max="100" value="0" step="1" class="timeline-slider">
+                  <span class="time-readout" id="replayTotalTime">00:00:00</span>
+                </div>
+
+                <!-- Playback Transport Buttons & Speed Multiplier -->
+                <div class="transport-controls">
+                  <button class="btn btn-sm btn-icon" id="btnReplayPrev" title="Jump to start"><i class="fa-solid fa-backward-step"></i></button>
+                  <button class="btn btn-sm btn-primary btn-play" id="btnReplayPlayPause" title="Play / Pause Replay"><i class="fa-solid fa-play"></i> Play</button>
+                  <button class="btn btn-sm btn-icon" id="btnReplayNext" title="Jump to end"><i class="fa-solid fa-forward-step"></i></button>
+
+                  <div class="btn-group speed-group" id="replaySpeedGroup" title="Playback Speed Multiplier">
+                    <button class="btn btn-sm btn-speed" data-speed="0.5">0.5x</button>
+                    <button class="btn btn-sm btn-speed active" data-speed="1.0">1x</button>
+                    <button class="btn btn-sm btn-speed" data-speed="2.0">2x</button>
+                    <button class="btn btn-sm btn-speed" data-speed="5.0">5x</button>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>

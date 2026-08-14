@@ -1,11 +1,12 @@
 // ==========================================================================
 // Ranchbot Cattle Ear Tag BLE & 6-DOF IMU Telemetry Receiver Application
 // 16-Bit Raw ADC IMU Calibration (±2.5G FS / ±125°/s FS)
-// Real-time 60FPS 3D IMU Chip & Carrier Board Orientation Renderer (Three.js)
-// Center-Zero Bi-Directional Axis Gauges with Dynamic Glowing Ball Indicators
-// Independent Digital Low-Pass Filters (LPF) for Accel & Gyro
-// High-Performance RAF-Throttled Graph & 3D Render Loops
-// Last Connected Device Persistence & Scan Priority
+// 1-Click Tare / Zero Rest Calibration (Biases & Gyro Drift Removal)
+// 6-DOF Madgwick AHRS & Complementary Sensor Fusion Engine
+// Dual 3D Models: Bare IMU Chip PCB ⇄ Realistic Livestock Ear Tag
+// Real-Time FFT Vibration & Gait Spectrum Analyzer (0-25 Hz)
+// Interactive Telemetry CSV Replay Engine with Scrubbable Timeline
+// High-Speed 60FPS Three.js Slerp & Throttled Chart.js Engine
 // ==========================================================================
 
 // Bluetooth & Serial Hardware State
@@ -24,11 +25,18 @@ let accelLsbPerG = 32768.0 / accelFullScale; // 13107.2 LSB/g
 let gyroFullScale = 125.0;    // ±125 °/s Full Scale
 let gyroLsbPerDps = 32768.0 / gyroFullScale; // 262.144 LSB/(°/s)
 
-// Orientation Kinematics State
-let lastEstimatedYaw = 0;
-let lastOrientationTimestamp = null;
+// IMU Tare & Calibration Offsets
+let imuBiases = { ax: 0.0, ay: 0.0, az: 0.0, gx: 0.0, gy: 0.0, gz: 0.0 };
+let isTareCalibrating = false;
+let tareSamples = [];
+const TARE_SAMPLE_COUNT = 50;
 
-// Stream CSV Recorder & Disk State
+// Orientation Kinematics & Sensor Fusion State
+let fusionMode = 'madgwick'; // 'madgwick', 'complementary', 'accel_trig'
+let lastOrientationTimestamp = null;
+let lastEstimatedYaw = 0;
+
+// Stream CSV Recorder State
 let isRecording = false;
 let recordedPackets = [];
 let recordingStartTime = null;
@@ -47,20 +55,22 @@ let cowMarker = null;
 let polyline = null;
 let pathHistory = [];
 
-// 6-DOF IMU Motion Chart State & Rolling Time Window
+// 6-DOF IMU Motion Chart State
 let motionChart = null;
 let chartTimeWindowMs = 60000; // default 1 minute (60s)
 let chartFilterMode = 'all';    // 'all', 'accel', 'gyro'
-let chartBuffer = [];          // array of { time: number, label: string, ax, ay, az, gx, gy, gz }
+let chartBuffer = [];
 let chartNeedsUpdate = false;
 let lastChartRenderTime = 0;
-const CHART_RENDER_FPS_INTERVAL = 33; // ~30 FPS throttling for high-performance chart rendering
+const CHART_RENDER_FPS_INTERVAL = 33; // ~30 FPS throttling
 
-// Three.js 3D IMU Chip Visualization State
+// Three.js 3D Viewport State
 let scene3d = null;
 let camera3d = null;
 let renderer3d = null;
-let imuBoardGroup = null;
+let imuBoardGroup = null;     // Bare IMU Chip PCB Model
+let cowTagModelGroup = null;  // Realistic Cattle Ear Tag Model
+let active3dModelType = 'chip'; // 'chip' or 'tag'
 let axesGizmoGroup = null;
 let deskGridHelper = null;
 let is3dInitialized = false;
@@ -70,34 +80,132 @@ let previousMousePosition = { x: 0, y: 0 };
 let show3dAxes = true;
 let show3dGrid = true;
 
-// Slerp Quaternion Interpolation for 60FPS / 120FPS smooth continuous rotation
+// Slerp Quaternion Interpolation for 60FPS Continuous Tracking
 let targetQuaternion = null;
 let currentQuaternion = null;
 let targetEuler = null;
 
+// Telemetry CSV Playback & Replay Engine State
+let replayDataRows = [];
+let isReplayActive = false;
+let isReplayPlaying = false;
+let replayCurrentIndex = 0;
+let replayPlaybackTimer = null;
+let replaySpeedMultiplier = 1.0;
+
 // Continuous IMU Latest State
 let currentImuState = {
-  rawAx: 0.00,
-  rawAy: 0.00,
-  rawAz: 1.00,
-  rawGx: 0.0,
-  rawGy: 0.0,
-  rawGz: 0.0,
-  filtAx: 0.00,
-  filtAy: 0.00,
-  filtAz: 1.00,
-  filtGx: 0.0,
-  filtGy: 0.0,
-  filtGz: 0.0,
-  pitch: 0.0,
-  roll: 0.0,
-  yaw: 0.0,
+  rawAx: 0.00, rawAy: 0.00, rawAz: 1.00,
+  rawGx: 0.0, rawGy: 0.0, rawGz: 0.0,
+  filtAx: 0.00, filtAy: 0.00, filtAz: 1.00,
+  filtGx: 0.0, filtGy: 0.0, filtGz: 0.0,
+  pitch: 0.0, roll: 0.0, yaw: 0.0,
   totalG: 1.00
 };
 
 // ==========================================================================
+// 6-DOF Madgwick AHRS Sensor Fusion Implementation
+// ==========================================================================
+class MadgwickAHRS {
+  constructor(beta = 0.04) {
+    this.beta = beta;
+    this.q0 = 1.0;
+    this.q1 = 0.0;
+    this.q2 = 0.0;
+    this.q3 = 0.0;
+  }
+
+  update(gxDps, gyDps, gzDps, ax, ay, az, dt) {
+    // Convert gyro to rad/s
+    const gx = gxDps * (Math.PI / 180.0);
+    const gy = gyDps * (Math.PI / 180.0);
+    const gz = gzDps * (Math.PI / 180.0);
+
+    let q0 = this.q0, q1 = this.q1, q2 = this.q2, q3 = this.q3;
+
+    // Rate of change of quaternion from gyroscope
+    let qDot1 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz);
+    let qDot2 = 0.5 * ( q0 * gx + q2 * gz - q3 * gy);
+    let qDot3 = 0.5 * ( q0 * gy - q1 * gz + q3 * gx);
+    let qDot4 = 0.5 * ( q0 * gz + q1 * gy - q2 * gx);
+
+    // Accelerometer normalization
+    let aLen = Math.sqrt(ax * ax + ay * ay + az * az);
+    if (aLen > 0.01) {
+      ax /= aLen;
+      ay /= aLen;
+      az /= aLen;
+
+      // Auxiliary variables to avoid repeated calculations
+      const _2q0 = 2.0 * q0;
+      const _2q1 = 2.0 * q1;
+      const _2q2 = 2.0 * q2;
+      const _2q3 = 2.0 * q3;
+      const _4q0 = 4.0 * q0;
+      const _4q1 = 4.0 * q1;
+      const _4q2 = 4.0 * q2;
+      const _8q1 = 8.0 * q1;
+      const _8q2 = 8.0 * q2;
+      const q0q0 = q0 * q0;
+      const q1q1 = q1 * q1;
+      const q2q2 = q2 * q2;
+      const q3q3 = q3 * q3;
+
+      // Gradient descent corrective step
+      let s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+      let s1 = _4q1 * q3q3 - _2q3 * ax + 4.0 * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+      let s2 = 4.0 * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+      let s3 = 4.0 * q1q1 * q3 - _2q1 * ax + 4.0 * q2q2 * q3 - _2q2 * ay;
+
+      let sLen = Math.sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+      if (sLen > 0) {
+        s0 /= sLen;
+        s1 /= sLen;
+        s2 /= sLen;
+        s3 /= sLen;
+
+        // Apply feedback step
+        qDot1 -= this.beta * s0;
+        qDot2 -= this.beta * s1;
+        qDot3 -= this.beta * s2;
+        qDot4 -= this.beta * s3;
+      }
+    }
+
+    // Integrate rate of change of quaternion
+    q0 += qDot1 * dt;
+    q1 += qDot2 * dt;
+    q2 += qDot3 * dt;
+    q3 += qDot4 * dt;
+
+    // Normalise quaternion
+    let qNorm = Math.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    if (qNorm > 0) {
+      this.q0 = q0 / qNorm;
+      this.q1 = q1 / qNorm;
+      this.q2 = q2 / qNorm;
+      this.q3 = q3 / qNorm;
+    }
+  }
+
+  getEuler() {
+    const q0 = this.q0, q1 = this.q1, q2 = this.q2, q3 = this.q3;
+    const roll = Math.atan2(2.0 * (q0 * q1 + q2 * q3), 1.0 - 2.0 * (q1 * q1 + q2 * q2)) * (180.0 / Math.PI);
+    const sinP = 2.0 * (q0 * q2 - q3 * q1);
+    const pitch = (Math.abs(sinP) >= 1.0 ? Math.sign(sinP) * (Math.PI / 2) : Math.asin(sinP)) * (180.0 / Math.PI);
+    const yaw = ((Math.atan2(2.0 * (q0 * q3 + q1 * q2), 1.0 - 2.0 * (q2 * q2 + q3 * q3)) * (180.0 / Math.PI)) % 360 + 360) % 360;
+    return { pitch, roll, yaw };
+  }
+
+  reset() {
+    this.q0 = 1.0; this.q1 = 0.0; this.q2 = 0.0; this.q3 = 0.0;
+  }
+}
+
+const madgwickAHRS = new MadgwickAHRS(0.04);
+
+// ==========================================================================
 // Digital Low-Pass Filter (DSP) Implementation
-// Supports 1st Order Single-Pole & 2nd Order Butterworth Biquad IIR Filters
 // ==========================================================================
 class DigitalLowPassFilter3Axis {
   constructor(cutoffFreq = 2.0, order = 2) {
@@ -124,11 +232,9 @@ class DigitalLowPassFilter3Axis {
   }
 
   apply(rawX, rawY, rawZ, timestamp = Date.now()) {
-    if (!this.enabled) {
-      return { x: rawX, y: rawY, z: rawZ };
-    }
+    if (!this.enabled) return { x: rawX, y: rawY, z: rawZ };
 
-    let dt = 0.05; // 50ms default (20 Hz)
+    let dt = 0.05;
     if (this.lastTimestamp) {
       dt = Math.max(0.001, Math.min(0.5, (timestamp - this.lastTimestamp) / 1000.0));
     }
@@ -143,27 +249,21 @@ class DigitalLowPassFilter3Axis {
 
   _filterChannel(ch, inputVal, dt) {
     if (!ch.initialized) {
-      ch.y1 = inputVal;
-      ch.y2 = inputVal;
-      ch.x1 = inputVal;
-      ch.x2 = inputVal;
-      ch.out = inputVal;
+      ch.y1 = inputVal; ch.y2 = inputVal; ch.x1 = inputVal; ch.x2 = inputVal; ch.out = inputVal;
       ch.initialized = true;
       return inputVal;
     }
 
     if (this.order === 1) {
-      // 1st Order Single-Pole Exponential Low-Pass Filter
       const tau = 1.0 / (2.0 * Math.PI * this.cutoffFreq);
       const alpha = dt / (tau + dt);
       ch.out = ch.out + alpha * (inputVal - ch.out);
       return ch.out;
     } else {
-      // 2nd Order Butterworth Low-Pass Filter via Bilinear Transform
       const fc = Math.min(this.cutoffFreq, 0.45 / dt);
       const omega = 2.0 * Math.PI * fc;
       const K = Math.tan((omega * dt) / 2.0);
-      const Q = 0.70710678; // 1 / sqrt(2)
+      const Q = 0.70710678;
       const K2 = K * K;
       const norm = 1.0 + K / Q + K2;
 
@@ -174,28 +274,75 @@ class DigitalLowPassFilter3Axis {
       const a2 = (1.0 - K / Q + K2) / norm;
 
       const out = b0 * inputVal + b1 * ch.x1 + b2 * ch.x2 - a1 * ch.y1 - a2 * ch.y2;
-
-      ch.x2 = ch.x1;
-      ch.x1 = inputVal;
-      ch.y2 = ch.y1;
-      ch.y1 = out;
-      ch.out = out;
-
-      if (this.order === 3) {
-        // 3rd Order: Cascade single pole with 2nd order stage
-        const tau = 1.0 / (2.0 * Math.PI * this.cutoffFreq);
-        const alpha = dt / (tau + dt);
-        ch.out = ch.y2 + alpha * (out - ch.y2);
-      }
-
+      ch.x2 = ch.x1; ch.x1 = inputVal; ch.y2 = ch.y1; ch.y1 = out; ch.out = out;
       return ch.out;
     }
   }
 }
 
-// Instantiate Filters
-const accelFilter = new DigitalLowPassFilter3Axis(2.0, 2); // default 2.0 Hz, 2nd Order
-const gyroFilter = new DigitalLowPassFilter3Axis(5.0, 2);  // default 5.0 Hz, 2nd Order
+const accelFilter = new DigitalLowPassFilter3Axis(2.0, 2);
+const gyroFilter = new DigitalLowPassFilter3Axis(5.0, 2);
+
+// ==========================================================================
+// Real-Time Vibration & Gait FFT Spectrum Analyzer
+// ==========================================================================
+class RealTimeFFTAnalyzer {
+  constructor(bufferSize = 64) {
+    this.bufferSize = bufferSize;
+    this.samples = new Float32Array(bufferSize);
+    this.index = 0;
+    this.sampleRate = 20.0; // 20 Hz nominal sample rate
+  }
+
+  addSample(val) {
+    this.samples[this.index] = val;
+    this.index = (this.index + 1) % this.bufferSize;
+  }
+
+  computeSpectrum() {
+    const N = this.bufferSize;
+    const real = new Float32Array(N);
+    const imag = new Float32Array(N);
+
+    // Extract time-ordered window with Hann smoothing
+    for (let i = 0; i < N; i++) {
+      const idx = (this.index + i) % N;
+      const w = 0.5 * (1.0 - Math.cos((2.0 * Math.PI * i) / (N - 1))); // Hann window
+      real[i] = this.samples[idx] * w;
+      imag[i] = 0.0;
+    }
+
+    // Discrete Fourier Transform (DFT) for frequency magnitude bins
+    const halfN = N / 2;
+    const magnitudes = new Float32Array(halfN);
+    let peakMag = 0;
+    let peakFreq = 0;
+    let sumSq = 0;
+
+    for (let k = 0; k < halfN; k++) {
+      let r = 0, im = 0;
+      for (let n = 0; n < N; n++) {
+        const angle = (2.0 * Math.PI * k * n) / N;
+        r += real[n] * Math.cos(angle);
+        im -= real[n] * Math.sin(angle);
+      }
+      const mag = Math.sqrt(r * r + im * im) / N;
+      magnitudes[k] = mag;
+      sumSq += mag * mag;
+
+      const freq = (k * this.sampleRate) / N;
+      if (k > 1 && mag > peakMag) { // Skip DC component (k=0)
+        peakMag = mag;
+        peakFreq = freq;
+      }
+    }
+
+    const rms = Math.sqrt(sumSq / halfN);
+    return { magnitudes, peakFreq, peakMag, rms };
+  }
+}
+
+const fftAnalyzer = new RealTimeFFTAnalyzer(64);
 
 // ==========================================================================
 // DOM Elements
@@ -211,9 +358,16 @@ const statusBadge = document.getElementById('statusBadge');
 const statusText = document.getElementById('statusText');
 const serialBaudSelect = document.getElementById('serialBaudSelect');
 const streamFormatSelect = document.getElementById('streamFormatSelect');
-const decoderSelect = document.getElementById('decoderSelect');
 const accelRangeSelect = document.getElementById('accelRangeSelect');
 const gyroRangeSelect = document.getElementById('gyroRangeSelect');
+const fusionModeSelect = document.getElementById('fusionModeSelect');
+
+// Tare Calibration Elements
+const btnTareImu = document.getElementById('btnTareImu');
+const btnResetTare = document.getElementById('btnResetTare');
+const tareProgressContainer = document.getElementById('tareProgressContainer');
+const tareProgressBar = document.getElementById('tareProgressBar');
+const tareProgressText = document.getElementById('tareProgressText');
 
 // Device & Cow Overview Elements
 const cowTagIdEl = document.getElementById('cowTagId');
@@ -268,10 +422,12 @@ const barYaw = document.getElementById('barYaw');
 const attitudePill = document.getElementById('attitudePill');
 const attitudeModeText = document.getElementById('attitudeModeText');
 
-// 3D Viewport Controls
+// 3D Viewport Controls & Model Switcher
 const btnReset3dView = document.getElementById('btnReset3dView');
 const btnToggle3dAxes = document.getElementById('btnToggle3dAxes');
 const btnToggle3dGrid = document.getElementById('btnToggle3dGrid');
+const btnModelChip = document.getElementById('btnModelChip');
+const btnModelTag = document.getElementById('btnModelTag');
 const hudPitch = document.getElementById('hudPitch');
 const hudRoll = document.getElementById('hudRoll');
 const hudYaw = document.getElementById('hudYaw');
@@ -302,6 +458,29 @@ const impactText = document.getElementById('impactText');
 const chartWindowBadge = document.getElementById('chartWindowBadge');
 const chartModeGroup = document.getElementById('chartModeGroup');
 const chartWindowGroup = document.getElementById('chartWindowGroup');
+
+// FFT Elements
+const fftCanvas = document.getElementById('fftCanvas');
+const fftPeakFreq = document.getElementById('fftPeakFreq');
+const fftRmsEnergy = document.getElementById('fftRmsEnergy');
+const fftActivityBadge = document.getElementById('fftActivityBadge');
+
+// CSV Replay Elements
+const csvFileInput = document.getElementById('csvFileInput');
+const btnLoadCsvFile = document.getElementById('btnLoadCsvFile');
+const btnEjectCsvFile = document.getElementById('btnEjectCsvFile');
+const csvDropZone = document.getElementById('csvDropZone');
+const csvPlayerContainer = document.getElementById('csvPlayerContainer');
+const replayStatusPill = document.getElementById('replayStatusPill');
+const replayFilenameText = document.getElementById('replayFilenameText');
+const replayRecordCount = document.getElementById('replayRecordCount');
+const replayCurrentTime = document.getElementById('replayCurrentTime');
+const replayTotalTime = document.getElementById('replayTotalTime');
+const replayTimelineSlider = document.getElementById('replayTimelineSlider');
+const btnReplayPlayPause = document.getElementById('btnReplayPlayPause');
+const btnReplayPrev = document.getElementById('btnReplayPrev');
+const btnReplayNext = document.getElementById('btnReplayNext');
+const replaySpeedGroup = document.getElementById('replaySpeedGroup');
 
 // Terminal, Parsed Grid & Full-Width Elements
 const terminalLog = document.getElementById('terminalLog');
@@ -335,14 +514,19 @@ const dashboardGrid = document.querySelector('.dashboard-grid');
 // Application Initialization
 // ==========================================================================
 document.addEventListener('DOMContentLoaded', () => {
+  loadSavedTareBiases();
   initMap();
   initChart();
   init3DImuViewer();
   setupEventListeners();
   setupFilterEventListeners();
+  setupTareEventListeners();
+  setupModelSwitcherListeners();
+  setupReplayEventListeners();
   setupMobileTabs();
   setupResponsiveHandlers();
   checkLastConnectedDevice();
+  startFftRenderLoop();
   
   // Ensure Tag Overview starts completely blank as requested
   updateDeviceOverview('--', '--', false);
@@ -350,7 +534,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Set initial flat orientation (top of chip up on desk)
   updateIMUAndOrientation(0.00, 0.00, 1.00, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 'Default Position', 'At Rest');
   
-  logToConsole('system', 'Ranchbot Cow Tag BLE & GPS/IMU Receiver initialized. 60FPS 3D & Bi-Directional Gauges ACTIVE.');
+  logToConsole('system', 'Ranchbot Cow Tag BLE Receiver with Madgwick 6-DOF Fusion, 3D Dual Models, FFT & CSV Replay ACTIVE.');
 });
 
 // ==========================================================================
@@ -428,12 +612,21 @@ function setupEventListeners() {
     });
   }
 
+  // Sensor Fusion Mode Selector
+  if (fusionModeSelect) {
+    fusionModeSelect.addEventListener('change', () => {
+      fusionMode = fusionModeSelect.value;
+      madgwickAHRS.reset();
+      logToConsole('system', `Attitude Sensor Fusion set to: ${fusionModeSelect.options[fusionModeSelect.selectedIndex].text}`);
+    });
+  }
+
   // 3D Viewport Controls
   if (btnReset3dView) btnReset3dView.addEventListener('click', reset3DView);
   if (btnToggle3dAxes) btnToggle3dAxes.addEventListener('click', toggle3DAxes);
   if (btnToggle3dGrid) btnToggle3dGrid.addEventListener('click', toggle3DGrid);
 
-  // Chart Mode Filter Buttons (All, Accel, Gyro)
+  // Chart Mode Filter Buttons
   if (chartModeGroup) {
     chartModeGroup.addEventListener('click', (e) => {
       const btn = e.target.closest('.btn-filter');
@@ -446,7 +639,7 @@ function setupEventListeners() {
     });
   }
 
-  // Chart Time Window Buttons (30s, 1 Min, 3 Min)
+  // Chart Time Window Buttons
   if (chartWindowGroup) {
     chartWindowGroup.addEventListener('click', (e) => {
       const btn = e.target.closest('.btn-window');
@@ -474,10 +667,973 @@ function setupEventListeners() {
 }
 
 // ==========================================================================
+// Tare / Zero Rest Calibration Engine
+// ==========================================================================
+function setupTareEventListeners() {
+  if (btnTareImu) {
+    btnTareImu.addEventListener('click', () => {
+      if (isTareCalibrating) return;
+      startImuTareCalibration();
+    });
+  }
+
+  if (btnResetTare) {
+    btnResetTare.addEventListener('click', () => {
+      resetImuTare();
+    });
+  }
+}
+
+function loadSavedTareBiases() {
+  try {
+    const saved = localStorage.getItem('ranchbot_imu_biases');
+    if (saved) {
+      imuBiases = JSON.parse(saved);
+      logToConsole('system', `Loaded saved Tare Biases: Accel(${imuBiases.ax.toFixed(3)}, ${imuBiases.ay.toFixed(3)}, ${imuBiases.az.toFixed(3)}) Gyro(${imuBiases.gx.toFixed(1)}, ${imuBiases.gy.toFixed(1)}, ${imuBiases.gz.toFixed(1)})`);
+    }
+  } catch (e) {}
+}
+
+function startImuTareCalibration() {
+  isTareCalibrating = true;
+  tareSamples = [];
+  if (tareProgressContainer) tareProgressContainer.style.display = 'block';
+  if (tareProgressBar) tareProgressBar.style.width = '0%';
+  if (tareProgressText) tareProgressText.textContent = `Sampling stationary offsets (0/${TARE_SAMPLE_COUNT})... Keep IMU flat on desk!`;
+  if (btnTareImu) {
+    btnTareImu.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Calibrating...';
+    btnTareImu.disabled = true;
+  }
+  logToConsole('system', '[TARE] Starting 50-sample stationary zero calibration...');
+}
+
+function recordTareSample(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz) {
+  if (!isTareCalibrating) return;
+
+  tareSamples.push({ ax: rawAx, ay: rawAy, az: rawAz, gx: rawGx, gy: rawGy, gz: rawGz });
+  const count = tareSamples.length;
+  const pct = Math.round((count / TARE_SAMPLE_COUNT) * 100);
+
+  if (tareProgressBar) tareProgressBar.style.width = `${pct}%`;
+  if (tareProgressText) tareProgressText.textContent = `Sampling stationary offsets (${count}/${TARE_SAMPLE_COUNT})... Keep IMU flat!`;
+
+  if (count >= TARE_SAMPLE_COUNT) {
+    finishTareCalibration();
+  }
+}
+
+function finishTareCalibration() {
+  isTareCalibrating = false;
+
+  let sumAx = 0, sumAy = 0, sumAz = 0, sumGx = 0, sumGy = 0, sumGz = 0;
+  for (const s of tareSamples) {
+    sumAx += s.ax;
+    sumAy += s.ay;
+    sumAz += s.az;
+    sumGx += s.gx;
+    sumGy += s.gy;
+    sumGz += s.gz;
+  }
+
+  const N = tareSamples.length;
+  // Compute biases: Z axis target is +1.0g Earth normal gravity
+  imuBiases = {
+    ax: sumAx / N,
+    ay: sumAy / N,
+    az: (sumAz / N) - 1.0,
+    gx: sumGx / N,
+    gy: sumGy / N,
+    gz: sumGz / N
+  };
+
+  localStorage.setItem('ranchbot_imu_biases', JSON.stringify(imuBiases));
+
+  if (tareProgressContainer) {
+    setTimeout(() => { tareProgressContainer.style.display = 'none'; }, 2000);
+  }
+  if (tareProgressText) tareProgressText.textContent = '✓ Calibration COMPLETE! Rest Zero & Gyro Drift Calibrated.';
+  if (btnTareImu) {
+    btnTareImu.innerHTML = '<i class="fa-solid fa-check"></i> Calibrated';
+    btnTareImu.disabled = false;
+    setTimeout(() => {
+      btnTareImu.innerHTML = '<i class="fa-solid fa-crosshairs"></i> Tare / Zero Rest';
+    }, 3000);
+  }
+
+  madgwickAHRS.reset();
+  logToConsole('system', `✓ IMU TARE COMPLETE! Offsets saved: Accel(${imuBiases.ax.toFixed(3)}, ${imuBiases.ay.toFixed(3)}, ${imuBiases.az.toFixed(3)})g | Gyro(${imuBiases.gx.toFixed(1)}, ${imuBiases.gy.toFixed(1)}, ${imuBiases.gz.toFixed(1)})°/s.`);
+}
+
+function resetImuTare() {
+  imuBiases = { ax: 0.0, ay: 0.0, az: 0.0, gx: 0.0, gy: 0.0, gz: 0.0 };
+  localStorage.removeItem('ranchbot_imu_biases');
+  madgwickAHRS.reset();
+  logToConsole('system', 'Tare Offsets reset to factory raw 0.0.');
+}
+
+// ==========================================================================
+// Dual 3D Model Switcher (IMU Chip vs Cattle Ear Tag)
+// ==========================================================================
+function setupModelSwitcherListeners() {
+  if (btnModelChip && btnModelTag) {
+    btnModelChip.addEventListener('click', () => switch3DModel('chip'));
+    btnModelTag.addEventListener('click', () => switch3DModel('tag'));
+  }
+}
+
+function switch3DModel(modelType) {
+  active3dModelType = modelType;
+  if (btnModelChip) btnModelChip.classList.toggle('active', modelType === 'chip');
+  if (btnModelTag) btnModelTag.classList.toggle('active', modelType === 'tag');
+
+  if (imuBoardGroup) imuBoardGroup.visible = (modelType === 'chip');
+  if (cowTagModelGroup) cowTagModelGroup.visible = (modelType === 'tag');
+
+  logToConsole('system', `3D View switched to: ${modelType === 'chip' ? 'Bare IMU Chip PCB' : 'Realistic Livestock Cattle Ear Tag'}`);
+}
+
+// ==========================================================================
+// 3D IMU Chip & Cattle Ear Tag Renderer (Three.js WebGL)
+// ==========================================================================
+function init3DImuViewer() {
+  const container = document.getElementById('imu3dContainer');
+  const canvas = document.getElementById('imu3dCanvas');
+  if (!container || !canvas || typeof THREE === 'undefined') return;
+
+  const width = container.clientWidth || 300;
+  const height = container.clientHeight || 280;
+
+  targetQuaternion = new THREE.Quaternion();
+  currentQuaternion = new THREE.Quaternion();
+  targetEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+  // 1. Scene
+  scene3d = new THREE.Scene();
+  scene3d.background = new THREE.Color(0x0a0f1d);
+
+  // 2. Camera
+  camera3d = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
+  camera3d.position.set(4.8, 4.2, 5.8);
+  camera3d.lookAt(0, 0, 0);
+
+  // 3. Renderer
+  renderer3d = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
+  renderer3d.setSize(width, height);
+  renderer3d.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+  // 4. Lighting
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
+  scene3d.add(ambientLight);
+
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+  dirLight.position.set(6, 12, 8);
+  scene3d.add(dirLight);
+
+  const fillLight = new THREE.PointLight(0x00f2fe, 0.45, 25);
+  fillLight.position.set(-5, -2, -4);
+  scene3d.add(fillLight);
+
+  // 5. Reference Desk Grid Plane
+  deskGridHelper = new THREE.GridHelper(8, 16, 0x00f2fe, 0x1e293b);
+  deskGridHelper.position.y = -0.02;
+  scene3d.add(deskGridHelper);
+
+  // --------------------------------------------------------------------------
+  // MODEL 1: Bare IMU Carrier PCB & IC Package
+  // --------------------------------------------------------------------------
+  imuBoardGroup = new THREE.Group();
+  scene3d.add(imuBoardGroup);
+
+  const pcbGeo = new THREE.BoxGeometry(3.6, 0.14, 2.6);
+  const pcbMat = new THREE.MeshStandardMaterial({ color: 0x113b2e, roughness: 0.35, metalness: 0.25 });
+  const pcbMesh = new THREE.Mesh(pcbGeo, pcbMat);
+  pcbMesh.position.y = 0.07;
+  imuBoardGroup.add(pcbMesh);
+
+  // Gold Pads
+  const goldMat = new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.9, roughness: 0.15 });
+  [[-1.55, 0.145, -1.05], [1.55, 0.145, -1.05], [-1.55, 0.145, 1.05], [1.55, 0.145, 1.05]].forEach(([cx, cy, cz]) => {
+    const pad = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.18, 0.02, 16), goldMat);
+    pad.position.set(cx, cy, cz);
+    imuBoardGroup.add(pad);
+  });
+
+  // IMU IC Package
+  const chipMat = new THREE.MeshStandardMaterial({ color: 0x181a20, roughness: 0.5, metalness: 0.3 });
+  const imuChipMesh = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.22, 1.4), chipMat);
+  imuChipMesh.position.set(0, 0.25, 0);
+  imuBoardGroup.add(imuChipMesh);
+
+  // Pin 1 Dot
+  const pin1Dot = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.02, 16), new THREE.MeshStandardMaterial({ color: 0x00f2fe, emissive: 0x00f2fe, emissiveIntensity: 0.8 }));
+  pin1Dot.position.set(-0.48, 0.365, -0.48);
+  imuBoardGroup.add(pin1Dot);
+
+  // Silkscreen
+  const textCanvas = document.createElement('canvas');
+  textCanvas.width = 256; textCanvas.height = 256;
+  const ctx = textCanvas.getContext('2d');
+  ctx.fillStyle = '#181a20'; ctx.fillRect(0, 0, 256, 256);
+  ctx.fillStyle = '#f8fafc'; ctx.font = 'bold 26px "JetBrains Mono", monospace'; ctx.textAlign = 'center';
+  ctx.fillText('IMU 6-DOF', 128, 85);
+  ctx.fillStyle = '#00c6ff'; ctx.font = 'bold 20px "JetBrains Mono", monospace'; ctx.fillText('±2.5G / 125°/s', 128, 128);
+  ctx.fillStyle = '#94a3b8'; ctx.font = '16px "JetBrains Mono", monospace'; ctx.fillText('16-BIT ADC', 128, 168);
+
+  const textTexture = new THREE.CanvasTexture(textCanvas);
+  const textPlane = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.2), new THREE.MeshBasicMaterial({ map: textTexture, transparent: true }));
+  textPlane.rotation.x = -Math.PI / 2;
+  textPlane.position.set(0, 0.362, 0);
+  imuBoardGroup.add(textPlane);
+
+  // Metallic Solder Leads
+  const pinMat = new THREE.MeshStandardMaterial({ color: 0xc8c8c8, metalness: 0.9, roughness: 0.1 });
+  for (let i = -0.45; i <= 0.45; i += 0.3) {
+    const pL = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat); pL.position.set(-0.72, 0.18, i); imuBoardGroup.add(pL);
+    const pR = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat); pR.position.set(0.72, 0.18, i); imuBoardGroup.add(pR);
+    const pF = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat); pF.position.set(i, 0.18, 0.72); imuBoardGroup.add(pF);
+    const pB = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat); pB.position.set(i, 0.18, -0.72); imuBoardGroup.add(pB);
+  }
+
+  // --------------------------------------------------------------------------
+  // MODEL 2: Realistic Ranchbot Cattle Ear Tag Model
+  // --------------------------------------------------------------------------
+  cowTagModelGroup = new THREE.Group();
+  cowTagModelGroup.visible = false;
+  scene3d.add(cowTagModelGroup);
+
+  // Molded Polyurethane Tag Body (Yellow / Livestock Visibility Color)
+  const tagShape = new THREE.Shape();
+  tagShape.moveTo(-1.2, -1.8);
+  tagShape.lineTo(1.2, -1.8);
+  tagShape.lineTo(1.5, 0.8);
+  tagShape.lineTo(0.5, 2.2);
+  tagShape.lineTo(-0.5, 2.2);
+  tagShape.lineTo(-1.5, 0.8);
+  tagShape.closePath();
+
+  const extrudeSettings = { depth: 0.18, bevelEnabled: true, bevelSegments: 3, steps: 1, bevelSize: 0.06, bevelThickness: 0.06 };
+  const tagGeo = new THREE.ExtrudeGeometry(tagShape, extrudeSettings);
+  const tagMat = new THREE.MeshStandardMaterial({ color: 0xffb703, roughness: 0.35, metalness: 0.1 });
+  const tagMesh = new THREE.Mesh(tagGeo, tagMat);
+  tagMesh.rotation.x = Math.PI / 2;
+  tagMesh.position.set(0, 0.15, 0);
+  cowTagModelGroup.add(tagMesh);
+
+  // Ear Tag Attachment Locking Stud
+  const studGeo = new THREE.CylinderGeometry(0.35, 0.35, 0.4, 24);
+  const studMat = new THREE.MeshStandardMaterial({ color: 0xd90429, roughness: 0.4, metalness: 0.2 });
+  const studMesh = new THREE.Mesh(studGeo, studMat);
+  studMesh.position.set(0, 0.25, -1.6);
+  cowTagModelGroup.add(studMesh);
+
+  // Laser Printed Tag Label Canvas
+  const tagLabelCanvas = document.createElement('canvas');
+  tagLabelCanvas.width = 256; tagLabelCanvas.height = 256;
+  const lctx = tagLabelCanvas.getContext('2d');
+  lctx.fillStyle = '#ffb703'; lctx.fillRect(0, 0, 256, 256);
+  lctx.fillStyle = '#040914'; lctx.font = 'bold 36px "Inter", sans-serif'; lctx.textAlign = 'center';
+  lctx.fillText('RANCHBOT', 128, 70);
+  lctx.fillStyle = '#000000'; lctx.font = 'bold 44px "JetBrains Mono", monospace';
+  lctx.fillText('COW-8492', 128, 140);
+  lctx.font = '22px "Inter", sans-serif';
+  lctx.fillText('GPS • BLE • 6-DOF', 128, 195);
+
+  const tagLabelTexture = new THREE.CanvasTexture(tagLabelCanvas);
+  const tagLabelPlane = new THREE.Mesh(new THREE.PlaneGeometry(2.0, 2.0), new THREE.MeshBasicMaterial({ map: tagLabelTexture, transparent: true }));
+  tagLabelPlane.rotation.x = -Math.PI / 2;
+  tagLabelPlane.position.set(0, 0.26, 0.4);
+  cowTagModelGroup.add(tagLabelPlane);
+
+  // --------------------------------------------------------------------------
+  // Coordinate Axes Gizmo (Attached to dynamic rotation)
+  // --------------------------------------------------------------------------
+  axesGizmoGroup = new THREE.Group();
+  const arrowX = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0.38, 0), 1.9, 0xff4d6d, 0.35, 0.18);
+  const arrowY = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0.38, 0), 1.9, 0x38ef7d, 0.35, 0.18);
+  const arrowZ = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0.38, 0), 1.9, 0x00c6ff, 0.35, 0.18);
+  axesGizmoGroup.add(arrowX, arrowY, arrowZ);
+  imuBoardGroup.add(axesGizmoGroup);
+
+  // Mouse Orbit Drag Controls
+  container.addEventListener('mousedown', (e) => {
+    isMouseDragging3d = true;
+    previousMousePosition = { x: e.clientX, y: e.clientY };
+  });
+
+  window.addEventListener('mouseup', () => { isMouseDragging3d = false; });
+
+  container.addEventListener('mousemove', (e) => {
+    if (!isMouseDragging3d) return;
+    const deltaX = e.clientX - previousMousePosition.x;
+    const deltaY = e.clientY - previousMousePosition.y;
+
+    const radius = camera3d.position.length();
+    let theta = Math.atan2(camera3d.position.x, camera3d.position.z) - deltaX * 0.008;
+    let phi = Math.max(0.1, Math.min(Math.PI / 2 - 0.05, Math.acos(Math.max(-1, Math.min(1, camera3d.position.y / radius))) + deltaY * 0.008));
+
+    camera3d.position.x = radius * Math.sin(phi) * Math.sin(theta);
+    camera3d.position.y = radius * Math.cos(phi);
+    camera3d.position.z = radius * Math.sin(phi) * Math.cos(theta);
+    camera3d.lookAt(0, 0, 0);
+
+    previousMousePosition = { x: e.clientX, y: e.clientY };
+  });
+
+  container.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY > 0 ? 1.08 : 0.92;
+    camera3d.position.multiplyScalar(zoomFactor);
+    camera3d.position.clampLength(2.5, 16.0);
+    camera3d.lookAt(0, 0, 0);
+  }, { passive: false });
+
+  is3dInitialized = true;
+  start3DAnimationLoop();
+}
+
+function start3DAnimationLoop() {
+  if (is3dAnimating) return;
+  is3dAnimating = true;
+
+  function animate() {
+    requestAnimationFrame(animate);
+    if (is3dInitialized && targetQuaternion) {
+      currentQuaternion.slerp(targetQuaternion, 0.45);
+      if (imuBoardGroup) imuBoardGroup.quaternion.copy(currentQuaternion);
+      if (cowTagModelGroup) cowTagModelGroup.quaternion.copy(currentQuaternion);
+      render3D();
+    }
+  }
+  requestAnimationFrame(animate);
+}
+
+function update3DOrientation(pitchDeg, rollDeg, yawDeg, totalG = 1.0, isFlat = true) {
+  if (!is3dInitialized || !targetQuaternion) return;
+
+  const pitchRad = (pitchDeg * Math.PI) / 180.0;
+  const rollRad = (rollDeg * Math.PI) / 180.0;
+  const yawRad = (yawDeg * Math.PI) / 180.0;
+
+  targetEuler.set(-pitchRad, -yawRad, rollRad, 'YXZ');
+  targetQuaternion.setFromEuler(targetEuler);
+
+  if (hudPitch) hudPitch.textContent = `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}°`;
+  if (hudRoll) hudRoll.textContent = `${rollDeg >= 0 ? '+' : ''}${rollDeg.toFixed(1)}°`;
+  if (hudYaw) hudYaw.textContent = `${yawDeg.toFixed(1)}°`;
+  if (hudGravity) hudGravity.textContent = `${totalG.toFixed(2)} g (${isFlat ? 'Z+ Normal' : 'Dynamic'})`;
+
+  if (chipFlatStatusPill) {
+    if (Math.abs(pitchDeg) < 3.0 && Math.abs(rollDeg) < 3.0) {
+      chipFlatStatusPill.className = 'pill pill-success';
+      chipFlatStatusPill.innerHTML = '<i class="fa-solid fa-table"></i> Top Up (Flat on Desk)';
+    } else {
+      chipFlatStatusPill.className = 'pill pill-attitude';
+      chipFlatStatusPill.innerHTML = `<i class="fa-solid fa-arrows-spin"></i> Tilted (P:${pitchDeg.toFixed(0)}° R:${rollDeg.toFixed(0)}°)`;
+    }
+  }
+}
+
+function render3D() {
+  if (renderer3d && scene3d && camera3d) {
+    renderer3d.render(scene3d, camera3d);
+  }
+}
+
+function reset3DView() {
+  if (camera3d) {
+    camera3d.position.set(4.8, 4.2, 5.8);
+    camera3d.lookAt(0, 0, 0);
+  }
+}
+
+function toggle3DAxes() {
+  if (axesGizmoGroup) {
+    show3dAxes = !show3dAxes;
+    axesGizmoGroup.visible = show3dAxes;
+    if (btnToggle3dAxes) btnToggle3dAxes.classList.toggle('active', show3dAxes);
+  }
+}
+
+function toggle3DGrid() {
+  if (deskGridHelper) {
+    show3dGrid = !show3dGrid;
+    deskGridHelper.visible = show3dGrid;
+    if (btnToggle3dGrid) btnToggle3dGrid.classList.toggle('active', show3dGrid);
+  }
+}
+
+// ==========================================================================
+// Center-Zero Bi-Directional Axis Bar & Ball Indicator Helper
+// ==========================================================================
+function updateBiDirectionalAxis(barEl, ballEl, val, maxScale) {
+  if (!barEl) return;
+  const num = parseFloat(val) || 0;
+  const clamped = Math.max(-maxScale, Math.min(maxScale, num));
+  const ratio = clamped / maxScale;
+  const pct = Math.abs(ratio) * 50.0;
+
+  if (ratio >= 0) {
+    barEl.style.left = '50%';
+    barEl.style.width = `${pct}%`;
+    if (ballEl) ballEl.style.left = `${50.0 + pct}%`;
+  } else {
+    barEl.style.left = `${50.0 - pct}%`;
+    barEl.style.width = `${pct}%`;
+    if (ballEl) ballEl.style.left = `${50.0 - pct}%`;
+  }
+}
+
+// ==========================================================================
+// 6-DOF IMU Kinematics, Tare Offsets & Attitude Fusion
+// ==========================================================================
+function updateIMUGauges(ax, ay, az, gx, gy, gz, activityStr) {
+  updateIMUAndOrientation(ax, ay, az, gx, gy, gz, null, null, null, 'Live UART', activityStr);
+}
+
+function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawGz = 0, explicitPitch = null, explicitRoll = null, explicitYaw = null, sourceInfo = 'Live IMU', activityStr = 'At Rest') {
+  let numRawAx = parseFloat(rawAx) || 0;
+  let numRawAy = parseFloat(rawAy) || 0;
+  let numRawAz = parseFloat(rawAz) || 0;
+  let numRawGx = parseFloat(rawGx) || 0;
+  let numRawGy = parseFloat(rawGy) || 0;
+  let numRawGz = parseFloat(rawGz) || 0;
+
+  // Record stationary sample if Tare calibration is in progress
+  if (isTareCalibrating) {
+    recordTareSample(numRawAx, numRawAy, numRawAz, numRawGx, numRawGy, numRawGz);
+  }
+
+  // 1. Subtract Calibrated Tare Offsets (Bias Cancellation)
+  const calAx = numRawAx - imuBiases.ax;
+  const calAy = numRawAy - imuBiases.ay;
+  const calAz = numRawAz - imuBiases.az;
+  const calGx = numRawGx - imuBiases.gx;
+  const calGy = numRawGy - imuBiases.gy;
+  const calGz = numRawGz - imuBiases.gz;
+
+  const now = Date.now();
+  const dt = lastOrientationTimestamp ? Math.min((now - lastOrientationTimestamp) / 1000.0, 0.2) : 0.05;
+  lastOrientationTimestamp = now;
+
+  // 2. Apply Configurable Digital Low-Pass Filters
+  const filtAccel = accelFilter.apply(calAx, calAy, calAz, now);
+  const filtGyro = gyroFilter.apply(calGx, calGy, calGz, now);
+
+  const ax = filtAccel.x;
+  const ay = filtAccel.y;
+  const az = filtAccel.z;
+  const gx = filtGyro.x;
+  const gy = filtGyro.y;
+  const gz = filtGyro.z;
+
+  currentImuState = {
+    rawAx: numRawAx, rawAy: numRawAy, rawAz: numRawAz,
+    rawGx: numRawGx, rawGy: numRawGy, rawGz: numRawGz,
+    filtAx: ax, filtAy: ay, filtAz: az,
+    filtGx: gx, filtGy: gy, filtGz: gz
+  };
+
+  // Add acceleration magnitude to real-time FFT analyzer
+  const totalG = Math.sqrt(ax * ax + ay * ay + az * az);
+  fftAnalyzer.addSample(totalG - 1.0); // Remove 1g static offset to isolate dynamic vibrations
+
+  // 3. Compute Attitude Angles using Selected Sensor Fusion Algorithm
+  let numPitch, numRoll, numYaw;
+
+  if (explicitPitch !== null && !isNaN(parseFloat(explicitPitch))) {
+    numPitch = parseFloat(explicitPitch);
+    numRoll = parseFloat(explicitRoll) || 0;
+    numYaw = parseFloat(explicitYaw) || 0;
+  } else if (fusionMode === 'madgwick') {
+    madgwickAHRS.update(gx, gy, gz, ax, ay, az, dt);
+    const fused = madgwickAHRS.getEuler();
+    numPitch = fused.pitch;
+    numRoll = fused.roll;
+    numYaw = fused.yaw;
+  } else if (fusionMode === 'complementary') {
+    const accPitch = Math.atan2(ax, Math.sqrt(ay * ay + az * az)) * (180.0 / Math.PI);
+    const accRoll = Math.atan2(ay, Math.sqrt(ax * ax + az * az)) * (180.0 / Math.PI);
+    const alpha = 0.96;
+    numPitch = alpha * (currentImuState.pitch + gx * dt) + (1.0 - alpha) * accPitch;
+    numRoll = alpha * (currentImuState.roll + gy * dt) + (1.0 - alpha) * accRoll;
+    lastEstimatedYaw = ((lastEstimatedYaw + gz * dt) % 360 + 360) % 360;
+    numYaw = lastEstimatedYaw;
+  } else {
+    // Pure Accelerometer Gravity Trigonometry
+    numPitch = Math.atan2(ax, Math.sqrt(ay * ay + az * az)) * (180.0 / Math.PI);
+    numRoll = Math.atan2(ay, Math.sqrt(ax * ax + az * az)) * (180.0 / Math.PI);
+    lastEstimatedYaw = ((lastEstimatedYaw + gz * dt) % 360 + 360) % 360;
+    numYaw = lastEstimatedYaw;
+  }
+
+  currentImuState.pitch = numPitch;
+  currentImuState.roll = numRoll;
+  currentImuState.yaw = numYaw;
+  currentImuState.totalG = totalG;
+
+  // 4. Update Accelerometer Values, Center-Zero Fills & Dynamic Balls (±2.5g)
+  if (valAccelX) valAccelX.textContent = `${ax >= 0 ? '+' : ''}${ax.toFixed(2)} g`;
+  if (valAccelY) valAccelY.textContent = `${ay >= 0 ? '+' : ''}${ay.toFixed(2)} g`;
+  if (valAccelZ) valAccelZ.textContent = `${az >= 0 ? '+' : ''}${az.toFixed(2)} g`;
+
+  updateBiDirectionalAxis(barAccelX, ballAccelX, ax, accelFullScale);
+  updateBiDirectionalAxis(barAccelY, ballAccelY, ay, accelFullScale);
+  updateBiDirectionalAxis(barAccelZ, ballAccelZ, az, accelFullScale);
+
+  // 5. Update Gyroscope Values, Center-Zero Fills & Dynamic Balls (±125°/s)
+  if (valGyroX) valGyroX.textContent = `${gx >= 0 ? '+' : ''}${gx.toFixed(1)} °/s`;
+  if (valGyroY) valGyroY.textContent = `${gy >= 0 ? '+' : ''}${gy.toFixed(1)} °/s`;
+  if (valGyroZ) valGyroZ.textContent = `${gz >= 0 ? '+' : ''}${gz.toFixed(1)} °/s`;
+
+  updateBiDirectionalAxis(barGyroX, ballGyroX, gx, gyroFullScale);
+  updateBiDirectionalAxis(barGyroY, ballGyroY, gy, gyroFullScale);
+  updateBiDirectionalAxis(barGyroZ, ballGyroZ, gz, gyroFullScale);
+
+  // 6. Update Euler Gauges
+  if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
+  if (valRoll) valRoll.textContent = `${numRoll >= 0 ? '+' : ''}${numRoll.toFixed(1)}°`;
+  if (valYaw) valYaw.textContent = `${numYaw.toFixed(1)}° ${getCompassHeading(numYaw)}`;
+
+  if (barPitch) {
+    const pPct = Math.min(50, (Math.abs(numPitch) / 90.0) * 50.0);
+    barPitch.style.width = `${pPct}%`;
+    barPitch.style.marginLeft = numPitch >= 0 ? '50%' : `${50 - pPct}%`;
+  }
+
+  if (barRoll) {
+    const rPct = Math.min(50, (Math.abs(numRoll) / 180.0) * 50.0);
+    barRoll.style.width = `${rPct}%`;
+    barRoll.style.marginLeft = numRoll >= 0 ? '50%' : `${50 - rPct}%`;
+  }
+
+  if (barYaw) {
+    const yPct = Math.min(100, Math.max(0, (numYaw / 360.0) * 100));
+    barYaw.style.width = `${yPct}%`;
+    barYaw.style.marginLeft = '0';
+  }
+
+  if (attitudeModeText) {
+    attitudeModeText.textContent = fusionMode === 'madgwick' ? 'Madgwick 6-DOF Fusion' : (fusionMode === 'complementary' ? 'Complementary Filter' : 'Accel Gravity');
+  }
+
+  // 7. Status Pills
+  const isFlat = Math.abs(numPitch) < 3.0 && Math.abs(numRoll) < 3.0;
+
+  if (attitudePill) {
+    if (isFlat) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(56, 239, 125, 0.4)';
+      attitudePill.style.color = '#38ef7d';
+      attitudePill.textContent = 'Flat (Top Up)';
+    } else if (numPitch > 18) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
+      attitudePill.style.color = '#ffb703';
+      attitudePill.textContent = `Nose Up (+${numPitch.toFixed(0)}°)`;
+    } else if (numPitch < -18) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
+      attitudePill.style.color = '#ffb703';
+      attitudePill.textContent = `Nosedown (${numPitch.toFixed(0)}°)`;
+    } else if (numRoll > 20) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+      attitudePill.style.color = '#00f2fe';
+      attitudePill.textContent = `Bank Right (+${numRoll.toFixed(0)}°)`;
+    } else if (numRoll < -20) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+      attitudePill.style.color = '#00f2fe';
+      attitudePill.textContent = `Bank Left (${numRoll.toFixed(0)}°)`;
+    } else {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(245, 158, 11, 0.4)';
+      attitudePill.style.color = '#f59e0b';
+      attitudePill.textContent = `Tilt P:${numPitch.toFixed(0)}° R:${numRoll.toFixed(0)}°`;
+    }
+  }
+
+  if (motionPill) {
+    if (totalG > 1.8) {
+      motionPill.className = 'pill pill-danger';
+      motionPill.textContent = 'RAPID MOTION / ALARM';
+    } else if (totalG > 1.2) {
+      motionPill.className = 'pill pill-warning';
+      motionPill.textContent = 'ACTIVE MOTION';
+    } else {
+      motionPill.className = 'pill pill-info';
+      motionPill.textContent = isFlat ? 'AT REST (DESK)' : 'NORMAL REST';
+    }
+  }
+
+  if (activityStateEl && activityStr && activityStateEl.textContent !== '--') {
+    activityStateEl.textContent = activityStr;
+  }
+
+  // 8. Update Live 3D Model Orientation
+  update3DOrientation(numPitch, numRoll, numYaw, totalG, isFlat);
+
+  return { pitch: numPitch, roll: numRoll, yaw: numYaw, ax, ay, az, gx, gy, gz, totalG };
+}
+
+function getCompassHeading(deg) {
+  const d = ((deg % 360) + 360) % 360;
+  const directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+  const idx = Math.round(d / 22.5) % 16;
+  return directions[idx];
+}
+
+// ==========================================================================
+// Real-Time FFT Spectrum Canvas Visualizer
+// ==========================================================================
+function startFftRenderLoop() {
+  const canvas = document.getElementById('fftCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+
+  function renderFft() {
+    requestAnimationFrame(renderFft);
+
+    const w = canvas.clientWidth || 300;
+    const h = canvas.clientHeight || 120;
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+
+    ctx.clearRect(0, 0, w, h);
+
+    const { magnitudes, peakFreq, peakMag, rms } = fftAnalyzer.computeSpectrum();
+
+    // Update Peak and RMS metric displays
+    if (fftPeakFreq) fftPeakFreq.textContent = `${peakFreq.toFixed(1)} Hz`;
+    if (fftRmsEnergy) fftRmsEnergy.textContent = `${rms.toFixed(2)} g`;
+
+    if (fftActivityBadge) {
+      if (peakFreq > 3.0 && rms > 0.15) {
+        fftActivityBadge.className = 'pill pill-danger';
+        fftActivityBadge.textContent = 'Rapid Shaking / Tremor';
+      } else if (peakFreq >= 1.5 && rms > 0.08) {
+        fftActivityBadge.className = 'pill pill-warning';
+        fftActivityBadge.textContent = 'Active Walking / Run';
+      } else if (peakFreq >= 0.8 && peakFreq <= 1.4 && rms > 0.04) {
+        fftActivityBadge.className = 'pill pill-attitude';
+        fftActivityBadge.textContent = 'Rumination / Grazing';
+      } else {
+        fftActivityBadge.className = 'pill pill-info';
+        fftActivityBadge.textContent = 'Resting / Idle';
+      }
+    }
+
+    // Draw Spectrum Bars
+    const binCount = magnitudes.length;
+    const barWidth = (w / binCount) - 2;
+
+    for (let i = 0; i < binCount; i++) {
+      const mag = magnitudes[i];
+      const barHeight = Math.min(h - 10, (mag / 0.5) * (h - 10));
+      const x = i * (barWidth + 2);
+      const y = h - barHeight;
+
+      const grad = ctx.createLinearGradient(0, y, 0, h);
+      grad.addColorStop(0, '#00f2fe');
+      grad.addColorStop(1, 'rgba(0, 198, 255, 0.15)');
+
+      ctx.fillStyle = grad;
+      ctx.fillRect(x, y, barWidth, barHeight);
+
+      // Peak highlight dot on dominant frequency
+      if (i > 1 && mag === peakMag && peakMag > 0.05) {
+        ctx.fillStyle = '#ffb703';
+        ctx.beginPath();
+        ctx.arc(x + barWidth / 2, y - 4, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  requestAnimationFrame(renderFft);
+}
+
+// ==========================================================================
+// Telemetry CSV Replay & Playback Engine
+// ==========================================================================
+function setupReplayEventListeners() {
+  if (btnLoadCsvFile && csvFileInput) {
+    btnLoadCsvFile.addEventListener('click', () => csvFileInput.click());
+    csvFileInput.addEventListener('change', handleCsvFileSelect);
+  }
+
+  if (btnEjectCsvFile) {
+    btnEjectCsvFile.addEventListener('click', ejectCsvReplay);
+  }
+
+  if (csvDropZone) {
+    csvDropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      csvDropZone.classList.add('dragover');
+    });
+    csvDropZone.addEventListener('dragleave', () => csvDropZone.classList.remove('dragover'));
+    csvDropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      csvDropZone.classList.remove('dragover');
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        loadCsvFile(e.dataTransfer.files[0]);
+      }
+    });
+    csvDropZone.addEventListener('click', () => csvFileInput.click());
+  }
+
+  if (btnReplayPlayPause) btnReplayPlayPause.addEventListener('click', toggleReplayPlayPause);
+  if (btnReplayPrev) btnReplayPrev.addEventListener('click', () => seekReplayIndex(0));
+  if (btnReplayNext) btnReplayNext.addEventListener('click', () => seekReplayIndex(replayDataRows.length - 1));
+
+  if (replayTimelineSlider) {
+    replayTimelineSlider.addEventListener('input', () => {
+      const idx = parseInt(replayTimelineSlider.value, 10);
+      seekReplayIndex(idx);
+    });
+  }
+
+  if (replaySpeedGroup) {
+    replaySpeedGroup.addEventListener('click', (e) => {
+      const btn = e.target.closest('.btn-speed');
+      if (!btn) return;
+      replaySpeedGroup.querySelectorAll('.btn-speed').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      replaySpeedMultiplier = parseFloat(btn.dataset.speed) || 1.0;
+      if (isReplayPlaying) {
+        startReplayPlayback();
+      }
+    });
+  }
+}
+
+function handleCsvFileSelect(e) {
+  if (e.target.files && e.target.files.length > 0) {
+    loadCsvFile(e.target.files[0]);
+  }
+}
+
+function loadCsvFile(file) {
+  if (!file || !file.name.endsWith('.csv')) {
+    alert('Please upload a valid .CSV telemetry recording file.');
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const text = e.target.result;
+    parseAndInitCsvReplay(file.name, text);
+  };
+  reader.readAsText(file);
+}
+
+function parseAndInitCsvReplay(filename, csvText) {
+  const lines = csvText.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length <= 1) {
+    alert('The uploaded CSV file contains no data rows.');
+    return;
+  }
+
+  const header = lines[0].split(',').map(h => h.replace(/^["\uFEFF]|["\r\n]/g, '').trim());
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const tokens = parseCsvLineTokens(lines[i]);
+    if (tokens.length >= 8) {
+      rows.push({
+        iso: tokens[0] || '',
+        local: tokens[1] || '',
+        packet: tokens[2] || String(i),
+        source: tokens[3] || 'CSV_REPLAY',
+        tag_id: tokens[4] || 'COW-TAG',
+        type: tokens[5] || 'REPLAY',
+        lat: parseFloat(tokens[6]) || null,
+        lng: parseFloat(tokens[7]) || null,
+        ax: parseFloat(tokens[8]) || 0,
+        ay: parseFloat(tokens[9]) || 0,
+        az: parseFloat(tokens[10]) || 1.0,
+        gx: parseFloat(tokens[11]) || 0,
+        gy: parseFloat(tokens[12]) || 0,
+        gz: parseFloat(tokens[13]) || 0,
+        pitch: parseFloat(tokens[14]) || null,
+        roll: parseFloat(tokens[15]) || null,
+        yaw: parseFloat(tokens[16]) || null,
+        batt: tokens[17] || '',
+        mode: tokens[18] || 'CSV Replay'
+      });
+    }
+  }
+
+  if (rows.length === 0) {
+    alert('Could not parse any valid telemetry rows from the CSV file.');
+    return;
+  }
+
+  replayDataRows = rows;
+  isReplayActive = true;
+  replayCurrentIndex = 0;
+
+  if (csvDropZone) csvDropZone.style.display = 'none';
+  if (csvPlayerContainer) csvPlayerContainer.style.display = 'flex';
+  if (btnEjectCsvFile) btnEjectCsvFile.style.display = 'inline-flex';
+  if (replayStatusPill) {
+    replayStatusPill.className = 'pill pill-success';
+    replayStatusPill.textContent = 'CSV Loaded';
+  }
+  if (replayFilenameText) replayFilenameText.textContent = filename;
+  if (replayRecordCount) replayRecordCount.textContent = `${rows.length} rows`;
+  if (replayTimelineSlider) {
+    replayTimelineSlider.max = rows.length - 1;
+    replayTimelineSlider.value = 0;
+  }
+
+  updateReplayTimecodeDisplay();
+  seekReplayIndex(0);
+  logToConsole('system', `[REPLAY] Loaded "${filename}" (${rows.length} telemetry records). Ready for playback.`);
+}
+
+function parseCsvLineTokens(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (c === ',' && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += c;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+function toggleReplayPlayPause() {
+  if (!isReplayActive || replayDataRows.length === 0) return;
+
+  isReplayPlaying = !isReplayPlaying;
+  if (isReplayPlaying) {
+    if (btnReplayPlayPause) {
+      btnReplayPlayPause.innerHTML = '<i class="fa-solid fa-pause"></i> Pause';
+      btnReplayPlayPause.classList.add('is-playing');
+    }
+    if (replayStatusPill) {
+      replayStatusPill.className = 'pill pill-warning';
+      replayStatusPill.textContent = 'Replaying...';
+    }
+    startReplayPlayback();
+  } else {
+    stopReplayPlayback();
+    if (btnReplayPlayPause) {
+      btnReplayPlayPause.innerHTML = '<i class="fa-solid fa-play"></i> Play';
+      btnReplayPlayPause.classList.remove('is-playing');
+    }
+    if (replayStatusPill) {
+      replayStatusPill.className = 'pill pill-success';
+      replayStatusPill.textContent = 'Paused';
+    }
+  }
+}
+
+function startReplayPlayback() {
+  if (replayPlaybackTimer) clearInterval(replayPlaybackTimer);
+
+  const baseIntervalMs = 50; // 20 Hz nominal replay
+  const interval = Math.max(10, Math.round(baseIntervalMs / replaySpeedMultiplier));
+
+  replayPlaybackTimer = setInterval(() => {
+    if (replayCurrentIndex >= replayDataRows.length - 1) {
+      toggleReplayPlayPause();
+      return;
+    }
+    seekReplayIndex(replayCurrentIndex + 1);
+  }, interval);
+}
+
+function stopReplayPlayback() {
+  if (replayPlaybackTimer) {
+    clearInterval(replayPlaybackTimer);
+    replayPlaybackTimer = null;
+  }
+}
+
+function seekReplayIndex(idx) {
+  if (!isReplayActive || replayDataRows.length === 0) return;
+
+  replayCurrentIndex = Math.max(0, Math.min(replayDataRows.length - 1, idx));
+  if (replayTimelineSlider) replayTimelineSlider.value = replayCurrentIndex;
+
+  const row = replayDataRows[replayCurrentIndex];
+  if (!row) return;
+
+  updateReplayTimecodeDisplay();
+
+  // Apply to Telemetry State
+  const orientation = updateIMUAndOrientation(
+    row.ax, row.ay, row.az, row.gx, row.gy, row.gz,
+    row.pitch, row.roll, row.yaw,
+    'CSV Replay', row.mode
+  );
+
+  if (row.lat && row.lng) {
+    updateGPSPosition(row.lat, row.lng, 412, 1.5);
+  }
+
+  if (row.batt) {
+    updateBatteryDisplay(row.batt);
+  }
+
+  const timeLabel = row.local ? row.local.split(',')[1] || row.local : `Row ${replayCurrentIndex}`;
+  addChartData(timeLabel, orientation.ax, orientation.ay, orientation.az, orientation.gx, orientation.gy, orientation.gz);
+}
+
+function updateReplayTimecodeDisplay() {
+  if (!isReplayActive || replayDataRows.length === 0) return;
+  const currentSec = Math.floor(replayCurrentIndex / 20.0);
+  const totalSec = Math.floor(replayDataRows.length / 20.0);
+
+  const formatTime = (s) => {
+    const m = String(Math.floor(s / 60)).padStart(2, '0');
+    const sec = String(s % 60).padStart(2, '0');
+    return `${m}:${sec}`;
+  };
+
+  if (replayCurrentTime) replayCurrentTime.textContent = formatTime(currentSec);
+  if (replayTotalTime) replayTotalTime.textContent = formatTime(totalSec);
+}
+
+function ejectCsvReplay() {
+  stopReplayPlayback();
+  isReplayActive = false;
+  isReplayPlaying = false;
+  replayDataRows = [];
+
+  if (csvDropZone) csvDropZone.style.display = 'block';
+  if (csvPlayerContainer) csvPlayerContainer.style.display = 'none';
+  if (btnEjectCsvFile) btnEjectCsvFile.style.display = 'none';
+  if (csvFileInput) csvFileInput.value = '';
+  if (replayStatusPill) {
+    replayStatusPill.className = 'pill pill-secondary';
+    replayStatusPill.textContent = 'No File Loaded';
+  }
+  logToConsole('system', 'Ejected CSV replay session.');
+}
+
+// ==========================================================================
 // Digital Low-Pass Filter Control Panel & Presets
 // ==========================================================================
 function setupFilterEventListeners() {
-  // Accelerometer Filter Controls
   if (chkAccelFilter) {
     chkAccelFilter.addEventListener('change', () => {
       accelFilter.enabled = chkAccelFilter.checked;
@@ -516,7 +1672,6 @@ function setupFilterEventListeners() {
     });
   }
 
-  // Gyroscope Filter Controls
   if (chkGyroFilter) {
     chkGyroFilter.addEventListener('change', () => {
       gyroFilter.enabled = chkGyroFilter.checked;
@@ -601,41 +1756,14 @@ function setupFilterEventListeners() {
     });
   });
 
-  // Reset Filters Defaults Button
   if (btnResetFilters) {
     btnResetFilters.addEventListener('click', () => {
-      if (chkAccelFilter) chkAccelFilter.checked = true;
-      if (accelFilterOrder) accelFilterOrder.value = '2';
-      if (accelCutoffFreq) accelCutoffFreq.value = 2.0;
-      if (accelCutoffInput) accelCutoffInput.value = '2.0';
-      if (lblAccelCutoff) lblAccelCutoff.textContent = '2.0 Hz';
-      if (accelFilterPill) {
-        accelFilterPill.className = 'pill pill-success';
-        accelFilterPill.textContent = 'LPF ON';
-      }
       accelFilter.setParameters(2.0, 2, true);
       accelFilter.reset();
-
-      if (chkGyroFilter) chkGyroFilter.checked = true;
-      if (gyroFilterOrder) gyroFilterOrder.value = '2';
-      if (gyroCutoffFreq) gyroCutoffFreq.value = 5.0;
-      if (gyroCutoffInput) gyroCutoffInput.value = '5.0';
-      if (lblGyroCutoff) lblGyroCutoff.textContent = '5.0 Hz';
-      if (gyroFilterPill) {
-        gyroFilterPill.className = 'pill pill-success';
-        gyroFilterPill.textContent = 'LPF ON';
-      }
       gyroFilter.setParameters(5.0, 2, true);
       gyroFilter.reset();
-
-      document.querySelectorAll('.btn-preset').forEach(b => b.classList.remove('active'));
-      const defaultAccelBtn = document.querySelector('.btn-preset[data-target="accel"][data-freq="2.0"]');
-      const defaultGyroBtn = document.querySelector('.btn-preset[data-target="gyro"][data-freq="5.0"]');
-      if (defaultAccelBtn) defaultAccelBtn.classList.add('active');
-      if (defaultGyroBtn) defaultGyroBtn.classList.add('active');
-
       updateFilterMasterStatus();
-      logToConsole('system', 'Digital Filters reset to balanced defaults (Accel: 2.0Hz 2nd-Ord | Gyro: 5.0Hz 2nd-Ord).');
+      logToConsole('system', 'Digital Filters reset to balanced defaults (Accel 2.0Hz | Gyro 5.0Hz).');
     });
   }
 
@@ -658,564 +1786,6 @@ function updateFilterMasterStatus() {
       filterMasterStatusPill.textContent = 'Filters OFF (Raw ADC)';
     }
   }
-
-  if (impactIndicator && impactText) {
-    if (isAccelOn || isGyroOn) {
-      impactIndicator.className = 'impact-indicator active';
-      impactIndicator.querySelector('i').className = 'fa-solid fa-circle-check';
-      impactText.innerHTML = `Filters actively smoothing <strong>Orientation (Pitch/Roll/Yaw)</strong>, <strong>G-Force</strong>, <strong>Angular Rate</strong>, and <strong>3D IMU Chip</strong> (${isAccelOn ? `Accel ${accelFilter.cutoffFreq}Hz` : 'Raw Accel'}, ${isGyroOn ? `Gyro ${gyroFilter.cutoffFreq}Hz` : 'Raw Gyro'}).`;
-    } else {
-      impactIndicator.className = 'impact-indicator disabled';
-      impactIndicator.querySelector('i').className = 'fa-solid fa-triangle-exclamation';
-      impactText.innerHTML = 'Filters disabled: Displaying and rendering <strong>100% UNFILTERED RAW ADC</strong> data directly.';
-    }
-  }
-}
-
-// ==========================================================================
-// Last Connected Device Persistence & Quick Reconnect
-// ==========================================================================
-function checkLastConnectedDevice() {
-  const lastBleName = localStorage.getItem('ranchbot_last_ble_name');
-  const lastBleId = localStorage.getItem('ranchbot_last_ble_id');
-  const lastSerialBaud = localStorage.getItem('ranchbot_last_serial_baud');
-
-  if (lastBleName || lastBleId) {
-    const displayName = lastBleName || 'Saved Ear Tag';
-    if (btnLastDevice && lastDeviceNameText) {
-      lastDeviceNameText.textContent = `Reconnect "${displayName}"`;
-      btnLastDevice.title = `Instant reconnect to ${displayName} (ID: ${lastBleId || 'Saved'})`;
-      btnLastDevice.style.display = 'inline-flex';
-    }
-  }
-}
-
-function saveLastConnectedBle(name, id) {
-  if (name) localStorage.setItem('ranchbot_last_ble_name', name);
-  if (id) localStorage.setItem('ranchbot_last_ble_id', id);
-  checkLastConnectedDevice();
-}
-
-function saveLastConnectedSerial(baud) {
-  if (baud) localStorage.setItem('ranchbot_last_serial_baud', String(baud));
-}
-
-async function handleLastDeviceReconnect() {
-  logToConsole('system', 'Attempting fast reconnect to last known BLE device...');
-  handleConnectButtonClick();
-}
-
-// ==========================================================================
-// 3D IMU Chip & Carrier Board Renderer (Three.js WebGL - 60 FPS Engine)
-// ==========================================================================
-function init3DImuViewer() {
-  const container = document.getElementById('imu3dContainer');
-  const canvas = document.getElementById('imu3dCanvas');
-  if (!container || !canvas || typeof THREE === 'undefined') return;
-
-  const width = container.clientWidth || 300;
-  const height = container.clientHeight || 280;
-
-  // Initialize Slerp Target & Current Quaternions
-  targetQuaternion = new THREE.Quaternion();
-  currentQuaternion = new THREE.Quaternion();
-  targetEuler = new THREE.Euler(0, 0, 0, 'YXZ');
-
-  // 1. Scene
-  scene3d = new THREE.Scene();
-  scene3d.background = new THREE.Color(0x0a0f1d);
-
-  // 2. Camera (Isometric Perspective)
-  camera3d = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
-  camera3d.position.set(4.8, 4.2, 5.8);
-  camera3d.lookAt(0, 0, 0);
-
-  // 3. Renderer
-  renderer3d = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
-  renderer3d.setSize(width, height);
-  renderer3d.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer3d.shadowMap.enabled = false; // Disabled shadowMap for 60fps maximum throughput
-
-  // 4. Lighting
-  const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
-  scene3d.add(ambientLight);
-
-  const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
-  dirLight.position.set(6, 12, 8);
-  scene3d.add(dirLight);
-
-  const fillLight = new THREE.PointLight(0x00f2fe, 0.45, 25);
-  fillLight.position.set(-5, -2, -4);
-  scene3d.add(fillLight);
-
-  // 5. Reference Desk Grid Plane (Y = 0)
-  deskGridHelper = new THREE.GridHelper(8, 16, 0x00f2fe, 0x1e293b);
-  deskGridHelper.position.y = -0.02;
-  scene3d.add(deskGridHelper);
-
-  // 6. Carrier PCB Board & IMU Group
-  imuBoardGroup = new THREE.Group();
-  scene3d.add(imuBoardGroup);
-
-  // PCB Carrier Board (Dark Green FR4 substrate)
-  const pcbGeo = new THREE.BoxGeometry(3.6, 0.14, 2.6);
-  const pcbMat = new THREE.MeshStandardMaterial({
-    color: 0x113b2e,
-    roughness: 0.35,
-    metalness: 0.25
-  });
-  const pcbMesh = new THREE.Mesh(pcbGeo, pcbMat);
-  pcbMesh.position.y = 0.07;
-  imuBoardGroup.add(pcbMesh);
-
-  // Gold Edge Traces & Corner Mounting Pads
-  const goldMat = new THREE.MeshStandardMaterial({ color: 0xd4af37, metalness: 0.9, roughness: 0.15 });
-  const cornerPads = [
-    [-1.55, 0.145, -1.05],
-    [1.55, 0.145, -1.05],
-    [-1.55, 0.145, 1.05],
-    [1.55, 0.145, 1.05]
-  ];
-  cornerPads.forEach(([cx, cy, cz]) => {
-    const padGeo = new THREE.CylinderGeometry(0.18, 0.18, 0.02, 16);
-    const pad = new THREE.Mesh(padGeo, goldMat);
-    pad.position.set(cx, cy, cz);
-    imuBoardGroup.add(pad);
-  });
-
-  // IMU IC Package (Center Mounted QFN Package)
-  const chipGeo = new THREE.BoxGeometry(1.4, 0.22, 1.4);
-  const chipMat = new THREE.MeshStandardMaterial({
-    color: 0x181a20, // Matte epoxy IC black
-    roughness: 0.5,
-    metalness: 0.3
-  });
-  const imuChipMesh = new THREE.Mesh(chipGeo, chipMat);
-  imuChipMesh.position.set(0, 0.25, 0);
-  imuBoardGroup.add(imuChipMesh);
-
-  // Pin 1 Polarity Marker Dot (Top-Left Corner)
-  const dotGeo = new THREE.CylinderGeometry(0.07, 0.07, 0.02, 16);
-  const dotMat = new THREE.MeshStandardMaterial({ color: 0x00f2fe, emissive: 0x00f2fe, emissiveIntensity: 0.8 });
-  const pin1Dot = new THREE.Mesh(dotGeo, dotMat);
-  pin1Dot.position.set(-0.48, 0.365, -0.48);
-  imuBoardGroup.add(pin1Dot);
-
-  // Silkscreen Text Canvas Texture for the IMU IC
-  const textCanvas = document.createElement('canvas');
-  textCanvas.width = 256;
-  textCanvas.height = 256;
-  const ctx = textCanvas.getContext('2d');
-  ctx.fillStyle = '#181a20';
-  ctx.fillRect(0, 0, 256, 256);
-  ctx.fillStyle = '#f8fafc';
-  ctx.font = 'bold 26px "JetBrains Mono", monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('IMU 6-DOF', 128, 85);
-  ctx.fillStyle = '#00c6ff';
-  ctx.font = 'bold 20px "JetBrains Mono", monospace';
-  ctx.fillText('±2.5G / 125°/s', 128, 128);
-  ctx.fillStyle = '#94a3b8';
-  ctx.font = '16px "JetBrains Mono", monospace';
-  ctx.fillText('16-BIT ADC', 128, 168);
-
-  const textTexture = new THREE.CanvasTexture(textCanvas);
-  const textMat = new THREE.MeshBasicMaterial({ map: textTexture, transparent: true });
-  const textPlaneGeo = new THREE.PlaneGeometry(1.2, 1.2);
-  const textPlane = new THREE.Mesh(textPlaneGeo, textMat);
-  textPlane.rotation.x = -Math.PI / 2;
-  textPlane.position.set(0, 0.362, 0);
-  imuBoardGroup.add(textPlane);
-
-  // Metallic Solder Leads on QFN perimeter
-  const pinMat = new THREE.MeshStandardMaterial({ color: 0xc8c8c8, metalness: 0.9, roughness: 0.1 });
-  for (let i = -0.45; i <= 0.45; i += 0.3) {
-    const pL = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat);
-    pL.position.set(-0.72, 0.18, i);
-    imuBoardGroup.add(pL);
-
-    const pR = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat);
-    pR.position.set(0.72, 0.18, i);
-    imuBoardGroup.add(pR);
-
-    const pF = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat);
-    pF.position.set(i, 0.18, 0.72);
-    imuBoardGroup.add(pF);
-
-    const pB = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.12), pinMat);
-    pB.position.set(i, 0.18, -0.72);
-    imuBoardGroup.add(pB);
-  }
-
-  // 7. 3D Coordinate Axis Gizmo Arrows
-  axesGizmoGroup = new THREE.Group();
-
-  // +X (Pitch Axis / Red)
-  const arrowX = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0.38, 0), 1.9, 0xff4d6d, 0.35, 0.18);
-  axesGizmoGroup.add(arrowX);
-
-  // +Y (Roll Axis / Green)
-  const arrowY = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0.38, 0), 1.9, 0x38ef7d, 0.35, 0.18);
-  axesGizmoGroup.add(arrowY);
-
-  // +Z (Top / Up Axis / Blue)
-  const arrowZ = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0.38, 0), 1.9, 0x00c6ff, 0.35, 0.18);
-  axesGizmoGroup.add(arrowZ);
-
-  imuBoardGroup.add(axesGizmoGroup);
-
-  // 8. Mouse Orbit Drag Controls
-  container.addEventListener('mousedown', (e) => {
-    isMouseDragging3d = true;
-    previousMousePosition = { x: e.clientX, y: e.clientY };
-  });
-
-  window.addEventListener('mouseup', () => {
-    isMouseDragging3d = false;
-  });
-
-  container.addEventListener('mousemove', (e) => {
-    if (!isMouseDragging3d) return;
-    const deltaX = e.clientX - previousMousePosition.x;
-    const deltaY = e.clientY - previousMousePosition.y;
-
-    const radius = camera3d.position.length();
-    let theta = Math.atan2(camera3d.position.x, camera3d.position.z);
-    let phi = Math.acos(Math.max(-1, Math.min(1, camera3d.position.y / radius)));
-
-    theta -= deltaX * 0.008;
-    phi = Math.max(0.1, Math.min(Math.PI / 2 - 0.05, phi + deltaY * 0.008));
-
-    camera3d.position.x = radius * Math.sin(phi) * Math.sin(theta);
-    camera3d.position.y = radius * Math.cos(phi);
-    camera3d.position.z = radius * Math.sin(phi) * Math.cos(theta);
-    camera3d.lookAt(0, 0, 0);
-
-    previousMousePosition = { x: e.clientX, y: e.clientY };
-  });
-
-  container.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    const zoomFactor = e.deltaY > 0 ? 1.08 : 0.92;
-    camera3d.position.multiplyScalar(zoomFactor);
-    camera3d.position.clampLength(2.5, 16.0);
-    camera3d.lookAt(0, 0, 0);
-  }, { passive: false });
-
-  // Touch controls for mobile
-  let lastTouchX = 0, lastTouchY = 0;
-  container.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 1) {
-      lastTouchX = e.touches[0].clientX;
-      lastTouchY = e.touches[0].clientY;
-    }
-  }, { passive: true });
-
-  container.addEventListener('touchmove', (e) => {
-    if (e.touches.length === 1) {
-      const deltaX = e.touches[0].clientX - lastTouchX;
-      const deltaY = e.touches[0].clientY - lastTouchY;
-
-      const radius = camera3d.position.length();
-      let theta = Math.atan2(camera3d.position.x, camera3d.position.z);
-      let phi = Math.acos(Math.max(-1, Math.min(1, camera3d.position.y / radius)));
-
-      theta -= deltaX * 0.01;
-      phi = Math.max(0.1, Math.min(Math.PI / 2 - 0.05, phi + deltaY * 0.01));
-
-      camera3d.position.x = radius * Math.sin(phi) * Math.sin(theta);
-      camera3d.position.y = radius * Math.cos(phi);
-      camera3d.position.z = radius * Math.sin(phi) * Math.cos(theta);
-      camera3d.lookAt(0, 0, 0);
-
-      lastTouchX = e.touches[0].clientX;
-      lastTouchY = e.touches[0].clientY;
-    }
-  }, { passive: true });
-
-  is3dInitialized = true;
-  start3DAnimationLoop();
-}
-
-function start3DAnimationLoop() {
-  if (is3dAnimating) return;
-  is3dAnimating = true;
-
-  function animate() {
-    requestAnimationFrame(animate);
-    if (is3dInitialized && imuBoardGroup && targetQuaternion) {
-      // Ultra-responsive slerp (0.45 per frame -> instant, silky-smooth 60/120fps motion tracking)
-      currentQuaternion.slerp(targetQuaternion, 0.45);
-      imuBoardGroup.quaternion.copy(currentQuaternion);
-      render3D();
-    }
-  }
-  requestAnimationFrame(animate);
-}
-
-function update3DOrientation(pitchDeg, rollDeg, yawDeg, totalG = 1.0, isFlat = true) {
-  if (!is3dInitialized || !targetQuaternion) return;
-
-  const pitchRad = (pitchDeg * Math.PI) / 180.0;
-  const rollRad = (rollDeg * Math.PI) / 180.0;
-  const yawRad = (yawDeg * Math.PI) / 180.0;
-
-  // Set target quaternion for continuous 60fps slerp loop (Pitch = X, Roll = Z, Yaw = Y)
-  targetEuler.set(-pitchRad, -yawRad, rollRad, 'YXZ');
-  targetQuaternion.setFromEuler(targetEuler);
-
-  // Update 3D HUD overlay
-  if (hudPitch) hudPitch.textContent = `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}°`;
-  if (hudRoll) hudRoll.textContent = `${rollDeg >= 0 ? '+' : ''}${rollDeg.toFixed(1)}°`;
-  if (hudYaw) hudYaw.textContent = `${yawDeg.toFixed(1)}°`;
-  if (hudGravity) hudGravity.textContent = `${totalG.toFixed(2)} g (${isFlat ? 'Z+ Normal' : 'Dynamic'})`;
-
-  if (chipFlatStatusPill) {
-    if (Math.abs(pitchDeg) < 3.0 && Math.abs(rollDeg) < 3.0) {
-      chipFlatStatusPill.className = 'pill pill-success';
-      chipFlatStatusPill.innerHTML = '<i class="fa-solid fa-table"></i> Top Up (Flat on Desk)';
-    } else {
-      chipFlatStatusPill.className = 'pill pill-attitude';
-      chipFlatStatusPill.innerHTML = `<i class="fa-solid fa-arrows-spin"></i> Tilted (P:${pitchDeg.toFixed(0)}° R:${rollDeg.toFixed(0)}°)`;
-    }
-  }
-}
-
-function render3D() {
-  if (renderer3d && scene3d && camera3d) {
-    renderer3d.render(scene3d, camera3d);
-  }
-}
-
-function reset3DView() {
-  if (camera3d) {
-    camera3d.position.set(4.8, 4.2, 5.8);
-    camera3d.lookAt(0, 0, 0);
-  }
-}
-
-function toggle3DAxes() {
-  if (axesGizmoGroup) {
-    show3dAxes = !show3dAxes;
-    axesGizmoGroup.visible = show3dAxes;
-    if (btnToggle3dAxes) btnToggle3dAxes.classList.toggle('active', show3dAxes);
-  }
-}
-
-function toggle3DGrid() {
-  if (deskGridHelper) {
-    show3dGrid = !show3dGrid;
-    deskGridHelper.visible = show3dGrid;
-    if (btnToggle3dGrid) btnToggle3dGrid.classList.toggle('active', show3dGrid);
-  }
-}
-
-// ==========================================================================
-// Center-Zero Bi-Directional Axis Bar & Ball Indicator Helper
-// ==========================================================================
-function updateBiDirectionalAxis(barEl, ballEl, val, maxScale) {
-  if (!barEl) return;
-  const num = parseFloat(val) || 0;
-  const clamped = Math.max(-maxScale, Math.min(maxScale, num));
-  const ratio = clamped / maxScale; // -1.0 to +1.0
-  const pct = Math.abs(ratio) * 50.0; // 0% to 50%
-
-  if (ratio >= 0) {
-    barEl.style.left = '50%';
-    barEl.style.width = `${pct}%`;
-    if (ballEl) ballEl.style.left = `${50.0 + pct}%`;
-  } else {
-    barEl.style.left = `${50.0 - pct}%`;
-    barEl.style.width = `${pct}%`;
-    if (ballEl) ballEl.style.left = `${50.0 - pct}%`;
-  }
-}
-
-// ==========================================================================
-// 6-DOF IMU Kinematics & 16-Bit Raw ADC Calibration
-// ==========================================================================
-function updateIMUGauges(ax, ay, az, gx, gy, gz, activityStr) {
-  updateIMUAndOrientation(ax, ay, az, gx, gy, gz, null, null, null, 'Live UART', activityStr);
-}
-
-function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawGz = 0, explicitPitch = null, explicitRoll = null, explicitYaw = null, sourceInfo = 'Live IMU', activityStr = 'At Rest') {
-  const numRawAx = parseFloat(rawAx) || 0;
-  const numRawAy = parseFloat(rawAy) || 0;
-  const numRawAz = parseFloat(rawAz) || 0;
-  const numRawGx = parseFloat(rawGx) || 0;
-  const numRawGy = parseFloat(rawGy) || 0;
-  const numRawGz = parseFloat(rawGz) || 0;
-
-  const now = Date.now();
-
-  // Apply Configurable Digital Low-Pass Filters
-  const filtAccel = accelFilter.apply(numRawAx, numRawAy, numRawAz, now);
-  const filtGyro = gyroFilter.apply(numRawGx, numRawGy, numRawGz, now);
-
-  const ax = filtAccel.x;
-  const ay = filtAccel.y;
-  const az = filtAccel.z;
-  const gx = filtGyro.x;
-  const gy = filtGyro.y;
-  const gz = filtGyro.z;
-
-  currentImuState = {
-    rawAx: numRawAx,
-    rawAy: numRawAy,
-    rawAz: numRawAz,
-    rawGx: numRawGx,
-    rawGy: numRawGy,
-    rawGz: numRawGz,
-    filtAx: ax,
-    filtAy: ay,
-    filtAz: az,
-    filtGx: gx,
-    filtGy: gy,
-    filtGz: gz
-  };
-
-  // Compute Euler pitch & roll from gravity acceleration vector
-  let numPitch;
-  if (explicitPitch !== null && explicitPitch !== undefined && !isNaN(parseFloat(explicitPitch))) {
-    numPitch = parseFloat(explicitPitch);
-  } else {
-    numPitch = Math.atan2(ax, Math.sqrt(ay * ay + az * az)) * (180.0 / Math.PI);
-  }
-
-  let numRoll;
-  if (explicitRoll !== null && explicitRoll !== undefined && !isNaN(parseFloat(explicitRoll))) {
-    numRoll = parseFloat(explicitRoll);
-  } else {
-    numRoll = Math.atan2(ay, Math.sqrt(ax * ax + az * az)) * (180.0 / Math.PI);
-  }
-
-  let numYaw;
-  if (explicitYaw !== null && explicitYaw !== undefined && !isNaN(parseFloat(explicitYaw))) {
-    numYaw = ((parseFloat(explicitYaw) % 360) + 360) % 360;
-    lastEstimatedYaw = numYaw;
-  } else {
-    const dt = lastOrientationTimestamp ? Math.min((now - lastOrientationTimestamp) / 1000.0, 0.5) : 0.05;
-    lastEstimatedYaw = ((lastEstimatedYaw + gz * dt) % 360 + 360) % 360;
-    numYaw = lastEstimatedYaw;
-  }
-  lastOrientationTimestamp = now;
-
-  currentImuState.pitch = numPitch;
-  currentImuState.roll = numRoll;
-  currentImuState.yaw = numYaw;
-
-  // 1. Update Accelerometer Values, Center-Zero Fills & Dynamic Balls (±2.5g)
-  if (valAccelX) valAccelX.textContent = `${ax >= 0 ? '+' : ''}${ax.toFixed(2)} g`;
-  if (valAccelY) valAccelY.textContent = `${ay >= 0 ? '+' : ''}${ay.toFixed(2)} g`;
-  if (valAccelZ) valAccelZ.textContent = `${az >= 0 ? '+' : ''}${az.toFixed(2)} g`;
-
-  updateBiDirectionalAxis(barAccelX, ballAccelX, ax, accelFullScale);
-  updateBiDirectionalAxis(barAccelY, ballAccelY, ay, accelFullScale);
-  updateBiDirectionalAxis(barAccelZ, ballAccelZ, az, accelFullScale);
-
-  // 2. Update Gyroscope Values, Center-Zero Fills & Dynamic Balls (±125°/s)
-  if (valGyroX) valGyroX.textContent = `${gx >= 0 ? '+' : ''}${gx.toFixed(1)} °/s`;
-  if (valGyroY) valGyroY.textContent = `${gy >= 0 ? '+' : ''}${gy.toFixed(1)} °/s`;
-  if (valGyroZ) valGyroZ.textContent = `${gz >= 0 ? '+' : ''}${gz.toFixed(1)} °/s`;
-
-  updateBiDirectionalAxis(barGyroX, ballGyroX, gx, gyroFullScale);
-  updateBiDirectionalAxis(barGyroY, ballGyroY, gy, gyroFullScale);
-  updateBiDirectionalAxis(barGyroZ, ballGyroZ, gz, gyroFullScale);
-
-  // 3. Update Euler Gauges
-  if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
-  if (valRoll) valRoll.textContent = `${numRoll >= 0 ? '+' : ''}${numRoll.toFixed(1)}°`;
-  if (valYaw) valYaw.textContent = `${numYaw.toFixed(1)}° ${getCompassHeading(numYaw)}`;
-
-  if (barPitch) {
-    const pPct = Math.min(50, (Math.abs(numPitch) / 90.0) * 50.0);
-    barPitch.style.width = `${pPct}%`;
-    barPitch.style.marginLeft = numPitch >= 0 ? '50%' : `${50 - pPct}%`;
-  }
-
-  if (barRoll) {
-    const rPct = Math.min(50, (Math.abs(numRoll) / 180.0) * 50.0);
-    barRoll.style.width = `${rPct}%`;
-    barRoll.style.marginLeft = numRoll >= 0 ? '50%' : `${50 - rPct}%`;
-  }
-
-  if (barYaw) {
-    const yPct = Math.min(100, Math.max(0, (numYaw / 360.0) * 100));
-    barYaw.style.width = `${yPct}%`;
-    barYaw.style.marginLeft = '0';
-  }
-
-  if (attitudeModeText) {
-    attitudeModeText.textContent = sourceInfo || 'Live IMU';
-  }
-
-  // 4. Status Pills
-  const totalG = Math.sqrt(ax * ax + ay * ay + az * az);
-  currentImuState.totalG = totalG;
-  const isFlat = Math.abs(numPitch) < 3.0 && Math.abs(numRoll) < 3.0;
-
-  if (attitudePill) {
-    if (isFlat) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(56, 239, 125, 0.4)';
-      attitudePill.style.color = '#38ef7d';
-      attitudePill.textContent = 'Flat (Top Up)';
-    } else if (numPitch > 18) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
-      attitudePill.style.color = '#ffb703';
-      attitudePill.textContent = `Nose Up (+${numPitch.toFixed(0)}°)`;
-    } else if (numPitch < -18) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
-      attitudePill.style.color = '#ffb703';
-      attitudePill.textContent = `Nosedown (${numPitch.toFixed(0)}°)`;
-    } else if (numRoll > 20) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
-      attitudePill.style.color = '#00f2fe';
-      attitudePill.textContent = `Bank Right (+${numRoll.toFixed(0)}°)`;
-    } else if (numRoll < -20) {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
-      attitudePill.style.color = '#00f2fe';
-      attitudePill.textContent = `Bank Left (${numRoll.toFixed(0)}°)`;
-    } else {
-      attitudePill.className = 'pill pill-attitude';
-      attitudePill.style.borderColor = 'rgba(245, 158, 11, 0.4)';
-      attitudePill.style.color = '#f59e0b';
-      attitudePill.textContent = `Tilt P:${numPitch.toFixed(0)}° R:${numRoll.toFixed(0)}°`;
-    }
-  }
-
-  if (motionPill) {
-    if (totalG > 1.8) {
-      motionPill.className = 'pill pill-danger';
-      motionPill.textContent = 'RAPID MOTION / ALARM';
-    } else if (totalG > 1.2) {
-      motionPill.className = 'pill pill-warning';
-      motionPill.textContent = 'ACTIVE MOTION';
-    } else {
-      motionPill.className = 'pill pill-info';
-      motionPill.textContent = isFlat ? 'AT REST (DESK)' : 'NORMAL REST';
-    }
-  }
-
-  if (activityStateEl && activityStr && activityStateEl.textContent !== '--') {
-    activityStateEl.textContent = activityStr;
-  }
-
-  // 5. Update Live 3D IMU Chip & Board Orientation
-  update3DOrientation(numPitch, numRoll, numYaw, totalG, isFlat);
-
-  return { pitch: numPitch, roll: numRoll, yaw: numYaw, ax, ay, az, gx, gy, gz, totalG };
-}
-
-function getCompassHeading(deg) {
-  const d = ((deg % 360) + 360) % 360;
-  const directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
-  const idx = Math.round(d / 22.5) % 16;
-  return directions[idx];
 }
 
 // ==========================================================================
@@ -1231,7 +1801,6 @@ function updateDeviceOverview(name, id, connected) {
       deviceTypeBadge.className = 'badge pill-success';
     }
   } else {
-    // 100% Blank Data when disconnected as requested by user
     if (deviceNameEl) deviceNameEl.textContent = '--';
     if (cowTagIdEl) cowTagIdEl.textContent = '--';
     if (batteryValueEl) batteryValueEl.textContent = '-- V';
@@ -1251,44 +1820,17 @@ function updateBatteryDisplay(batteryVolts, batteryPct = null) {
   let v = parseFloat(batteryVolts);
   let pct = batteryPct !== null && !isNaN(parseInt(batteryPct, 10)) ? parseInt(batteryPct, 10) : null;
 
-  if (!isNaN(v) && v > 100) {
-    v = v / 1000.0;
-  }
+  if (!isNaN(v) && v > 100) v = v / 1000.0;
+  if (pct === null && !isNaN(v) && v > 0) pct = Math.round(Math.min(100, Math.max(0, ((v - 3.3) / 0.9) * 100)));
 
-  if (pct === null && !isNaN(v) && v > 0) {
-    pct = Math.round(Math.min(100, Math.max(0, ((v - 3.3) / (4.2 - 3.3)) * 100)));
-  }
-
-  if (batteryValueEl) {
-    batteryValueEl.textContent = !isNaN(v) ? `${v.toFixed(2)} V` : '-- V';
-  }
-
+  if (batteryValueEl) batteryValueEl.textContent = !isNaN(v) ? `${v.toFixed(2)} V` : '-- V';
   if (batteryPillEl && pct !== null) {
     batteryPillEl.textContent = `${pct}%`;
-    if (pct > 60) {
-      batteryPillEl.className = 'valueHighlight battery-pill pill-success';
-      batteryPillEl.style.background = 'rgba(56, 239, 125, 0.15)';
-      batteryPillEl.style.color = '#38ef7d';
-    } else if (pct > 25) {
-      batteryPillEl.className = 'valueHighlight battery-pill pill-warning';
-      batteryPillEl.style.background = 'rgba(255, 183, 3, 0.15)';
-      batteryPillEl.style.color = '#ffb703';
-    } else {
-      batteryPillEl.className = 'valueHighlight battery-pill pill-danger';
-      batteryPillEl.style.background = 'rgba(255, 77, 109, 0.15)';
-      batteryPillEl.style.color = '#ff4d6d';
-    }
+    batteryPillEl.className = pct > 60 ? 'valueHighlight battery-pill pill-success' : (pct > 25 ? 'valueHighlight battery-pill pill-warning' : 'valueHighlight battery-pill pill-danger');
   }
-
   if (batteryLevelFillEl && pct !== null) {
     batteryLevelFillEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
-    if (pct > 60) {
-      batteryLevelFillEl.style.background = '#38ef7d';
-    } else if (pct > 25) {
-      batteryLevelFillEl.style.background = '#ffb703';
-    } else {
-      batteryLevelFillEl.style.background = '#ff4d6d';
-    }
+    batteryLevelFillEl.style.background = pct > 60 ? '#38ef7d' : (pct > 25 ? '#ffb703' : '#ff4d6d');
   }
 }
 
@@ -1329,32 +1871,15 @@ async function handleConnectButtonClick() {
       optionalServicesList.push(userServiceUuid);
     }
 
-    // Build smart search filter list prioritizing last connected device
     const lastBleName = localStorage.getItem('ranchbot_last_ble_name');
     const filterList = [];
-    if (lastBleName) {
-      filterList.push({ namePrefix: lastBleName });
-    }
-    filterList.push(
-      { namePrefix: 'Xiao' },
-      { namePrefix: 'Xiao-cowtag' },
-      { namePrefix: 'cowtag' },
-      { namePrefix: 'Ranchbot' },
-      { namePrefix: 'Tag' },
-      { namePrefix: 'Cow' }
-    );
+    if (lastBleName) filterList.push({ namePrefix: lastBleName });
+    filterList.push({ namePrefix: 'Xiao' }, { namePrefix: 'Xiao-cowtag' }, { namePrefix: 'cowtag' }, { namePrefix: 'Ranchbot' }, { namePrefix: 'Tag' }, { namePrefix: 'Cow' });
 
     try {
-      bleDevice = await navigator.bluetooth.requestDevice({
-        filters: filterList,
-        optionalServices: optionalServicesList
-      });
+      bleDevice = await navigator.bluetooth.requestDevice({ filters: filterList, optionalServices: optionalServicesList });
     } catch (filterErr) {
-      logToConsole('system', 'Name filter missed. Prompting for all nearby BLE devices...');
-      bleDevice = await navigator.bluetooth.requestDevice({
-        acceptAllDevices: true,
-        optionalServices: optionalServicesList
-      });
+      bleDevice = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: optionalServicesList });
     }
 
     const deviceName = bleDevice.name || 'Xiao-cowtag';
@@ -1362,25 +1887,16 @@ async function handleConnectButtonClick() {
     saveLastConnectedBle(deviceName, bleDevice.id);
 
     bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
-
     updateDeviceOverview(deviceName, bleDevice.id, true);
     cowTagIdEl.textContent = deviceName;
     updateStatus('connected', 'Tag Active');
     btnConnect.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Stop Tracking Tag';
 
-    // 1. Subscribe to Live BLE Advertisement Broadcasts
     if (bleDevice.watchAdvertisements) {
-      logToConsole('system', 'Subscribing to Live BLE Advertising Broadcasts...');
       bleDevice.addEventListener('advertisementreceived', handleAdvertisementReceived);
-      try {
-        await bleDevice.watchAdvertisements();
-        logToConsole('system', 'BLE Advertisement Watcher ACTIVE.');
-      } catch (advErr) {
-        logToConsole('warn', `Advertisement Watcher notice: ${advErr.message}`);
-      }
+      try { await bleDevice.watchAdvertisements(); } catch (e) {}
     }
 
-    // 2. Attempt GATT Connection
     try {
       gattServer = await connectGattWithRetry(bleDevice, 2);
       await setupBLEDataNotifications(gattServer);
@@ -1400,60 +1916,17 @@ async function handleScanAllClick() {
     return;
   }
 
-  if (!navigator.bluetooth) {
-    alert('Web Bluetooth is not supported in this browser environment.');
-    return;
-  }
-
   try {
     updateStatus('scanning', 'Scanning All BLE...');
-    logToConsole('system', 'Initiating unfiltered scan (acceptAllDevices = true)...');
-
-    const userServiceUuid = document.getElementById('serviceUuid').value.trim();
-    const optionalServicesList = [
-      ENVIRONMENTAL_SENSING_SERVICE,
-      '00001800-0000-1000-8000-00805f9b34fb',
-      '00001801-0000-1000-8000-00805f9b34fb',
-      '0000180f-0000-1000-8000-00805f9b34fb',
-      '0000ffe0-0000-1000-8000-00805f9b34fb',
-      '6e400001-b5a3-f393-e0a9-e50e24dcca9e'
-    ];
-    if (userServiceUuid && !optionalServicesList.includes(userServiceUuid)) {
-      optionalServicesList.push(userServiceUuid);
-    }
-
-    bleDevice = await navigator.bluetooth.requestDevice({
-      acceptAllDevices: true,
-      optionalServices: optionalServicesList
-    });
+    const optionalServicesList = [ENVIRONMENTAL_SENSING_SERVICE, '6e400001-b5a3-f393-e0a9-e50e24dcca9e', '0000ffe0-0000-1000-8000-00805f9b34fb'];
+    bleDevice = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: optionalServicesList });
 
     const deviceName = bleDevice.name || 'XIAO-COWTAG';
-    logToConsole('system', `Device Selected: "${deviceName}" (ID: ${bleDevice.id})`);
     saveLastConnectedBle(deviceName, bleDevice.id);
-
     bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
-
     updateDeviceOverview(deviceName, bleDevice.id, true);
-    cowTagIdEl.textContent = deviceName;
     updateStatus('connected', 'Tag Active');
-    btnConnect.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Stop Tracking Tag';
-
-    if (bleDevice.watchAdvertisements) {
-      bleDevice.addEventListener('advertisementreceived', handleAdvertisementReceived);
-      try {
-        await bleDevice.watchAdvertisements();
-      } catch (e) {}
-    }
-
-    try {
-      gattServer = await connectGattWithRetry(bleDevice, 2);
-      await setupBLEDataNotifications(gattServer);
-    } catch (gattErr) {
-      logToConsole('warn', `GATT notice: "${gattErr.message}". Defaulting to Broadcast Telemetry Mode.`);
-    }
-
-  } catch (error) {
-    logToConsole('error', `BLE Scan Error: ${error.message}`);
+  } catch (e) {
     updateStatus('disconnected', 'Disconnected');
   }
 }
@@ -1461,19 +1934,11 @@ async function handleScanAllClick() {
 function handleAdvertisementReceived(event) {
   const rssi = event.rssi;
   if (rssiValueEl) rssiValueEl.textContent = `${rssi} dBm`;
-
-  logToConsole('rx', `[BLE ADV BROADCAST] Device: "${event.name || 'XIAO-COWTAG'}" | RSSI: ${rssi} dBm`);
-
   if (event.manufacturerData && event.manufacturerData.size > 0) {
-    for (let [mfgId, dataView] of event.manufacturerData) {
-      decodeAndProcessPacket(dataView, 'ADV_MANUFACTURER');
-    }
+    for (let [mfgId, dataView] of event.manufacturerData) decodeAndProcessPacket(dataView, 'ADV_MANUFACTURER');
   }
-
   if (event.serviceData && event.serviceData.size > 0) {
-    for (let [uuid, dataView] of event.serviceData) {
-      decodeAndProcessPacket(dataView, 'ADV_SERVICE');
-    }
+    for (let [uuid, dataView] of event.serviceData) decodeAndProcessPacket(dataView, 'ADV_SERVICE');
   }
 }
 
@@ -1482,60 +1947,31 @@ async function connectGattWithRetry(device, maxAttempts = 3) {
   while (attempt < maxAttempts) {
     try {
       attempt++;
-      logToConsole('system', `GATT connection attempt ${attempt}/${maxAttempts}...`);
-      await new Promise(r => setTimeout(r, 200));
-      const server = await device.gatt.connect();
-      logToConsole('system', 'GATT Server Connected Successfully!');
-      return server;
+      return await device.gatt.connect();
     } catch (err) {
-      logToConsole('warn', `Attempt ${attempt} failed: ${err.message}`);
       if (attempt >= maxAttempts) throw err;
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 400));
     }
   }
 }
 
 async function setupBLEDataNotifications(server) {
   try {
-    let services = [];
-    try {
-      services = await server.getPrimaryServices();
-    } catch (sErr) {
-      const targetServices = [
-        ENVIRONMENTAL_SENSING_SERVICE,
-        '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
-        '0000ffe0-0000-1000-8000-00805f9b34fb',
-        '0000180f-0000-1000-8000-00805f9b34fb'
-      ];
-      for (const sUuid of targetServices) {
-        try {
-          const s = await server.getPrimaryService(sUuid);
-          if (s) services.push(s);
-        } catch (e) {}
+    const services = await server.getPrimaryServices();
+    for (const service of services) {
+      const chars = await service.getCharacteristics();
+      for (const char of chars) {
+        if (char.properties.notify || char.properties.indicate) {
+          await char.startNotifications();
+          char.addEventListener('characteristicvaluechanged', handleCharacteristicValueChanged);
+        }
       }
     }
-
-    for (const service of services) {
-      try {
-        const characteristics = await service.getCharacteristics();
-        for (const char of characteristics) {
-          if (char.properties.notify || char.properties.indicate) {
-            await char.startNotifications();
-            char.addEventListener('characteristicvaluechanged', handleCharacteristicValueChanged);
-            logToConsole('system', `SUBSCRIBED to Telemetry Stream on ${char.uuid}`);
-          }
-        }
-      } catch (cErr) {}
-    }
-  } catch (err) {
-    logToConsole('error', `Service discovery failed: ${err.message}`);
-  }
+  } catch (e) {}
 }
 
 function disconnectDevice() {
-  if (bleDevice && bleDevice.gatt.connected) {
-    bleDevice.gatt.disconnect();
-  }
+  if (bleDevice && bleDevice.gatt.connected) bleDevice.gatt.disconnect();
   onDisconnected();
 }
 
@@ -1551,7 +1987,7 @@ function handleCharacteristicValueChanged(event) {
 }
 
 // ==========================================================================
-// Web Serial API (USB-to-UART Direct Hardware Connection)
+// Web Serial API (USB UART)
 // ==========================================================================
 async function handleConnectSerialButtonClick() {
   if (serialPort) {
@@ -1560,33 +1996,23 @@ async function handleConnectSerialButtonClick() {
   }
 
   if (!('serial' in navigator)) {
-    alert('Web Serial API is not supported in this browser environment. Please use Google Chrome, Microsoft Edge, or Opera.');
+    alert('Web Serial API is not supported in this browser. Please use Chrome or Edge.');
     return;
   }
 
   try {
     const selectedBaud = parseInt(serialBaudSelect.value, 10) || 115200;
-    logToConsole('system', `Requesting Serial (UART) Port connection at ${selectedBaud} baud...`);
-    
     serialPort = await navigator.serial.requestPort();
     await serialPort.open({ baudRate: selectedBaud });
 
-    const portInfo = serialPort.getInfo();
-    const usbVendorId = portInfo.usbVendorId ? `0x${portInfo.usbVendorId.toString(16).toUpperCase()}` : 'UART';
-    const usbProductId = portInfo.usbProductId ? `0x${portInfo.usbProductId.toString(16).toUpperCase()}` : 'DEV';
-
     saveLastConnectedSerial(selectedBaud);
-
     updateStatus('serial-connected', `Serial Active (${selectedBaud}b)`);
-    updateDeviceOverview(`USB Serial Device (${usbVendorId}:${usbProductId})`, `PORT-${usbVendorId}`, true);
-    cowTagIdEl.textContent = `UART-${usbVendorId}`;
+    updateDeviceOverview('USB Serial Device', 'PORT-UART', true);
     btnConnectSerial.className = 'btn btn-primary';
     btnConnectSerial.innerHTML = '<i class="fa-solid fa-plug-circle-xmark"></i> Disconnect Serial';
 
-    logToConsole('system', `[SERIAL CONNECTED] Port open at ${selectedBaud} baud.`);
     readSerialStream();
   } catch (err) {
-    logToConsole('error', `Serial Port Connection failed: ${err.message}`);
     updateStatus('disconnected', 'Disconnected');
     serialPort = null;
   }
@@ -1596,41 +2022,20 @@ async function readSerialStream() {
   try {
     const reader = serialPort.readable.getReader();
     serialReader = reader;
-
     while (serialPort && serialPort.readable) {
       const { value, done } = await reader.read();
       if (done) break;
-      if (value) {
-        processRawUartChunk(value, 'SERIAL');
-      }
+      if (value) processRawUartChunk(value, 'SERIAL');
     }
-  } catch (err) {
-    if (serialPort) {
-      logToConsole('error', `Serial Stream Read Error: ${err.message}`);
-    }
-  } finally {
-    if (serialReader) {
-      try { serialReader.releaseLock(); } catch(e){}
-      serialReader = null;
-    }
-  }
+  } catch (err) {}
 }
 
 async function disconnectSerialPort() {
-  if (serialReader) {
-    try { await serialReader.cancel(); } catch (e) {}
-    serialReader = null;
-  }
-  if (serialPort) {
-    try { await serialPort.close(); } catch (e) {}
-    serialPort = null;
-  }
-
+  if (serialReader) { try { await serialReader.cancel(); } catch (e) {} serialReader = null; }
+  if (serialPort) { try { await serialPort.close(); } catch (e) {} serialPort = null; }
   updateStatus('disconnected', 'Disconnected');
   updateDeviceOverview('--', '--', false);
-  btnConnectSerial.className = 'btn btn-primary';
   btnConnectSerial.innerHTML = '<i class="fa-solid fa-plug"></i> Connect Serial';
-  logToConsole('warn', 'Serial UART Disconnected.');
 }
 
 // ==========================================================================
@@ -1641,9 +2046,7 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
   packetCountEl.textContent = packetCounter;
 
   const hexBytes = [];
-  for (let i = 0; i < dataView.byteLength; i++) {
-    hexBytes.push(dataView.getUint8(i).toString(16).padStart(2, '0').toUpperCase());
-  }
+  for (let i = 0; i < dataView.byteLength; i++) hexBytes.push(dataView.getUint8(i).toString(16).padStart(2, '0').toUpperCase());
   const rawHexStr = hexBytes.join(' ');
 
   let parsed = {};
@@ -1657,7 +2060,6 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     const lat = latMicro / 1e7;
     const lng = lngMicro / 1e7;
 
-    // Decode 16-bit Raw ADC Accelerometer values using exact full-scale calibration
     const rawAxInt = dataView.getInt16(11, true);
     const rawAyInt = dataView.getInt16(13, true);
     const rawAzInt = dataView.byteLength >= 17 ? dataView.getInt16(15, true) : Math.round(accelLsbPerG);
@@ -1666,7 +2068,6 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     const rawAy = (rawAyInt / accelLsbPerG).toFixed(3);
     const rawAz = (rawAzInt / accelLsbPerG).toFixed(3);
 
-    // Decode 16-bit Raw ADC Gyroscope values
     const rawGx = (((rawAxInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
     const rawGy = (((rawAyInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
     const rawGz = (((rawAzInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
@@ -1678,9 +2079,7 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     const activities = ['Resting / Lying', 'Grazing Pasture', 'Walking / Moving', 'High Alert / Running'];
     const actStr = activities[actByte % 4] || 'Grazing';
 
-    // Compute Filtered Kinematics & 3D Orientation
     const orientation = updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz, null, null, null, 'BLE Tag Frame', actStr);
-
     updateBatteryDisplay(battVolts);
 
     parsed = {
@@ -1696,11 +2095,8 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     };
 
     updateGPSPosition(lat, lng, 412, actByte === 2 ? 3.5 : 1.2);
-
     const timeStr = new Date().toLocaleTimeString();
     addChartData(timeStr, orientation.ax, orientation.ay, orientation.az, orientation.gx, orientation.gy, orientation.gz);
-
-    logToConsole('rx', `[RX TAG] COW-${tagIdNum} | Lat:${lat.toFixed(5)} Lng:${lng.toFixed(5)} | Acc:(${orientation.ax.toFixed(2)},${orientation.ay.toFixed(2)},${orientation.az.toFixed(2)})g | Gyro:(${orientation.gx.toFixed(1)},${orientation.gy.toFixed(1)},${orientation.gz.toFixed(1)})°/s | P:${orientation.pitch.toFixed(1)}° R:${orientation.roll.toFixed(1)}°`);
 
     if (isRecording) {
       writeRecordToFileAndBuffer({
@@ -1729,7 +2125,6 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     }
   } else {
     parsed = { 'Raw Hex': rawHexStr, 'Length': `${dataView.byteLength} Bytes` };
-    logToConsole('rx', `[RAW PAYLOAD] ${rawHexStr}`);
   }
 
   renderParsedFields(parsed);
@@ -1737,33 +2132,22 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
 
 function parseTextTelemetry(line) {
   const res = {
-    tag_id: '',
-    lat: '',
-    lng: '',
-    accel_x: '',
-    accel_y: '',
-    accel_z: '',
-    gyro_x: '',
-    gyro_y: '',
-    gyro_z: '',
-    pitch: '',
-    roll: '',
-    yaw: '',
-    battery_v: '',
-    battery_pct: '',
-    activity_mode: '',
-    has_imu_data: false
+    tag_id: '', lat: '', lng: '',
+    accel_x: '', accel_y: '', accel_z: '',
+    gyro_x: '', gyro_y: '', gyro_z: '',
+    pitch: '', roll: '', yaw: '',
+    battery_v: '', battery_pct: '',
+    activity_mode: '', has_imu_data: false
   };
 
   if (!line || typeof line !== 'string') return res;
   
   let cleanLine = line.trim();
   cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*(?:\[(?:BLE|SERIAL|UART|SIM|RX|TX)\])?\s*/i, '');
-  const isSystemLog = cleanLine.match(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i);
   cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i);
   cleanLine = cleanLine.trim();
 
-  // 1. Battery log line e.g. "BATTERY: 96% (4116 mV)"
+  // 1. Battery log line
   const battLogMatch = cleanLine.match(/BATTERY\s*:\s*(\d+)\s*%\s*(?:\(\s*(\d+)\s*mV\s*\))?/i);
   if (battLogMatch) {
     const pct = parseInt(battLogMatch[1], 10);
@@ -1775,75 +2159,17 @@ function parseTextTelemetry(line) {
     return res;
   }
 
-  // 2. GPS Diagnostics
-  if (cleanLine.includes('GPS NO-FIX') || cleanLine.includes('ANTENNA SHORT') || cleanLine.includes('GPS diag:')) {
-    if (gpsFixPill) {
-      gpsFixPill.className = 'pill pill-warning';
-      gpsFixPill.textContent = cleanLine.includes('ANTENNA SHORT') ? 'Antenna Alert' : 'GPS Searching';
-    }
-    res.activity_mode = 'GPS Diagnostic';
-    return res;
-  }
-
-  // 3. FIFO & System logs
-  if (cleanLine.includes('FIFO window') || cleanLine.includes('SD: IMU batch') || cleanLine.includes('SD: TELEM row') || isSystemLog) {
-    res.activity_mode = 'System Diagnostic';
-    return res;
-  }
-
-  // 4. NMEA GPS Sentences
-  if (cleanLine.startsWith('$GP') || cleanLine.startsWith('$GN')) {
-    if (cleanLine.startsWith('$GPRMC') || cleanLine.startsWith('$GNRMC')) {
-      const parts = cleanLine.split(',');
-      if (parts.length >= 7 && parts[2] === 'A') {
-        const rawLat = parseFloat(parts[3]);
-        const latDir = parts[4];
-        const rawLng = parseFloat(parts[5]);
-        const lngDir = parts[6];
-
-        if (!isNaN(rawLat) && !isNaN(rawLng)) {
-          let latDeg = Math.floor(rawLat / 100) + (rawLat % 100) / 60;
-          if (latDir === 'S') latDeg = -latDeg;
-          let lngDeg = Math.floor(rawLng / 100) + (rawLng % 100) / 60;
-          if (lngDir === 'W') lngDeg = -lngDeg;
-
-          res.lat = latDeg.toFixed(6);
-          res.lng = lngDeg.toFixed(6);
-          updateGPSPosition(latDeg, lngDeg, 412, 1.5);
-          if (gpsFixPill) {
-            gpsFixPill.className = 'pill pill-success';
-            gpsFixPill.textContent = 'GPS Locked (NMEA)';
-          }
-        }
-      }
-      res.activity_mode = 'NMEA GPS Fix';
-    } else {
-      res.activity_mode = 'NMEA Sentence';
-    }
-    return res;
-  }
-
-  // 5. $IMU sentence from CowTag: sample, timestamp_ms, raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz, pitch, roll, yaw
+  // 2. $IMU sentence from CowTag
   if (cleanLine.startsWith('$IMU')) {
     const parts = cleanLine.split(',');
     if (parts.length >= 7) {
       if (parts.length >= 12) {
-        const rawAx = parseFloat(parts[3]);
-        const rawAy = parseFloat(parts[4]);
-        const rawAz = parseFloat(parts[5]);
-        const rawGx = parseFloat(parts[6]);
-        const rawGy = parseFloat(parts[7]);
-        const rawGz = parseFloat(parts[8]);
-
-        // Exact 16-Bit ADC Calibration (±2.5g Accel, ±125°/s Gyro)
-        res.accel_x = (rawAx / accelLsbPerG).toFixed(3);
-        res.accel_y = (rawAy / accelLsbPerG).toFixed(3);
-        res.accel_z = (rawAz / accelLsbPerG).toFixed(3);
-
-        res.gyro_x = (rawGx / gyroLsbPerDps).toFixed(1);
-        res.gyro_y = (rawGy / gyroLsbPerDps).toFixed(1);
-        res.gyro_z = (rawGz / gyroLsbPerDps).toFixed(1);
-
+        res.accel_x = (parseFloat(parts[3]) / accelLsbPerG).toFixed(3);
+        res.accel_y = (parseFloat(parts[4]) / accelLsbPerG).toFixed(3);
+        res.accel_z = (parseFloat(parts[5]) / accelLsbPerG).toFixed(3);
+        res.gyro_x = (parseFloat(parts[6]) / gyroLsbPerDps).toFixed(1);
+        res.gyro_y = (parseFloat(parts[7]) / gyroLsbPerDps).toFixed(1);
+        res.gyro_z = (parseFloat(parts[8]) / gyroLsbPerDps).toFixed(1);
         res.pitch = parseFloat(parts[9]).toFixed(2);
         res.roll = parseFloat(parts[10]).toFixed(2);
         res.yaw = parseFloat(parts[11]).toFixed(2);
@@ -1858,10 +2184,7 @@ function parseTextTelemetry(line) {
       res.activity_mode = '$IMU Stream';
       res.has_imu_data = true;
     }
-  }
-
-  // 6. Euler Attitudes ($RPY or $YPR)
-  else if (cleanLine.startsWith('$RPY')) {
+  } else if (cleanLine.startsWith('$RPY') || cleanLine.startsWith('$YPR')) {
     const parts = cleanLine.split(',');
     if (parts.length >= 4) {
       res.roll = parseFloat(parts[1]).toFixed(1);
@@ -1870,88 +2193,23 @@ function parseTextTelemetry(line) {
       res.activity_mode = '$RPY Attitude';
       res.has_imu_data = true;
     }
-  } else if (cleanLine.startsWith('$YPR')) {
-    const parts = cleanLine.split(',');
-    if (parts.length >= 4) {
-      res.yaw = parseFloat(parts[1]).toFixed(1);
-      res.pitch = parseFloat(parts[2]).toFixed(1);
-      res.roll = parseFloat(parts[3]).toFixed(1);
-      res.activity_mode = '$YPR Attitude';
-      res.has_imu_data = true;
-    }
-  }
-
-  // 7. Vector Prefixes: PRY, RPY, ACCEL, GYRO
-  else if (cleanLine.match(/^(?:PRY|RPY|YPR|ACCEL|ACC|GYRO|GYR)\s*[:=]/i)) {
-    const pryMatch = cleanLine.match(/PRY\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-    if (pryMatch) {
-      res.pitch = parseFloat(pryMatch[1]).toFixed(1);
-      res.roll = parseFloat(pryMatch[2]).toFixed(1);
-      res.yaw = parseFloat(pryMatch[3]).toFixed(1);
-      res.has_imu_data = true;
-    }
-    const accelMatch = cleanLine.match(/(?:ACCEL|ACC)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-    if (accelMatch) {
-      const vX = parseFloat(accelMatch[1]);
-      const vY = parseFloat(accelMatch[2]);
-      const vZ = parseFloat(accelMatch[3]);
-      const scale = Math.abs(vZ) > 50 ? accelLsbPerG : 1.0;
-      res.accel_x = (vX / scale).toFixed(3);
-      res.accel_y = (vY / scale).toFixed(3);
-      res.accel_z = (vZ / scale).toFixed(3);
-      res.has_imu_data = true;
-    }
-    const gyroMatch = cleanLine.match(/(?:GYRO|GYR)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-    if (gyroMatch) {
-      const gX = parseFloat(gyroMatch[1]);
-      const gY = parseFloat(gyroMatch[2]);
-      const gZ = parseFloat(gyroMatch[3]);
-      const gScale = Math.abs(gX) > 200 ? gyroLsbPerDps : 1.0;
-      res.gyro_x = (gX / gScale).toFixed(1);
-      res.gyro_y = (gY / gScale).toFixed(1);
-      res.gyro_z = (gZ / gScale).toFixed(1);
-      res.has_imu_data = true;
-    }
-    res.activity_mode = 'Vector Stream';
-  }
-
-  // 8. Numerical Telemetry Stream
-  else {
+  } else {
     const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
     const nums = tokens.map(t => parseFloat(t)).filter(n => !isNaN(n));
-
-    if (nums.length === tokens.length && nums.length >= 3) {
-      if (nums.length === 7) {
-        res.gyro_x = (nums[1] / gyroLsbPerDps).toFixed(1);
-        res.gyro_y = (nums[2] / gyroLsbPerDps).toFixed(1);
-        res.gyro_z = (nums[3] / gyroLsbPerDps).toFixed(1);
-        res.pitch = nums[4].toFixed(2);
-        res.roll = nums[5].toFixed(2);
-        res.yaw = nums[6].toFixed(2);
-        res.activity_mode = '7-DOF Euler Stream';
-        res.has_imu_data = true;
-      } else if (nums.length === 22) {
-        res.battery_pct = String(Math.round(nums[19]));
-        res.battery_v = (nums[20] / 1000.0).toFixed(2);
-        updateBatteryDisplay(res.battery_v, nums[19]);
-        res.activity_mode = 'Summary 22-Val';
-        return res;
-      } else if (nums.length === 6) {
-        const scale = Math.abs(nums[2]) > 50 ? accelLsbPerG : 1.0;
-        const gScale = Math.abs(nums[3]) > 200 ? gyroLsbPerDps : 1.0;
-        res.accel_x = (nums[0] / scale).toFixed(3);
-        res.accel_y = (nums[1] / scale).toFixed(3);
-        res.accel_z = (nums[2] / scale).toFixed(3);
-        res.gyro_x = (nums[3] / gScale).toFixed(1);
-        res.gyro_y = (nums[4] / gScale).toFixed(1);
-        res.gyro_z = (nums[5] / gScale).toFixed(1);
-        res.activity_mode = '6-DOF Raw';
-        res.has_imu_data = true;
-      }
+    if (nums.length >= 6) {
+      const scale = Math.abs(nums[2]) > 50 ? accelLsbPerG : 1.0;
+      const gScale = Math.abs(nums[3]) > 200 ? gyroLsbPerDps : 1.0;
+      res.accel_x = (nums[0] / scale).toFixed(3);
+      res.accel_y = (nums[1] / scale).toFixed(3);
+      res.accel_z = (nums[2] / scale).toFixed(3);
+      res.gyro_x = (nums[3] / gScale).toFixed(1);
+      res.gyro_y = (nums[4] / gScale).toFixed(1);
+      res.gyro_z = (nums[5] / gScale).toFixed(1);
+      res.activity_mode = '6-DOF Raw';
+      res.has_imu_data = true;
     }
   }
 
-  // Update IMU and 3D Model when data is received
   if (res.has_imu_data) {
     const orientation = updateIMUAndOrientation(
       res.accel_x || currentImuState.filtAx,
@@ -1963,8 +2221,7 @@ function parseTextTelemetry(line) {
       res.pitch ? parseFloat(res.pitch) : null,
       res.roll ? parseFloat(res.roll) : null,
       res.yaw ? parseFloat(res.yaw) : null,
-      'Live Inbound UART',
-      res.activity_mode || 'Active UART'
+      'Live Inbound UART', res.activity_mode || 'Active UART'
     );
 
     res.accel_x = orientation.ax.toFixed(2);
@@ -1993,32 +2250,22 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
 
   if (typeof chunkData === 'string') {
     textChunk = chunkData;
-    const encoder = new TextEncoder();
-    uint8Array = encoder.encode(chunkData);
+    uint8Array = new TextEncoder().encode(chunkData);
   } else if (chunkData instanceof DataView) {
     uint8Array = new Uint8Array(chunkData.buffer, chunkData.byteOffset, chunkData.byteLength);
-    const decoder = new TextDecoder('utf-8', { fatal: false });
-    textChunk = decoder.decode(uint8Array);
+    textChunk = new TextDecoder('utf-8', { fatal: false }).decode(uint8Array);
   } else if (chunkData instanceof ArrayBuffer || ArrayBuffer.isView(chunkData)) {
     uint8Array = new Uint8Array(chunkData.buffer || chunkData, chunkData.byteOffset || 0, chunkData.byteLength);
-    const decoder = new TextDecoder('utf-8', { fatal: false });
-    textChunk = decoder.decode(uint8Array);
+    textChunk = new TextDecoder('utf-8', { fatal: false }).decode(uint8Array);
   }
 
   if (uint8Array) {
-    for (let i = 0; i < uint8Array.length; i++) {
-      hexBytes.push(uint8Array[i].toString(16).padStart(2, '0').toUpperCase());
-    }
+    for (let i = 0; i < uint8Array.length; i++) hexBytes.push(uint8Array[i].toString(16).padStart(2, '0').toUpperCase());
   }
 
   const rawHexStr = hexBytes.join(' ');
   const displayFormat = streamFormatSelect ? streamFormatSelect.value : 'text';
 
-  if (displayFormat === 'hex') {
-    logToConsole('rx', `[RAW HEX ${source}] ${rawHexStr}`);
-  }
-
-  // 1. Text Line Buffering & Recording
   if (textChunk) {
     serialLineBuffer += textChunk;
     const lines = serialLineBuffer.split(/\r?\n/);
@@ -2027,13 +2274,9 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
     for (const line of lines) {
       const trimmed = line.trim();
       if (trimmed.length > 0) {
-        if (displayFormat !== 'hex') {
-          logToConsole('uart-text', `[${source}] ${trimmed}`);
-        }
-
+        if (displayFormat !== 'hex') logToConsole('uart-text', `[${source}] ${trimmed}`);
         packetCounter++;
         packetCountEl.textContent = packetCounter;
-
         const extracted = parseTextTelemetry(trimmed);
 
         if (isRecording) {
@@ -2066,7 +2309,6 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
     }
   }
 
-  // 2. Binary Frame Buffer (0xCB Sync Header Detection)
   if (uint8Array && uint8Array.length > 0) {
     const newBuf = new Uint8Array(uartByteRingBuffer.length + uint8Array.length);
     newBuf.set(uartByteRingBuffer);
@@ -2076,17 +2318,12 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
     while (uartByteRingBuffer.length >= 20) {
       let syncIdx = -1;
       for (let i = 0; i <= uartByteRingBuffer.length - 20; i++) {
-        if (uartByteRingBuffer[i] === 0xCB) {
-          syncIdx = i;
-          break;
-        }
+        if (uartByteRingBuffer[i] === 0xCB) { syncIdx = i; break; }
       }
-
       if (syncIdx === -1) {
         uartByteRingBuffer = uartByteRingBuffer.slice(Math.max(0, uartByteRingBuffer.length - 19));
         break;
       }
-
       const packetSlice = uartByteRingBuffer.slice(syncIdx, syncIdx + 20);
       const packetView = new DataView(packetSlice.buffer, packetSlice.byteOffset, packetSlice.byteLength);
       decodeAndProcessPacket(packetView, source);
@@ -2096,7 +2333,7 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
 }
 
 // ==========================================================================
-// Chart.js 6-DOF IMU Motion History Setup (High-Performance Engine)
+// Chart.js 6-DOF IMU Motion History Setup
 // ==========================================================================
 function initChart() {
   const chartCanvas = document.getElementById('motionChart');
@@ -2122,36 +2359,13 @@ function initChart() {
       animation: false,
       interaction: { mode: 'index', intersect: false },
       scales: {
-        x: {
-          grid: { color: 'rgba(255, 255, 255, 0.05)' },
-          ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }
-        },
-        y: {
-          type: 'linear',
-          position: 'left',
-          min: -accelFullScale,
-          max: accelFullScale,
-          suggestedMin: -accelFullScale,
-          suggestedMax: accelFullScale,
-          grid: { color: 'rgba(255, 255, 255, 0.08)' },
-          ticks: { color: '#00c6ff', font: { family: 'JetBrains Mono', size: 10 } },
-          title: { display: true, text: `Acceleration (±${accelFullScale}g)`, color: '#00c6ff', font: { size: 11, weight: '600' } }
-        },
-        y1: {
-          type: 'linear',
-          position: 'right',
-          min: -gyroFullScale,
-          max: gyroFullScale,
-          suggestedMin: -gyroFullScale,
-          suggestedMax: gyroFullScale,
-          grid: { drawOnChartArea: false },
-          ticks: { color: '#f59e0b', font: { family: 'JetBrains Mono', size: 10 } },
-          title: { display: true, text: `Angular Rate (±${gyroFullScale} °/s)`, color: '#f59e0b', font: { size: 11, weight: '600' } }
-        }
+        x: { grid: { color: 'rgba(255, 255, 255, 0.05)' }, ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono', size: 10 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
+        y: { type: 'linear', position: 'left', min: -accelFullScale, max: accelFullScale, grid: { color: 'rgba(255, 255, 255, 0.08)' }, ticks: { color: '#00c6ff', font: { family: 'JetBrains Mono', size: 10 } }, title: { display: true, text: `Acceleration (±${accelFullScale}g)`, color: '#00c6ff', font: { size: 11, weight: '600' } } },
+        y1: { type: 'linear', position: 'right', min: -gyroFullScale, max: gyroFullScale, grid: { drawOnChartArea: false }, ticks: { color: '#f59e0b', font: { family: 'JetBrains Mono', size: 10 } }, title: { display: true, text: `Angular Rate (±${gyroFullScale} °/s)`, color: '#f59e0b', font: { size: 11, weight: '600' } } }
       },
       plugins: {
         legend: { position: 'top', labels: { color: '#f1f5f9', font: { family: 'Inter', size: 11 }, boxWidth: 12, padding: 8 } },
-        tooltip: { backgroundColor: 'rgba(11, 15, 25, 0.95)', titleFont: { family: 'JetBrains Mono' }, bodyFont: { family: 'JetBrains Mono' }, borderColor: 'rgba(0, 242, 254, 0.3)', borderWidth: 1 }
+        tooltip: { backgroundColor: 'rgba(11, 15, 25, 0.95)', titleFont: { family: 'JetBrains Mono' }, bodyFont: { family: 'JetBrains Mono' } }
       }
     }
   });
@@ -2162,31 +2376,16 @@ function initChart() {
 
 function addChartData(timeLabel, ax, ay, az, gx = 0, gy = 0, gz = 0) {
   if (!motionChart) return;
-
   const now = Date.now();
-  chartBuffer.push({
-    time: now,
-    label: timeLabel,
-    ax: Number(ax) || 0,
-    ay: Number(ay) || 0,
-    az: Number(az) || 0,
-    gx: Number(gx) || 0,
-    gy: Number(gy) || 0,
-    gz: Number(gz) || 0
-  });
-
+  chartBuffer.push({ time: now, label: timeLabel, ax: Number(ax) || 0, ay: Number(ay) || 0, az: Number(az) || 0, gx: Number(gx) || 0, gy: Number(gy) || 0, gz: Number(gz) || 0 });
   const cutoffTime = now - chartTimeWindowMs;
-  while (chartBuffer.length > 0 && chartBuffer[0].time < cutoffTime) {
-    chartBuffer.shift();
-  }
-
+  while (chartBuffer.length > 0 && chartBuffer[0].time < cutoffTime) chartBuffer.shift();
   chartNeedsUpdate = true;
 }
 
 function startChartRenderLoop() {
   function loop(timestamp) {
     requestAnimationFrame(loop);
-
     if (chartNeedsUpdate && (timestamp - lastChartRenderTime >= CHART_RENDER_FPS_INTERVAL)) {
       lastChartRenderTime = timestamp;
       chartNeedsUpdate = false;
@@ -2198,7 +2397,6 @@ function startChartRenderLoop() {
 
 function rebuildChartFromBuffer() {
   if (!motionChart) return;
-
   motionChart.data.labels = chartBuffer.map(item => item.label);
   motionChart.data.datasets[0].data = chartBuffer.map(item => item.ax);
   motionChart.data.datasets[1].data = chartBuffer.map(item => item.ay);
@@ -2206,15 +2404,12 @@ function rebuildChartFromBuffer() {
   motionChart.data.datasets[3].data = chartBuffer.map(item => item.gx);
   motionChart.data.datasets[4].data = chartBuffer.map(item => item.gy);
   motionChart.data.datasets[5].data = chartBuffer.map(item => item.gz);
-
   applyChartFilterMode();
-
   if (chartWindowBadge) {
     const sec = Math.round(chartTimeWindowMs / 1000);
     const winLabel = sec >= 60 ? `${Math.round(sec / 60)} Min` : `${sec}s`;
     chartWindowBadge.innerHTML = `<i class="fa-solid fa-clock"></i> Last ${winLabel} (${sec}s) • ${chartBuffer.length} pts`;
   }
-
   motionChart.update('none');
 }
 
@@ -2244,10 +2439,7 @@ function initMap() {
   map = L.map('map', { center: [startLat, startLng], zoom: 16, zoomControl: false });
   L.control.zoom({ position: 'topright' }).addTo(map);
 
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; OpenStreetMap',
-    maxZoom: 19
-  }).addTo(map);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 19 }).addTo(map);
 
   const cowIcon = L.divIcon({
     className: 'custom-cow-icon',
@@ -2268,10 +2460,8 @@ function updateGPSPosition(lat, lng, alt, speed) {
 
   const newPos = [lat, lng];
   if (cowMarker) cowMarker.setLatLng(newPos);
-  
   pathHistory.push(newPos);
   if (pathHistory.length > 50) pathHistory.shift();
-  
   if (polyline) polyline.setLatLngs(pathHistory);
   if (map) map.panTo(newPos);
 }
@@ -2297,9 +2487,7 @@ function logToConsole(type, msg) {
   entry.className = `log-entry ${type}`;
   entry.innerHTML = `<span style="color: #64748b; margin-right: 8px;">[${time}]</span> ${escapeHtml(msg)}`;
   terminalLog.appendChild(entry);
-  if (autoScroll) {
-    terminalLog.scrollTop = terminalLog.scrollHeight;
-  }
+  if (autoScroll) terminalLog.scrollTop = terminalLog.scrollHeight;
 }
 
 function escapeHtml(str) {
@@ -2311,44 +2499,23 @@ function togglePauseStream() {
   if (btnPauseStream) {
     btnPauseStream.classList.toggle('active', isStreamPaused);
     btnPauseStream.innerHTML = isStreamPaused ? '<i class="fa-solid fa-play"></i>' : '<i class="fa-solid fa-pause"></i>';
-    btnPauseStream.title = isStreamPaused ? 'Resume Stream' : 'Pause Stream';
   }
   logToConsole('system', isStreamPaused ? 'UART Stream PAUSED.' : 'UART Stream RESUMED.');
 }
 
 function toggleAutoScroll() {
   autoScroll = !autoScroll;
-  if (btnToggleAutoScroll) {
-    btnToggleAutoScroll.classList.toggle('active', autoScroll);
-  }
-  logToConsole('system', autoScroll ? 'Terminal Auto-Scroll ENABLED.' : 'Terminal Auto-Scroll DISABLED.');
+  if (btnToggleAutoScroll) btnToggleAutoScroll.classList.toggle('active', autoScroll);
 }
 
 // ==========================================================================
 // Telemetry Stream CSV Recorder
 // ==========================================================================
 const CSV_HEADERS = [
-  'Timestamp (ISO)',
-  'Timestamp (Local)',
-  'Packet #',
-  'Source',
-  'Cow Tag ID',
-  'Data Type',
-  'Latitude (°)',
-  'Longitude (°)',
-  'Accel X (g)',
-  'Accel Y (g)',
-  'Accel Z (g)',
-  'Gyro X (°/s)',
-  'Gyro Y (°/s)',
-  'Gyro Z (°/s)',
-  'Pitch (°)',
-  'Roll (°)',
-  'Yaw (°)',
-  'Battery (V)',
-  'Activity Mode',
-  'Payload Text',
-  'Raw Hex'
+  'Timestamp (ISO)', 'Timestamp (Local)', 'Packet #', 'Source', 'Cow Tag ID', 'Data Type',
+  'Latitude (°)', 'Longitude (°)', 'Accel X (g)', 'Accel Y (g)', 'Accel Z (g)',
+  'Gyro X (°/s)', 'Gyro Y (°/s)', 'Gyro Z (°/s)', 'Pitch (°)', 'Roll (°)', 'Yaw (°)',
+  'Battery (V)', 'Activity Mode', 'Payload Text', 'Raw Hex'
 ];
 
 function escapeCsvField(field) {
@@ -2438,8 +2605,6 @@ function startRecording() {
   recordingTimerInterval = setInterval(updateRecorderTimerDisplay, 1000);
   updateRecorderTimerDisplay();
   updateRecorderStats();
-
-  logToConsole('system', `[RECORDER STARTED] Capturing to "${activeRecordingFileName}".`);
 }
 
 function writeRecordToFileAndBuffer(recordItem) {
@@ -2511,27 +2676,25 @@ function clearCsvBuffer() {
 }
 
 // ==========================================================================
-// Simulator Stream Generator (Calibrated to ±2.5g and ±125°/s 16-Bit ADC)
+// Simulator Stream Generator (20 Hz Live Stream)
 // ==========================================================================
 function toggleSimulatorStream() {
   isSimulatorRunning = !isSimulatorRunning;
   if (isSimulatorRunning) {
     btnSimulateStream.classList.add('btn-primary');
     btnSimulateStream.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Test';
-    logToConsole('system', '[SIMULATOR] High-Speed 6-DOF IMU & 3D Attitude Stream Generator STARTED (20 Hz).');
+    logToConsole('system', '[SIMULATOR] High-Speed 6-DOF IMU Stream Generator STARTED (20 Hz).');
 
     let simLat = 31.968600;
     let simLng = -99.901800;
     let count = 0;
 
-    // Run at 20 Hz (50ms) for high-speed continuous motion and graph validation
     simulatorInterval = setInterval(() => {
       count++;
       simLat += (Math.random() - 0.5) * 0.00005;
       simLng += (Math.random() - 0.5) * 0.00005;
 
       const t = count * 0.08;
-      // Realistic physical movements within ±2.5g and ±125°/s
       const ax = (Math.sin(t * 1.5) * 0.85).toFixed(3);
       const ay = (Math.cos(t * 1.2) * 0.65).toFixed(3);
       const az = (0.98 + Math.sin(t * 0.8) * 0.25).toFixed(3);
@@ -2546,7 +2709,6 @@ function toggleSimulatorStream() {
       const battMv = Math.max(3400, Math.round(4120 - (count * 0.05)));
       const battPct = Math.round(Math.min(100, Math.max(0, ((battMv - 3300) / 900) * 100)));
 
-      // 16-Bit Signed ADC Values based on ±2.5g (13107.2 LSB/g) and ±125°/s (262.144 LSB/dps)
       const rawAx = Math.round(parseFloat(ax) * accelLsbPerG);
       const rawAy = Math.round(parseFloat(ay) * accelLsbPerG);
       const rawAz = Math.round(parseFloat(az) * accelLsbPerG);
@@ -2578,7 +2740,7 @@ function toggleSimulatorStream() {
         view.setUint8(19, 1);
         processRawUartChunk(view, 'SIM_BLE');
       }
-    }, 50); // 20 Hz
+    }, 50);
   } else {
     clearInterval(simulatorInterval);
     simulatorInterval = null;
@@ -2605,9 +2767,7 @@ function setupMobileTabs() {
     mobileTabNav.querySelectorAll('.mobile-tab-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
 
-    if (dashboardGrid) {
-      dashboardGrid.dataset.mobileTab = targetTab;
-    }
+    if (dashboardGrid) dashboardGrid.dataset.mobileTab = targetTab;
 
     setTimeout(() => {
       if (map) map.invalidateSize();
@@ -2625,9 +2785,7 @@ function setupMobileTabs() {
       }
     }, 120);
 
-    if (window.innerWidth <= 860) {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
+    if (window.innerWidth <= 860) window.scrollTo({ top: 0, behavior: 'smooth' });
   });
 }
 
@@ -2665,15 +2823,37 @@ function toggleFullWidthStream() {
     dashboardGrid.classList.add('full-width-active');
     btnToggleFullWidth.innerHTML = '<i class="fa-solid fa-compress"></i> <span class="btn-text">Restore View</span>';
     btnToggleFullWidth.classList.add('btn-primary');
-    btnToggleFullWidth.title = 'Restore Standard Dashboard View';
-    logToConsole('system', 'Telemetry Stream area expanded to FULL SCREEN WIDTH.');
   } else {
     dashboardGrid.classList.remove('full-width-active');
     btnToggleFullWidth.innerHTML = '<i class="fa-solid fa-expand"></i> <span class="btn-text">Full Width</span>';
     btnToggleFullWidth.classList.remove('btn-primary');
-    btnToggleFullWidth.title = 'Toggle Full Width Stream Area';
-    logToConsole('system', 'Restored standard dashboard layout.');
   }
 
   if (map) setTimeout(() => map.invalidateSize(), 250);
+}
+
+function checkLastConnectedDevice() {
+  const lastBleName = localStorage.getItem('ranchbot_last_ble_name');
+  const lastBleId = localStorage.getItem('ranchbot_last_ble_id');
+  if (lastBleName || lastBleId) {
+    const displayName = lastBleName || 'Saved Ear Tag';
+    if (btnLastDevice && lastDeviceNameText) {
+      lastDeviceNameText.textContent = `Reconnect "${displayName}"`;
+      btnLastDevice.style.display = 'inline-flex';
+    }
+  }
+}
+
+function saveLastConnectedBle(name, id) {
+  if (name) localStorage.setItem('ranchbot_last_ble_name', name);
+  if (id) localStorage.setItem('ranchbot_last_ble_id', id);
+  checkLastConnectedDevice();
+}
+
+function saveLastConnectedSerial(baud) {
+  if (baud) localStorage.setItem('ranchbot_last_serial_baud', String(baud));
+}
+
+async function handleLastDeviceReconnect() {
+  handleConnectButtonClick();
 }

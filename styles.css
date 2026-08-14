@@ -1299,6 +1299,254 @@ input:checked + .slider:before {
 }
 
 /* ==========================================================================
+   Tare / Zero Rest Calibration Styles
+   ========================================================================== */
+.imu-cal-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.btn-tare {
+  background: rgba(0, 242, 254, 0.12);
+  border: 1px solid rgba(0, 242, 254, 0.35);
+  color: var(--secondary);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.btn-tare:hover {
+  background: rgba(0, 242, 254, 0.25);
+  border-color: var(--secondary);
+  color: #ffffff;
+}
+
+.tare-progress-container {
+  position: relative;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(0, 242, 254, 0.3);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.6rem;
+  margin-bottom: 0.5rem;
+  overflow: hidden;
+}
+
+.tare-progress-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(90deg, rgba(0, 198, 255, 0.3), rgba(0, 242, 254, 0.5));
+  transition: width 0.1s linear;
+  z-index: 1;
+}
+
+.tare-progress-text {
+  position: relative;
+  z-index: 2;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--secondary);
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   3D Model Switcher & Sensor Fusion Row
+   ========================================================================== */
+.model-switch-btn-group {
+  display: flex;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+
+.model-switch-btn-group .btn {
+  border: none;
+  background: transparent;
+  padding: 0.15rem 0.45rem;
+  font-size: 0.68rem;
+}
+
+.model-switch-btn-group .btn.active {
+  background: var(--primary);
+  color: #040914;
+  font-weight: 700;
+  box-shadow: 0 1px 6px rgba(0, 198, 255, 0.4);
+}
+
+.fusion-selector-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  margin-bottom: 0.5rem;
+  font-size: 0.75rem;
+}
+
+.fusion-selector-row label {
+  color: var(--secondary);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.fusion-select {
+  flex: 1;
+  background: var(--bg-input);
+  color: var(--text-main);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+/* ==========================================================================
+   Real-Time FFT Spectrum & CSV Playback Engine Grid
+   ========================================================================== */
+.fft-and-replay-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.fft-card, .replay-card {
+  min-height: 220px;
+}
+
+.fft-metrics {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.fft-stat strong {
+  color: var(--secondary);
+}
+
+.fft-canvas-container {
+  position: relative;
+  width: 100%;
+  height: 120px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+#fftCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.fft-freq-labels {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.2rem 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--text-dim);
+}
+
+.csv-drop-zone {
+  border: 2px dashed rgba(0, 242, 254, 0.35);
+  background: rgba(0, 242, 254, 0.03);
+  border-radius: var(--radius-sm);
+  padding: 1.5rem 1rem;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.csv-drop-zone:hover, .csv-drop-zone.dragover {
+  border-color: var(--secondary);
+  background: rgba(0, 242, 254, 0.08);
+  transform: scale(0.995);
+}
+
+.drop-icon {
+  font-size: 2rem;
+  color: var(--secondary);
+  margin-bottom: 0.5rem;
+}
+
+.drop-text {
+  font-size: 0.8rem;
+  color: var(--text-main);
+  margin-bottom: 0.25rem;
+}
+
+.drop-subtext {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+
+.csv-player-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+}
+
+.replay-file-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--secondary);
+  font-weight: 600;
+}
+
+.timeline-row {
+  display: grid;
+  grid-template-columns: 55px 1fr 55px;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.time-readout {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.timeline-slider {
+  width: 100%;
+  accent-color: var(--secondary);
+  cursor: pointer;
+  height: 6px;
+}
+
+.transport-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.btn-play {
+  min-width: 90px;
+}
+
+.speed-group .btn-speed.active {
+  background: var(--secondary);
+  color: #040914;
+  font-weight: 700;
+}
+
+/* ==========================================================================
    Right Panel: Packet Telemetry Console & Raw Hex Payload Inspector
    ========================================================================== */
 .console-card {
