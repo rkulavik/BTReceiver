@@ -198,9 +198,12 @@
                 </div>
               </div>
 
-              <!-- Accelerometer 3-Axis Reading -->
+              <!-- Accelerometer 3-Axis Reading (±2.5g Range) -->
               <div class="sensor-section">
-                <div class="section-title"><i class="fa-solid fa-gauge"></i> Accelerometer (g-force)</div>
+                <div class="section-title">
+                  <span><i class="fa-solid fa-gauge"></i> Accelerometer (g-force)</span>
+                  <span class="range-badge">±2.5 g Full Scale</span>
+                </div>
                 <div class="axis-bars">
                   <div class="axis-row">
                     <span class="axis-lbl">X (Pitch Axis):</span>
@@ -214,15 +217,18 @@
                   </div>
                   <div class="axis-row">
                     <span class="axis-lbl">Z (Yaw Axis):</span>
-                    <div class="bar-bg"><div class="bar-fill bar-z" id="barAccelZ" style="width: 75%;"></div></div>
+                    <div class="bar-bg"><div class="bar-fill bar-z" id="barAccelZ" style="width: 70%;"></div></div>
                     <span class="axis-val" id="valAccelZ">+0.98 g</span>
                   </div>
                 </div>
               </div>
 
-              <!-- Gyroscope 3-Axis Reading -->
+              <!-- Gyroscope 3-Axis Reading (±125°/s Range) -->
               <div class="sensor-section">
-                <div class="section-title"><i class="fa-solid fa-rotate"></i> Gyroscope (°/s angular rate)</div>
+                <div class="section-title">
+                  <span><i class="fa-solid fa-rotate"></i> Gyroscope (°/s angular rate)</span>
+                  <span class="range-badge">±125 °/s Full Scale</span>
+                </div>
                 <div class="axis-bars">
                   <div class="axis-row">
                     <span class="axis-lbl">GX (Roll rate):</span>

@@ -419,6 +419,16 @@ body {
   font-family: var(--font-mono);
 }
 
+.range-badge {
+  font-size: 0.65rem;
+  font-family: var(--font-mono);
+  color: var(--secondary);
+  background: rgba(0, 198, 255, 0.08);
+  border: 1px solid rgba(0, 198, 255, 0.2);
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+}
+
 /* Euler / Attitude Orientation Grid */
 .euler-grid {
   display: grid;

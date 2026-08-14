@@ -355,16 +355,24 @@ function initChart() {
         y: {
           type: 'linear',
           position: 'left',
+          min: -2.5,
+          max: 2.5,
+          suggestedMin: -2.5,
+          suggestedMax: 2.5,
           grid: { color: 'rgba(255, 255, 255, 0.08)' },
           ticks: { color: '#00c6ff', font: { family: 'JetBrains Mono', size: 10 } },
-          title: { display: true, text: 'Acceleration (g)', color: '#00c6ff', font: { size: 11, weight: '600' } }
+          title: { display: true, text: 'Acceleration (±2.5g)', color: '#00c6ff', font: { size: 11, weight: '600' } }
         },
         y1: {
           type: 'linear',
           position: 'right',
+          min: -125,
+          max: 125,
+          suggestedMin: -125,
+          suggestedMax: 125,
           grid: { drawOnChartArea: false },
           ticks: { color: '#f59e0b', font: { family: 'JetBrains Mono', size: 10 } },
-          title: { display: true, text: 'Angular Rate (°/s)', color: '#f59e0b', font: { size: 11, weight: '600' } }
+          title: { display: true, text: 'Angular Rate (±125 °/s)', color: '#f59e0b', font: { size: 11, weight: '600' } }
         }
       },
       plugins: {
@@ -856,23 +864,23 @@ function updateIMUAndOrientation(ax, ay, az, gx = 0, gy = 0, gz = 0, pitch = nul
   }
   lastOrientationTimestamp = Date.now();
 
-  // 1. Update Accelerometer Values & Bars
+  // 1. Update Accelerometer Values & Bars (-2.5g to +2.5g)
   if (valAccelX) valAccelX.textContent = `${numAx >= 0 ? '+' : ''}${numAx.toFixed(2)} g`;
   if (valAccelY) valAccelY.textContent = `${numAy >= 0 ? '+' : ''}${numAy.toFixed(2)} g`;
   if (valAccelZ) valAccelZ.textContent = `${numAz >= 0 ? '+' : ''}${numAz.toFixed(2)} g`;
 
-  if (barAccelX) barAccelX.style.width = `${Math.min(100, Math.max(0, ((numAx + 2) / 4) * 100))}%`;
-  if (barAccelY) barAccelY.style.width = `${Math.min(100, Math.max(0, ((numAy + 2) / 4) * 100))}%`;
-  if (barAccelZ) barAccelZ.style.width = `${Math.min(100, Math.max(0, ((numAz + 2) / 4) * 100))}%`;
+  if (barAccelX) barAccelX.style.width = `${Math.min(100, Math.max(0, ((numAx + 2.5) / 5.0) * 100))}%`;
+  if (barAccelY) barAccelY.style.width = `${Math.min(100, Math.max(0, ((numAy + 2.5) / 5.0) * 100))}%`;
+  if (barAccelZ) barAccelZ.style.width = `${Math.min(100, Math.max(0, ((numAz + 2.5) / 5.0) * 100))}%`;
 
-  // 2. Update Gyroscope Values & Bars (-200°/s to +200°/s)
+  // 2. Update Gyroscope Values & Bars (-125°/s to +125°/s)
   if (valGyroX) valGyroX.textContent = `${numGx >= 0 ? '+' : ''}${numGx.toFixed(1)} °/s`;
   if (valGyroY) valGyroY.textContent = `${numGy >= 0 ? '+' : ''}${numGy.toFixed(1)} °/s`;
   if (valGyroZ) valGyroZ.textContent = `${numGz >= 0 ? '+' : ''}${numGz.toFixed(1)} °/s`;
 
-  if (barGyroX) barGyroX.style.width = `${Math.min(100, Math.max(0, ((numGx + 200) / 400) * 100))}%`;
-  if (barGyroY) barGyroY.style.width = `${Math.min(100, Math.max(0, ((numGy + 200) / 400) * 100))}%`;
-  if (barGyroZ) barGyroZ.style.width = `${Math.min(100, Math.max(0, ((numGz + 200) / 400) * 100))}%`;
+  if (barGyroX) barGyroX.style.width = `${Math.min(100, Math.max(0, ((numGx + 125) / 250.0) * 100))}%`;
+  if (barGyroY) barGyroY.style.width = `${Math.min(100, Math.max(0, ((numGy + 125) / 250.0) * 100))}%`;
+  if (barGyroZ) barGyroZ.style.width = `${Math.min(100, Math.max(0, ((numGz + 125) / 250.0) * 100))}%`;
 
   // 3. Update Orientation (Pitch, Roll, Yaw) Gauges
   if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
