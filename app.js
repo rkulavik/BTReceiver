@@ -1229,8 +1229,22 @@ async function disconnectSerialPort() {
   logToConsole('warn', 'Serial UART Disconnected.');
 }
 
+// State for latest continuous IMU tracking
+let currentImuState = {
+  ax: 0.00,
+  ay: 0.00,
+  az: 0.98,
+  gx: 0.0,
+  gy: 0.0,
+  gz: 0.0,
+  pitch: 0.0,
+  roll: 0.0,
+  yaw: 0.0
+};
+
 /**
- * Parses ASCII text lines from serial stream to extract GPS, IMU, Pitch/Roll/Yaw, battery, or status
+ * Parses ASCII text lines from serial stream to extract GPS, IMU, Pitch/Roll/Yaw, battery, or status.
+ * Strict IMU validation ensures non-IMU logs (GPS, battery, FIFO, system diagnostics) NEVER pollute the rolling displays.
  */
 function parseTextTelemetry(line) {
   const res = {
@@ -1248,7 +1262,8 @@ function parseTextTelemetry(line) {
     yaw: '',
     battery_v: '',
     battery_pct: '',
-    activity_mode: ''
+    activity_mode: '',
+    has_imu_data: false
   };
 
   if (!line || typeof line !== 'string') return res;
@@ -1256,6 +1271,7 @@ function parseTextTelemetry(line) {
   // Clean line and strip log prefixes (e.g. "[10:56:35 AM] [BLE] [00:08:16.509,575] <inf> cowtag_fifo: ")
   let cleanLine = line.trim();
   cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*(?:\[(?:BLE|SERIAL|UART|SIM|RX|TX)\])?\s*/i, '');
+  const isSystemLog = cleanLine.match(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i);
   cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i, '');
   cleanLine = cleanLine.trim();
 
@@ -1272,70 +1288,55 @@ function parseTextTelemetry(line) {
     }
     res.activity_mode = `Battery ${pct}%`;
     updateBatteryDisplay(res.battery_v, pct);
-    return res;
+    return res; // Non-IMU -> do not push to rolling displays
   }
 
-  // 2. Check for FIFO window peak accelerometer & gyroscope logs
-  // e.g. "FIFO window n=1740 sets=290 used=289 WM=1 OVF=0 | peak A mm/s^2 X=209 Y=3097 Z=9680 | G mdps X=4725 Y=7135 Z=5363"
-  if (cleanLine.includes('peak A mm/s^2') || cleanLine.includes('G mdps')) {
-    const peakAMatch = cleanLine.match(/peak\s+A\s+mm\/s\^2\s+X=([+-]?\d+)\s+Y=([+-]?\d+)\s+Z=([+-]?\d+)/i);
-    if (peakAMatch) {
-      res.accel_x = (parseFloat(peakAMatch[1]) / 9806.65).toFixed(2);
-      res.accel_y = (parseFloat(peakAMatch[2]) / 9806.65).toFixed(2);
-      res.accel_z = (parseFloat(peakAMatch[3]) / 9806.65).toFixed(2);
-    }
-    const gMdpsMatch = cleanLine.match(/G\s+mdps\s+X=([+-]?\d+)\s+Y=([+-]?\d+)\s+Z=([+-]?\d+)/i);
-    if (gMdpsMatch) {
-      res.gyro_x = (parseFloat(gMdpsMatch[1]) / 1000.0).toFixed(1);
-      res.gyro_y = (parseFloat(gMdpsMatch[2]) / 1000.0).toFixed(1);
-      res.gyro_z = (parseFloat(gMdpsMatch[3]) / 1000.0).toFixed(1);
-    }
-    res.activity_mode = 'FIFO Peak Window';
-  }
-
-  // 3. Check for GPS Diagnostics / NO-FIX or Antenna alert
-  if (cleanLine.includes('GPS NO-FIX') || cleanLine.includes('ANTENNA SHORT')) {
+  // 2. Check for GPS Diagnostics / NO-FIX or Antenna alert
+  if (cleanLine.includes('GPS NO-FIX') || cleanLine.includes('ANTENNA SHORT') || cleanLine.includes('GPS diag:') || cleanLine.includes('GPS boot flags:')) {
     if (gpsFixPill) {
       gpsFixPill.className = 'pill pill-warning';
       gpsFixPill.textContent = cleanLine.includes('ANTENNA SHORT') ? 'Antenna Alert' : 'GPS Searching (No Fix)';
     }
+    res.activity_mode = 'GPS Diagnostic';
+    return res; // Non-IMU -> do not push to rolling displays
   }
 
-  // 4. Check for JSON formatted telemetry e.g. {"pitch": 12.4, "roll": -5.1, "yaw": 180.2, "ax": 0.12, ...}
-  if (cleanLine.startsWith('{') && cleanLine.endsWith('}')) {
-    try {
-      const obj = JSON.parse(cleanLine);
-      if (obj.pitch !== undefined) res.pitch = String(obj.pitch);
-      if (obj.roll !== undefined) res.roll = String(obj.roll);
-      if (obj.yaw !== undefined) res.yaw = String(obj.yaw);
-      if (obj.p !== undefined && !res.pitch) res.pitch = String(obj.p);
-      if (obj.r !== undefined && !res.roll) res.roll = String(obj.r);
-      if (obj.y !== undefined && !res.yaw) res.yaw = String(obj.y);
+  // 3. Check for FIFO Diagnostic & Storage logs (FIFO window peaks, SD batch logs)
+  if (cleanLine.includes('FIFO window') || cleanLine.includes('SD: IMU batch') || cleanLine.includes('SD: TELEM row') || isSystemLog) {
+    res.activity_mode = 'System Diagnostic';
+    return res; // Non-IMU -> do not push to rolling displays
+  }
 
-      if (obj.ax !== undefined) res.accel_x = String(obj.ax);
-      if (obj.ay !== undefined) res.accel_y = String(obj.ay);
-      if (obj.az !== undefined) res.accel_z = String(obj.az);
-      if (obj.accel_x !== undefined) res.accel_x = String(obj.accel_x);
-      if (obj.accel_y !== undefined) res.accel_y = String(obj.accel_y);
-      if (obj.accel_z !== undefined) res.accel_z = String(obj.accel_z);
+  // 4. Check for NMEA GPS Sentences ($GPRMC, $GNRMC, $GPGGA, $GNGGA, $GPTXT, $GPGSV, etc.)
+  if (cleanLine.startsWith('$GP') || cleanLine.startsWith('$GN')) {
+    if (cleanLine.startsWith('$GPRMC') || cleanLine.startsWith('$GNRMC')) {
+      const parts = cleanLine.split(',');
+      if (parts.length >= 7 && parts[2] === 'A') {
+        const rawLat = parseFloat(parts[3]);
+        const latDir = parts[4];
+        const rawLng = parseFloat(parts[5]);
+        const lngDir = parts[6];
 
-      if (obj.gx !== undefined) res.gyro_x = String(obj.gx);
-      if (obj.gy !== undefined) res.gyro_y = String(obj.gy);
-      if (obj.gz !== undefined) res.gyro_z = String(obj.gz);
-      if (obj.gyro_x !== undefined) res.gyro_x = String(obj.gyro_x);
-      if (obj.gyro_y !== undefined) res.gyro_y = String(obj.gyro_y);
-      if (obj.gz !== undefined) res.gyro_z = String(obj.gz);
+        if (!isNaN(rawLat) && !isNaN(rawLng)) {
+          let latDeg = Math.floor(rawLat / 100) + (rawLat % 100) / 60;
+          if (latDir === 'S') latDeg = -latDeg;
+          let lngDeg = Math.floor(rawLng / 100) + (rawLng % 100) / 60;
+          if (lngDir === 'W') lngDeg = -lngDeg;
 
-      if (obj.lat !== undefined) res.lat = String(obj.lat);
-      if (obj.lng !== undefined) res.lng = String(obj.lng);
-      if (obj.batt !== undefined) res.battery_v = String(obj.batt);
-      if (obj.battery !== undefined) res.battery_v = String(obj.battery);
-      if (obj.battery_pct !== undefined) res.battery_pct = String(obj.battery_pct);
-      if (obj.tag !== undefined) res.tag_id = String(obj.tag);
-      if (obj.tag_id !== undefined) res.tag_id = String(obj.tag_id);
-
-      res.activity_mode = 'JSON Stream';
-    } catch (e) {}
+          res.lat = latDeg.toFixed(6);
+          res.lng = lngDeg.toFixed(6);
+          updateGPSPosition(latDeg, lngDeg, 412, 1.5);
+          if (gpsFixPill) {
+            gpsFixPill.className = 'pill pill-success';
+            gpsFixPill.textContent = 'GPS Locked (NMEA)';
+          }
+        }
+      }
+      res.activity_mode = 'NMEA GPS Fix';
+    } else {
+      res.activity_mode = 'NMEA Sentence';
+    }
+    return res; // NMEA is location/satellite data -> do not push to rolling IMU displays
   }
 
   // 5. Check for $IMU sentence from CowTag
@@ -1352,13 +1353,13 @@ function parseTextTelemetry(line) {
         const rawGy = parseFloat(parts[7]);
         const rawGz = parseFloat(parts[8]);
 
-        // If rawAz is around 16000 (16384 LSB/g) scale by 16384, if ~9800 (mm/s^2) scale by 9806.65, if ~1000 scale by 1000
+        // Accelerometer scaling (±2.5g range)
         const accelScale = Math.abs(rawAz) > 12000 ? 16384.0 : (Math.abs(rawAz) > 3000 ? 9806.65 : (Math.abs(rawAz) > 50 ? 1000.0 : 1.0));
         res.accel_x = (rawAx / accelScale).toFixed(2);
         res.accel_y = (rawAy / accelScale).toFixed(2);
         res.accel_z = (rawAz / accelScale).toFixed(2);
 
-        // Gyro scaling: mdps -> /1000 = deg/s, or /10, or /131
+        // Gyro scaling (±125 °/s range)
         const gyroScale = Math.abs(rawGx) > 1000 ? 1000.0 : 10.0;
         res.gyro_x = (rawGx / gyroScale).toFixed(1);
         res.gyro_y = (rawGy / gyroScale).toFixed(1);
@@ -1376,45 +1377,19 @@ function parseTextTelemetry(line) {
         res.gyro_z = parseFloat(parts[6]).toFixed(1);
       }
       res.activity_mode = '$IMU Stream';
+      res.has_imu_data = true;
     }
   }
 
-  // 6. Check for NMEA $GPRMC or $GNRMC sentence
-  if (cleanLine.startsWith('$GPRMC') || cleanLine.startsWith('$GNRMC')) {
-    const parts = cleanLine.split(',');
-    if (parts.length >= 7 && parts[2] === 'A') {
-      const rawLat = parseFloat(parts[3]);
-      const latDir = parts[4];
-      const rawLng = parseFloat(parts[5]);
-      const lngDir = parts[6];
-
-      if (!isNaN(rawLat) && !isNaN(rawLng)) {
-        let latDeg = Math.floor(rawLat / 100) + (rawLat % 100) / 60;
-        if (latDir === 'S') latDeg = -latDeg;
-        let lngDeg = Math.floor(rawLng / 100) + (rawLng % 100) / 60;
-        if (lngDir === 'W') lngDeg = -lngDeg;
-
-        res.lat = latDeg.toFixed(6);
-        res.lng = lngDeg.toFixed(6);
-        updateGPSPosition(latDeg, lngDeg, 412, 1.5);
-        if (gpsFixPill) {
-          gpsFixPill.className = 'pill pill-success';
-          gpsFixPill.textContent = 'GPS Locked (NMEA)';
-        }
-      }
-    }
-    res.activity_mode = 'NMEA GPS Fix';
-    return res;
-  }
-
-  // 7. Check for Euler / Attitude Sentences e.g. $RPY,roll,pitch,yaw or $YPR,yaw,pitch,roll
-  if (cleanLine.startsWith('$RPY')) {
+  // 6. Check for Euler / Attitude Sentences e.g. $RPY,roll,pitch,yaw or $YPR,yaw,pitch,roll
+  else if (cleanLine.startsWith('$RPY')) {
     const parts = cleanLine.split(',');
     if (parts.length >= 4) {
       res.roll = parseFloat(parts[1]).toFixed(1);
       res.pitch = parseFloat(parts[2]).toFixed(1);
       res.yaw = parseFloat(parts[3]).toFixed(1);
       res.activity_mode = '$RPY Attitude';
+      res.has_imu_data = true;
     }
   } else if (cleanLine.startsWith('$YPR')) {
     const parts = cleanLine.split(',');
@@ -1423,78 +1398,71 @@ function parseTextTelemetry(line) {
       res.pitch = parseFloat(parts[2]).toFixed(1);
       res.roll = parseFloat(parts[3]).toFixed(1);
       res.activity_mode = '$YPR Attitude';
+      res.has_imu_data = true;
     }
   }
 
-  // 8. Check for vector prefixes e.g. PRY: 12.3, -4.5, 120.1 or RPY: ... or ACCEL: ... or GYRO: ...
-  const pryMatch = cleanLine.match(/PRY\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-  if (pryMatch) {
-    res.pitch = parseFloat(pryMatch[1]).toFixed(1);
-    res.roll = parseFloat(pryMatch[2]).toFixed(1);
-    res.yaw = parseFloat(pryMatch[3]).toFixed(1);
+  // 7. Check for vector prefixes: PRY: ... | RPY: ... | YPR: ... | ACCEL: ... | GYRO: ...
+  else if (cleanLine.match(/^(?:PRY|RPY|YPR|ACCEL|ACC|GYRO|GYR)\s*[:=]/i)) {
+    const pryMatch = cleanLine.match(/PRY\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
+    if (pryMatch) {
+      res.pitch = parseFloat(pryMatch[1]).toFixed(1);
+      res.roll = parseFloat(pryMatch[2]).toFixed(1);
+      res.yaw = parseFloat(pryMatch[3]).toFixed(1);
+      res.has_imu_data = true;
+    }
+    const rpyMatch = cleanLine.match(/RPY\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
+    if (rpyMatch) {
+      res.roll = parseFloat(rpyMatch[1]).toFixed(1);
+      res.pitch = parseFloat(rpyMatch[2]).toFixed(1);
+      res.yaw = parseFloat(rpyMatch[3]).toFixed(1);
+      res.has_imu_data = true;
+    }
+    const accelVecMatch = cleanLine.match(/(?:ACCEL|ACC)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
+    if (accelVecMatch) {
+      res.accel_x = parseFloat(accelVecMatch[1]).toFixed(2);
+      res.accel_y = parseFloat(accelVecMatch[2]).toFixed(2);
+      res.accel_z = parseFloat(accelVecMatch[3]).toFixed(2);
+      res.has_imu_data = true;
+    }
+    const gyroVecMatch = cleanLine.match(/(?:GYRO|GYR)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
+    if (gyroVecMatch) {
+      res.gyro_x = parseFloat(gyroVecMatch[1]).toFixed(1);
+      res.gyro_y = parseFloat(gyroVecMatch[2]).toFixed(1);
+      res.gyro_z = parseFloat(gyroVecMatch[3]).toFixed(1);
+      res.has_imu_data = true;
+    }
+    res.activity_mode = 'Vector Stream';
   }
 
-  const rpyMatch = cleanLine.match(/RPY\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-  if (rpyMatch) {
-    res.roll = parseFloat(rpyMatch[1]).toFixed(1);
-    res.pitch = parseFloat(rpyMatch[2]).toFixed(1);
-    res.yaw = parseFloat(rpyMatch[3]).toFixed(1);
+  // 8. Check for JSON formatted telemetry
+  else if (cleanLine.startsWith('{') && cleanLine.endsWith('}')) {
+    try {
+      const obj = JSON.parse(cleanLine);
+      if (obj.pitch !== undefined) res.pitch = String(obj.pitch);
+      if (obj.roll !== undefined) res.roll = String(obj.roll);
+      if (obj.yaw !== undefined) res.yaw = String(obj.yaw);
+      if (obj.ax !== undefined) res.accel_x = String(obj.ax);
+      if (obj.ay !== undefined) res.accel_y = String(obj.ay);
+      if (obj.az !== undefined) res.accel_z = String(obj.az);
+      if (obj.gx !== undefined) res.gyro_x = String(obj.gx);
+      if (obj.gy !== undefined) res.gyro_y = String(obj.gy);
+      if (obj.gz !== undefined) res.gyro_z = String(obj.gz);
+
+      if (obj.lat !== undefined) res.lat = String(obj.lat);
+      if (obj.lng !== undefined) res.lng = String(obj.lng);
+      if (obj.batt !== undefined) res.battery_v = String(obj.batt);
+      if (obj.battery_pct !== undefined) res.battery_pct = String(obj.battery_pct);
+
+      if (res.accel_x || res.gyro_x || res.pitch || res.roll || res.yaw) {
+        res.has_imu_data = true;
+      }
+      res.activity_mode = 'JSON Stream';
+    } catch (e) {}
   }
 
-  const yprMatch = cleanLine.match(/YPR\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-  if (yprMatch) {
-    res.yaw = parseFloat(yprMatch[1]).toFixed(1);
-    res.pitch = parseFloat(yprMatch[2]).toFixed(1);
-    res.roll = parseFloat(yprMatch[3]).toFixed(1);
-  }
-
-  const accelVecMatch = cleanLine.match(/(?:ACCEL|ACC)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-  if (accelVecMatch) {
-    res.accel_x = parseFloat(accelVecMatch[1]).toFixed(2);
-    res.accel_y = parseFloat(accelVecMatch[2]).toFixed(2);
-    res.accel_z = parseFloat(accelVecMatch[3]).toFixed(2);
-  }
-
-  const gyroVecMatch = cleanLine.match(/(?:GYRO|GYR)\s*[:=]\s*([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)[,\s]+([+-]?\d+\.?\d*)/i);
-  if (gyroVecMatch) {
-    res.gyro_x = parseFloat(gyroVecMatch[1]).toFixed(1);
-    res.gyro_y = parseFloat(gyroVecMatch[2]).toFixed(1);
-    res.gyro_z = parseFloat(gyroVecMatch[3]).toFixed(1);
-  }
-
-  // 9. Key-Value regex matchers
-  const pitchMatch = cleanLine.match(/(?:pitch|pit)\s*[:=]\s*([+-]?\d+\.?\d*)/i) || (!pryMatch && cleanLine.match(/\bP\s*[:=]\s*([+-]?\d+\.?\d*)/i));
-  const rollMatch = cleanLine.match(/(?:roll|rol)\s*[:=]\s*([+-]?\d+\.?\d*)/i) || (!rpyMatch && cleanLine.match(/\bR\s*[:=]\s*([+-]?\d+\.?\d*)/i));
-  const yawMatch = cleanLine.match(/(?:yaw|hdg|heading|yaw_deg)\s*[:=]\s*([+-]?\d+\.?\d*)/i) || (!yprMatch && cleanLine.match(/\bY\s*[:=]\s*([+-]?\d+\.?\d*)/i));
-
-  const latMatch = cleanLine.match(/lat(?:itude)?\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const lngMatch = cleanLine.match(/l(?:ng|on|ongitude)?\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const axMatch = cleanLine.match(/a(?:x|ccel_?x|cc_?x)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const ayMatch = cleanLine.match(/a(?:y|ccel_?y|cc_?y)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const azMatch = cleanLine.match(/a(?:z|ccel_?z|cc_?z)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const gxMatch = cleanLine.match(/g(?:x|yro_?x|yr_?x)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const gyMatch = cleanLine.match(/g(?:y|yro_?y|yr_?y)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const gzMatch = cleanLine.match(/g(?:z|yro_?z|yr_?z)\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const battMatch = cleanLine.match(/bat(?:t|tery)?\s*[:=]\s*([+-]?\d+\.?\d*)/i);
-  const tagMatch = cleanLine.match(/tag(?:_?id)?\s*[:=]\s*([A-Za-z0-9_\-]+)/i);
-
-  if (pitchMatch && !res.pitch) res.pitch = parseFloat(pitchMatch[1]).toFixed(1);
-  if (rollMatch && !res.roll) res.roll = parseFloat(rollMatch[1]).toFixed(1);
-  if (yawMatch && !res.yaw) res.yaw = parseFloat(yawMatch[1]).toFixed(1);
-
-  if (latMatch && !res.lat) res.lat = parseFloat(latMatch[1]).toFixed(6);
-  if (lngMatch && !res.lng) res.lng = parseFloat(lngMatch[1]).toFixed(6);
-  if (axMatch && !res.accel_x) res.accel_x = parseFloat(axMatch[1]).toFixed(2);
-  if (ayMatch && !res.accel_y) res.accel_y = parseFloat(ayMatch[1]).toFixed(2);
-  if (azMatch && !res.accel_z) res.accel_z = parseFloat(azMatch[1]).toFixed(2);
-  if (gxMatch && !res.gyro_x) res.gyro_x = parseFloat(gxMatch[1]).toFixed(1);
-  if (gyMatch && !res.gyro_y) res.gyro_y = parseFloat(gyMatch[1]).toFixed(1);
-  if (gzMatch && !res.gyro_z) res.gyro_z = parseFloat(gzMatch[1]).toFixed(1);
-  if (battMatch && !res.battery_v) res.battery_v = parseFloat(battMatch[1]).toFixed(2);
-  if (tagMatch && !res.tag_id) res.tag_id = tagMatch[1];
-
-  // 10. Fallback: Check comma/tab separated numerical streams
-  if (!res.lat && !res.accel_x && !res.pitch) {
+  // 9. Check for Comma-Separated Numerical Telemetry Stream
+  else {
     const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
     const nums = tokens.map(t => parseFloat(t)).filter(n => !isNaN(n));
 
@@ -1508,23 +1476,14 @@ function parseTextTelemetry(line) {
         res.roll = nums[5].toFixed(2);
         res.yaw = nums[6].toFixed(2);
         res.activity_mode = '7-DOF Euler Stream';
+        res.has_imu_data = true;
       } else if (nums.length === 22) {
         // Summary telemetry line: 483,0,0,0,0,0,209,3097,9680,4725,7135,5363,132519,4749,0,0,0,0,0,96,4116,2551
-        res.accel_x = (nums[6] / 9806.65).toFixed(2);
-        res.accel_y = (nums[7] / 9806.65).toFixed(2);
-        res.accel_z = (nums[8] / 9806.65).toFixed(2);
-        res.gyro_x = (nums[9] / 1000.0).toFixed(1);
-        res.gyro_y = (nums[10] / 1000.0).toFixed(1);
-        res.gyro_z = (nums[11] / 1000.0).toFixed(1);
         res.battery_pct = String(Math.round(nums[19]));
         res.battery_v = (nums[20] / 1000.0).toFixed(2);
         updateBatteryDisplay(res.battery_v, nums[19]);
         res.activity_mode = 'Summary 22-Val';
-      } else if (nums.length === 3) {
-        // 3 numbers: assume Accel X, Y, Z
-        res.accel_x = nums[0].toFixed(2);
-        res.accel_y = nums[1].toFixed(2);
-        res.accel_z = nums[2].toFixed(2);
+        return res; // Summary row -> do NOT put into rolling IMU displays
       } else if (nums.length === 6) {
         // 6 numbers: Accel X, Y, Z, Gyro X, Y, Z
         res.accel_x = nums[0].toFixed(2);
@@ -1533,17 +1492,8 @@ function parseTextTelemetry(line) {
         res.gyro_x = nums[3].toFixed(1);
         res.gyro_y = nums[4].toFixed(1);
         res.gyro_z = nums[5].toFixed(1);
-      } else if (nums.length >= 9) {
-        // 9 numbers: Accel, Gyro, Pitch, Roll, Yaw
-        res.accel_x = nums[0].toFixed(2);
-        res.accel_y = nums[1].toFixed(2);
-        res.accel_z = nums[2].toFixed(2);
-        res.gyro_x = nums[3].toFixed(1);
-        res.gyro_y = nums[4].toFixed(1);
-        res.gyro_z = nums[5].toFixed(1);
-        res.pitch = nums[6].toFixed(1);
-        res.roll = nums[7].toFixed(1);
-        res.yaw = nums[8].toFixed(1);
+        res.activity_mode = '6-DOF Raw';
+        res.has_imu_data = true;
       }
     }
   }
@@ -1558,22 +1508,23 @@ function parseTextTelemetry(line) {
     updateGPSPosition(parseFloat(res.lat), parseFloat(res.lng), 412, 1.2);
   }
 
-  // Update UI & 6-DOF Chart if we received any motion, attitude, or GPS data
-  if (res.accel_x || res.gyro_x || res.pitch || res.roll || res.yaw) {
-    const axVal = res.accel_x || '0.00';
-    const ayVal = res.accel_y || '0.00';
-    const azVal = res.accel_z || '0.98';
-    const gxVal = res.gyro_x || '0.0';
-    const gyVal = res.gyro_y || '0.0';
-    const gzVal = res.gyro_z || '0.0';
+  // ONLY update the 6-DOF Rolling Display & Kinematics when genuine IMU data is present!
+  if (res.has_imu_data) {
+    if (res.accel_x) currentImuState.ax = parseFloat(res.accel_x);
+    if (res.accel_y) currentImuState.ay = parseFloat(res.accel_y);
+    if (res.accel_z) currentImuState.az = parseFloat(res.accel_z);
+
+    if (res.gyro_x) currentImuState.gx = parseFloat(res.gyro_x);
+    if (res.gyro_y) currentImuState.gy = parseFloat(res.gyro_y);
+    if (res.gyro_z) currentImuState.gz = parseFloat(res.gyro_z);
 
     const calculatedEuler = updateIMUAndOrientation(
-      axVal,
-      ayVal,
-      azVal,
-      gxVal,
-      gyVal,
-      gzVal,
+      currentImuState.ax,
+      currentImuState.ay,
+      currentImuState.az,
+      currentImuState.gx,
+      currentImuState.gy,
+      currentImuState.gz,
       res.pitch ? parseFloat(res.pitch) : null,
       res.roll ? parseFloat(res.roll) : null,
       res.yaw ? parseFloat(res.yaw) : null,
@@ -1581,13 +1532,12 @@ function parseTextTelemetry(line) {
       res.activity_mode || 'Active UART'
     );
 
-    // If Pitch/Roll/Yaw were not in input, populate them with the calculated Euler angles
     if (!res.pitch) res.pitch = calculatedEuler.pitch.toFixed(1);
     if (!res.roll) res.roll = calculatedEuler.roll.toFixed(1);
     if (!res.yaw) res.yaw = calculatedEuler.yaw.toFixed(1);
 
     const timeStr = new Date().toLocaleTimeString();
-    addChartData(timeStr, axVal, ayVal, azVal, gxVal, gyVal, gzVal);
+    addChartData(timeStr, currentImuState.ax, currentImuState.ay, currentImuState.az, currentImuState.gx, currentImuState.gy, currentImuState.gz);
   }
 
   return res;
