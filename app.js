@@ -2614,9 +2614,9 @@ function parseTextTelemetry(line) {
     const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
     const nums = tokens.map(t => parseFloat(t));
 
-    // Case A: 15+ tokens Tag Status Packet (e.g. "1016,1,331029860,-968464290,10,5,568,2462,9887,2625,2432,2852,...")
-    if (tokens.length >= 15 && !isNaN(nums[0]) && !isNaN(nums[2]) && !isNaN(nums[3])) {
+  if (tokens.length >= 15 && !isNaN(nums[0]) && !isNaN(nums[2]) && !isNaN(nums[3])) {
       res.tag_id = `COW-${nums[0]}`;
+      res.is_status_packet = true;
 
       // Extract GPS Lat & Lng
       const rawLat = nums[2];
@@ -2632,7 +2632,7 @@ function parseTextTelemetry(line) {
         updateGPSPosition(lat, lng, alt, speed);
       }
 
-      // Extract IMU sensor counts if present (tokens 6-8: Accel LSB, tokens 9-11: Gyro LSB)
+      // Extract 6-DOF IMU sensor counts for Motion Chart (tokens 6-8: Accel LSB, tokens 9-11: Gyro LSB)
       if (tokens.length >= 12 && !isNaN(nums[6]) && !isNaN(nums[7]) && !isNaN(nums[8])) {
         const scale = Math.abs(nums[8]) > 50 ? accelLsbPerG : 1.0;
         const gScale = (!isNaN(nums[9]) && Math.abs(nums[9]) > 200) ? gyroLsbPerDps : 1.0;
@@ -2645,7 +2645,10 @@ function parseTextTelemetry(line) {
           res.gyro_z = (nums[11] / gScale).toFixed(1);
         }
         res.activity_mode = 'Tag Status Packet';
-        res.has_imu_data = true; // Enables Amplitude vs Time Motion Chart and Live IMU Telemetry
+        
+        // Push motion data directly to Amplitude vs Time Motion Chart without touching 3D AHRS orientation
+        const timeStr = new Date().toLocaleTimeString();
+        addChartData(timeStr, res.accel_x, res.accel_y, res.accel_z, res.gyro_x, res.gyro_y, res.gyro_z);
       }
 
       // Extract Battery % and mV (tokens 19 and 20 if present)
@@ -2672,7 +2675,8 @@ function parseTextTelemetry(line) {
     }
   }
 
-  if (res.has_imu_data) {
+  // Only call updateIMUAndOrientation for genuine high-rate IMU streams ($IMU, $RPY, 6-DOF Raw), NOT status packets!
+  if (res.has_imu_data && !res.is_status_packet) {
     const orientation = updateIMUAndOrientation(
       res.accel_x || currentImuState.filtAx,
       res.accel_y || currentImuState.filtAy,
