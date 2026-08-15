@@ -1278,9 +1278,10 @@ function updateIMUGauges(ax, ay, az, gx, gy, gz, activityStr) {
 }
 
 function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawGz = 0, explicitPitch = null, explicitRoll = null, explicitYaw = null, sourceInfo = 'Live IMU', activityStr = 'At Rest') {
-  let numRawAx = parseFloat(rawAx) || 0;
-  let numRawAy = parseFloat(rawAy) || 0;
-  let numRawAz = parseFloat(rawAz) || 0;
+  // Filter out any accelerometer value above 2.5g
+  let numRawAx = Math.max(-2.5, Math.min(2.5, parseFloat(rawAx) || 0));
+  let numRawAy = Math.max(-2.5, Math.min(2.5, parseFloat(rawAy) || 0));
+  let numRawAz = Math.max(-2.5, Math.min(2.5, parseFloat(rawAz) || 0));
   let numRawGx = parseFloat(rawGx) || 0;
   let numRawGy = parseFloat(rawGy) || 0;
   let numRawGz = parseFloat(rawGz) || 0;
@@ -1312,9 +1313,9 @@ function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawG
   const filtAccel = accelFilter.apply(calAx, calAy, calAz, now);
   const filtGyro = gyroFilter.apply(calGx, calGy, calGz, now);
 
-  const ax = filtAccel.x;
-  const ay = filtAccel.y;
-  const az = filtAccel.z;
+  const ax = Math.max(-2.5, Math.min(2.5, filtAccel.x));
+  const ay = Math.max(-2.5, Math.min(2.5, filtAccel.y));
+  const az = Math.max(-2.5, Math.min(2.5, filtAccel.z));
   const gx = filtGyro.x;
   const gy = filtGyro.y;
   const gz = filtGyro.z;
@@ -2844,7 +2845,11 @@ function initChart() {
 function addChartData(timeLabel, ax, ay, az, gx = 0, gy = 0, gz = 0) {
   if (!motionChart) return;
   const now = Date.now();
-  chartRingBuffer.push(now, timeLabel, Number(ax) || 0, Number(ay) || 0, Number(az) || 0, Number(gx) || 0, Number(gy) || 0, Number(gz) || 0);
+  const numAx = Math.max(-2.5, Math.min(2.5, Number(ax) || 0));
+  const numAy = Math.max(-2.5, Math.min(2.5, Number(ay) || 0));
+  const numAz = Math.max(-2.5, Math.min(2.5, Number(az) || 0));
+
+  chartRingBuffer.push(now, timeLabel, numAx, numAy, numAz, Number(gx) || 0, Number(gy) || 0, Number(gz) || 0);
   chartNeedsUpdate = true;
   if (!isFullWidth && isPageVisible) {
     rebuildChartFromBuffer();
