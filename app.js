@@ -2518,7 +2518,8 @@ function parseTextTelemetry(line) {
     recordStreamIssue('warn', 'warn', `Stream Warning: ${cleanLine}`, cleanLine);
   }
 
-  cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*(?:\[(?:BLE|SERIAL|UART|SIM|RX|TX)\])?\s*/i, '');
+  cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*/i, '');
+  cleanLine = cleanLine.replace(/^\[(?:BLE|SERIAL|UART|SIM|RX|TX)\]\s*/i, '');
   cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i, '');
   cleanLine = cleanLine.trim();
 
@@ -2614,7 +2615,7 @@ function parseTextTelemetry(line) {
         updateGPSPosition(lat, lng, alt, speed);
       }
 
-      // Extract IMU sensor counts if present (tokens 6-8: Accel, tokens 9-11: Gyro)
+      // Extract IMU sensor counts if present for logging/CSV, but DO NOT route to Live IMU Telemetry / 3D View
       if (tokens.length >= 12 && !isNaN(nums[6]) && !isNaN(nums[7]) && !isNaN(nums[8])) {
         const scale = Math.abs(nums[8]) > 50 ? accelLsbPerG : 1.0;
         const gScale = (tokens.length >= 12 && !isNaN(nums[9]) && Math.abs(nums[9]) > 200) ? gyroLsbPerDps : 1.0;
@@ -2627,7 +2628,7 @@ function parseTextTelemetry(line) {
           res.gyro_z = (nums[11] / gScale).toFixed(1);
         }
         res.activity_mode = 'Tag Status Packet';
-        res.has_imu_data = true;
+        res.has_imu_data = false; // Filtered out from Live IMU & 3D View as instructed
       }
 
       // Extract Battery % and mV (tokens 19 and 20 if present)
