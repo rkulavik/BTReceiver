@@ -66,7 +66,7 @@ let pathHistory = [];
 // 1. Zero-Allocation Float32Array Circular Ring Buffer for High-Speed Charting
 // ==========================================================================
 class Float32RingBuffer {
-  constructor(capacity = 360) {
+  constructor(capacity = 2000) {
     this.capacity = capacity;
     this.times = new Float64Array(capacity);
     this.labels = new Array(capacity).fill('');
@@ -81,10 +81,12 @@ class Float32RingBuffer {
   }
 
   push(timeMs, label, ax, ay, az, gx, gy, gz) {
-    const idx = (this.head + this.count) % this.capacity;
+    let idx;
     if (this.count < this.capacity) {
+      idx = (this.head + this.count) % this.capacity;
       this.count++;
     } else {
+      idx = this.head;
       this.head = (this.head + 1) % this.capacity;
     }
 
@@ -114,7 +116,7 @@ class Float32RingBuffer {
 
     for (let i = 0; i < this.count; i++) {
       const idx = (this.head + i) % this.capacity;
-      if (this.times[idx] >= cutoffTimeMs) {
+      if (!cutoffTimeMs || this.times[idx] >= cutoffTimeMs) {
         outLabels.push(this.labels[idx]);
         outAx.push(this.ax[idx]);
         outAy.push(this.ay[idx]);
@@ -124,11 +126,26 @@ class Float32RingBuffer {
         outGz.push(this.gz[idx]);
       }
     }
+
+    // Fallback: If cutoff filter removed all points but ring buffer has data, return available points
+    if (outLabels.length === 0 && this.count > 0) {
+      for (let i = 0; i < this.count; i++) {
+        const idx = (this.head + i) % this.capacity;
+        outLabels.push(this.labels[idx]);
+        outAx.push(this.ax[idx]);
+        outAy.push(this.ay[idx]);
+        outAz.push(this.az[idx]);
+        outGx.push(this.gx[idx]);
+        outGy.push(this.gy[idx]);
+        outGz.push(this.gz[idx]);
+      }
+    }
+
     return { labels: outLabels, ax: outAx, ay: outAy, az: outAz, gx: outGx, gy: outGy, gz: outGz };
   }
 }
 
-const chartRingBuffer = new Float32RingBuffer(500);
+const chartRingBuffer = new Float32RingBuffer(2000);
 
 // 6-DOF IMU Motion Chart State
 let motionChart = null;
@@ -2825,6 +2842,9 @@ function addChartData(timeLabel, ax, ay, az, gx = 0, gy = 0, gz = 0) {
   const now = Date.now();
   chartRingBuffer.push(now, timeLabel, Number(ax) || 0, Number(ay) || 0, Number(az) || 0, Number(gx) || 0, Number(gy) || 0, Number(gz) || 0);
   chartNeedsUpdate = true;
+  if (!isFullWidth && isPageVisible) {
+    rebuildChartFromBuffer();
+  }
 }
 
 function startChartRenderLoop() {
@@ -2866,15 +2886,26 @@ function applyChartFilterMode() {
   const isAccelVisible = chartFilterMode === 'all' || chartFilterMode === 'accel';
   const isGyroVisible = chartFilterMode === 'all' || chartFilterMode === 'gyro';
 
-  motionChart.data.datasets[0].hidden = !isAccelVisible;
-  motionChart.data.datasets[1].hidden = !isAccelVisible;
-  motionChart.data.datasets[2].hidden = !isAccelVisible;
-  motionChart.data.datasets[3].hidden = !isGyroVisible;
-  motionChart.data.datasets[4].hidden = !isGyroVisible;
-  motionChart.data.datasets[5].hidden = !isGyroVisible;
+  if (typeof motionChart.setDatasetVisibility === 'function') {
+    motionChart.setDatasetVisibility(0, isAccelVisible);
+    motionChart.setDatasetVisibility(1, isAccelVisible);
+    motionChart.setDatasetVisibility(2, isAccelVisible);
+    motionChart.setDatasetVisibility(3, isGyroVisible);
+    motionChart.setDatasetVisibility(4, isGyroVisible);
+    motionChart.setDatasetVisibility(5, isGyroVisible);
+  } else {
+    motionChart.data.datasets[0].hidden = !isAccelVisible;
+    motionChart.data.datasets[1].hidden = !isAccelVisible;
+    motionChart.data.datasets[2].hidden = !isAccelVisible;
+    motionChart.data.datasets[3].hidden = !isGyroVisible;
+    motionChart.data.datasets[4].hidden = !isGyroVisible;
+    motionChart.data.datasets[5].hidden = !isGyroVisible;
+  }
 
-  motionChart.options.scales.y.display = isAccelVisible;
-  motionChart.options.scales.y1.display = isGyroVisible;
+  if (motionChart.options && motionChart.options.scales) {
+    if (motionChart.options.scales.y) motionChart.options.scales.y.display = isAccelVisible;
+    if (motionChart.options.scales.y1) motionChart.options.scales.y1.display = isGyroVisible;
+  }
 }
 
 // ==========================================================================
