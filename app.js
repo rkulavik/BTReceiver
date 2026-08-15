@@ -2002,6 +2002,8 @@ function updateFilterMasterStatus() {
 // ==========================================================================
 // Device Overview & Blank Disconnected State
 // ==========================================================================
+let batteryVoltageHistory = [];
+
 function updateDeviceOverview(name, id, connected) {
   if (connected) {
     if (deviceNameEl) deviceNameEl.textContent = name || '--';
@@ -2012,6 +2014,7 @@ function updateDeviceOverview(name, id, connected) {
       deviceTypeBadge.className = 'badge pill-success';
     }
   } else {
+    batteryVoltageHistory = [];
     if (deviceNameEl) deviceNameEl.textContent = '--';
     if (cowTagIdEl) cowTagIdEl.textContent = '--';
     if (batteryValueEl) batteryValueEl.textContent = '-- V';
@@ -2036,15 +2039,25 @@ function updateBatteryDisplay(batteryVolts, batteryPct = null) {
     else if (v > 10) v = v / 10.0;   // e.g. 38.94 dV -> 3.89 V
   }
 
-  if (pct === null && !isNaN(v) && v > 0) {
-    pct = Math.round(Math.min(100, Math.max(0, ((v - 3.3) / 0.9) * 100)));
+  let avgV = v;
+  if (!isNaN(v) && v > 0) {
+    batteryVoltageHistory.push(v);
+    if (batteryVoltageHistory.length > 10) {
+      batteryVoltageHistory.shift();
+    }
+    const sum = batteryVoltageHistory.reduce((acc, val) => acc + val, 0);
+    avgV = sum / batteryVoltageHistory.length;
   }
 
-  if (!isNaN(v) && v > 0 && v < 3.45) {
-    recordStreamIssue('battery', 'warn', `Low Tag Battery Alert: ${v.toFixed(2)}V (${pct !== null ? `${pct}%` : 'Low'})`);
+  if (pct === null && !isNaN(avgV) && avgV > 0) {
+    pct = Math.round(Math.min(100, Math.max(0, ((avgV - 3.3) / 0.9) * 100)));
   }
 
-  if (batteryValueEl) batteryValueEl.textContent = (!isNaN(v) && v > 0) ? `${v.toFixed(2)} V` : '-- V';
+  if (!isNaN(avgV) && avgV > 0 && avgV < 3.45) {
+    recordStreamIssue('battery', 'warn', `Low Tag Battery Alert: ${avgV.toFixed(2)}V (${pct !== null ? `${pct}%` : 'Low'})`);
+  }
+
+  if (batteryValueEl) batteryValueEl.textContent = (!isNaN(avgV) && avgV > 0) ? `${avgV.toFixed(2)} V` : '-- V';
   if (batteryPillEl && pct !== null) {
     batteryPillEl.textContent = `${pct}%`;
     batteryPillEl.className = pct > 60 ? 'valueHighlight battery-pill pill-success' : (pct > 25 ? 'valueHighlight battery-pill pill-warning' : 'valueHighlight battery-pill pill-danger');
