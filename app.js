@@ -2615,10 +2615,10 @@ function parseTextTelemetry(line) {
         updateGPSPosition(lat, lng, alt, speed);
       }
 
-      // Extract IMU sensor counts if present for logging/CSV, but DO NOT route to Live IMU Telemetry / 3D View
+      // Extract IMU sensor counts if present (tokens 6-8: Accel LSB, tokens 9-11: Gyro LSB)
       if (tokens.length >= 12 && !isNaN(nums[6]) && !isNaN(nums[7]) && !isNaN(nums[8])) {
         const scale = Math.abs(nums[8]) > 50 ? accelLsbPerG : 1.0;
-        const gScale = (tokens.length >= 12 && !isNaN(nums[9]) && Math.abs(nums[9]) > 200) ? gyroLsbPerDps : 1.0;
+        const gScale = (!isNaN(nums[9]) && Math.abs(nums[9]) > 200) ? gyroLsbPerDps : 1.0;
         res.accel_x = (nums[6] / scale).toFixed(3);
         res.accel_y = (nums[7] / scale).toFixed(3);
         res.accel_z = (nums[8] / scale).toFixed(3);
@@ -2628,7 +2628,7 @@ function parseTextTelemetry(line) {
           res.gyro_z = (nums[11] / gScale).toFixed(1);
         }
         res.activity_mode = 'Tag Status Packet';
-        res.has_imu_data = false; // Filtered out from Live IMU & 3D View as instructed
+        res.has_imu_data = true; // Enables Amplitude vs Time Motion Chart and Live IMU Telemetry
       }
 
       // Extract Battery % and mV (tokens 19 and 20 if present)
