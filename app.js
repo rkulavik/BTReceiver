@@ -2011,16 +2011,22 @@ function updateDeviceOverview(name, id, connected) {
 
 function updateBatteryDisplay(batteryVolts, batteryPct = null) {
   let v = parseFloat(batteryVolts);
-  let pct = batteryPct !== null && !isNaN(parseInt(batteryPct, 10)) ? parseInt(batteryPct, 10) : null;
+  let pct = (batteryPct !== null && batteryPct !== undefined && !isNaN(parseInt(batteryPct, 10))) ? parseInt(batteryPct, 10) : null;
 
-  if (!isNaN(v) && v > 100) v = v / 1000.0;
-  if (pct === null && !isNaN(v) && v > 0) pct = Math.round(Math.min(100, Math.max(0, ((v - 3.3) / 0.9) * 100)));
+  if (!isNaN(v)) {
+    if (v > 100) v = v / 1000.0;     // e.g. 3850 mV -> 3.85 V
+    else if (v > 10) v = v / 10.0;   // e.g. 38.94 dV -> 3.89 V
+  }
 
-  if (v > 0 && v < 3.45) {
+  if (pct === null && !isNaN(v) && v > 0) {
+    pct = Math.round(Math.min(100, Math.max(0, ((v - 3.3) / 0.9) * 100)));
+  }
+
+  if (!isNaN(v) && v > 0 && v < 3.45) {
     recordStreamIssue('battery', 'warn', `Low Tag Battery Alert: ${v.toFixed(2)}V (${pct !== null ? `${pct}%` : 'Low'})`);
   }
 
-  if (batteryValueEl) batteryValueEl.textContent = !isNaN(v) ? `${v.toFixed(2)} V` : '-- V';
+  if (batteryValueEl) batteryValueEl.textContent = (!isNaN(v) && v > 0) ? `${v.toFixed(2)} V` : '-- V';
   if (batteryPillEl && pct !== null) {
     batteryPillEl.textContent = `${pct}%`;
     batteryPillEl.className = pct > 60 ? 'valueHighlight battery-pill pill-success' : (pct > 25 ? 'valueHighlight battery-pill pill-warning' : 'valueHighlight battery-pill pill-danger');
@@ -2432,13 +2438,14 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
 
     const battMv = dataView.byteLength >= 19 ? dataView.getUint16(17, true) : 3850;
     const battVolts = (battMv / 1000.0).toFixed(2);
+    const battPct = Math.round(Math.min(100, Math.max(0, ((parseFloat(battVolts) - 3.3) / 0.9) * 100)));
     const actByte = dataView.byteLength >= 20 ? dataView.getUint8(19) : 1;
 
     const activities = ['Resting / Lying', 'Grazing Pasture', 'Walking / Moving', 'High Alert / Running'];
     const actStr = activities[actByte % 4] || 'Grazing';
 
     const orientation = updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz, null, null, null, 'BLE Tag Frame', actStr);
-    updateBatteryDisplay(battVolts);
+    updateBatteryDisplay(battVolts, battPct);
 
     parsed = {
       'Sync Header': `0x${header.toString(16).toUpperCase()}`,
@@ -2448,7 +2455,7 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
       'Accel X/Y/Z': `${orientation.ax.toFixed(2)}g, ${orientation.ay.toFixed(2)}g, ${orientation.az.toFixed(2)}g`,
       'Gyro X/Y/Z': `${orientation.gx.toFixed(1)}°, ${orientation.gy.toFixed(1)}°, ${orientation.gz.toFixed(1)}°`,
       'Orientation': `P:${orientation.pitch.toFixed(1)}° R:${orientation.roll.toFixed(1)}° Y:${orientation.yaw.toFixed(1)}°`,
-      'Tag Battery': `${battVolts} V`,
+      'Tag Battery': `${battVolts} V (${battPct}%)`,
       'Activity Mode': actStr
     };
 
@@ -2476,6 +2483,7 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
         roll: orientation.roll.toFixed(1),
         yaw: orientation.yaw.toFixed(1),
         battery_v: battVolts,
+        battery_pct: String(battPct),
         activity_mode: actStr,
         payload_text: '',
         raw_hex: rawHexStr
@@ -2511,7 +2519,7 @@ function parseTextTelemetry(line) {
   }
 
   cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*(?:\[(?:BLE|SERIAL|UART|SIM|RX|TX)\])?\s*/i, '');
-  cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i);
+  cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i, '');
   cleanLine = cleanLine.trim();
 
   const battLogMatch = cleanLine.match(/BATTERY\s*:\s*(\d+)\s*%\s*(?:\(\s*(\d+)\s*mV\s*\))?/i);
@@ -2546,6 +2554,19 @@ function parseTextTelemetry(line) {
         res.gyro_y = (parseFloat(parts[5]) / gyroLsbPerDps).toFixed(1);
         res.gyro_z = (parseFloat(parts[6]) / gyroLsbPerDps).toFixed(1);
       }
+
+      // Parse battery voltage from $IMU line if present (e.g. parts[14] = 38.94 or 3.89)
+      if (parts.length >= 15 && parts[14] !== undefined && parts[14].trim() !== '') {
+        const rawB = parseFloat(parts[14]);
+        if (!isNaN(rawB) && rawB > 0) {
+          let bVolts = rawB;
+          if (bVolts > 100) bVolts = bVolts / 1000.0;
+          else if (bVolts > 10) bVolts = bVolts / 10.0;
+          res.battery_v = bVolts.toFixed(2);
+          updateBatteryDisplay(res.battery_v);
+        }
+      }
+
       res.activity_mode = '$IMU Stream';
       res.has_imu_data = true;
     }
@@ -2558,10 +2579,68 @@ function parseTextTelemetry(line) {
       res.activity_mode = '$RPY Attitude';
       res.has_imu_data = true;
     }
+  } else if (cleanLine.startsWith('$GPS') || cleanLine.startsWith('$POS') || cleanLine.startsWith('$GPGGA') || cleanLine.startsWith('$GPRMC')) {
+    const parts = cleanLine.split(',');
+    if (parts.length >= 3) {
+      const lat = parseFloat(parts[1]);
+      const lng = parseFloat(parts[2]);
+      const alt = parts[3] ? parseFloat(parts[3]) : 412.0;
+      const speed = parts[4] ? parseFloat(parts[4]) : 1.2;
+      if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+        res.lat = lat.toFixed(6);
+        res.lng = lng.toFixed(6);
+        updateGPSPosition(lat, lng, alt, speed);
+      }
+    }
   } else {
     const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
-    const nums = tokens.map(t => parseFloat(t)).filter(n => !isNaN(n));
-    if (nums.length >= 6) {
+    const nums = tokens.map(t => parseFloat(t));
+
+    // Case A: 15+ tokens Tag Status Packet (e.g. "1016,1,331029860,-968464290,10,5,568,2462,9887,2625,2432,2852,...")
+    if (tokens.length >= 15 && !isNaN(nums[0]) && !isNaN(nums[2]) && !isNaN(nums[3])) {
+      res.tag_id = `COW-${nums[0]}`;
+
+      // Extract GPS Lat & Lng
+      const rawLat = nums[2];
+      const rawLng = nums[3];
+      const lat = Math.abs(rawLat) > 1000000 ? rawLat / 1e7 : rawLat;
+      const lng = Math.abs(rawLng) > 1000000 ? rawLng / 1e7 : rawLng;
+
+      if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+        res.lat = lat.toFixed(6);
+        res.lng = lng.toFixed(6);
+        const alt = !isNaN(nums[4]) ? nums[4] : 412.0;
+        const speed = !isNaN(nums[5]) ? nums[5] : 1.2;
+        updateGPSPosition(lat, lng, alt, speed);
+      }
+
+      // Extract IMU sensor counts if present (tokens 6-8: Accel, tokens 9-11: Gyro)
+      if (tokens.length >= 12 && !isNaN(nums[6]) && !isNaN(nums[7]) && !isNaN(nums[8])) {
+        const scale = Math.abs(nums[8]) > 50 ? accelLsbPerG : 1.0;
+        const gScale = (tokens.length >= 12 && !isNaN(nums[9]) && Math.abs(nums[9]) > 200) ? gyroLsbPerDps : 1.0;
+        res.accel_x = (nums[6] / scale).toFixed(3);
+        res.accel_y = (nums[7] / scale).toFixed(3);
+        res.accel_z = (nums[8] / scale).toFixed(3);
+        if (!isNaN(nums[9]) && !isNaN(nums[10]) && !isNaN(nums[11])) {
+          res.gyro_x = (nums[9] / gScale).toFixed(1);
+          res.gyro_y = (nums[10] / gScale).toFixed(1);
+          res.gyro_z = (nums[11] / gScale).toFixed(1);
+        }
+        res.activity_mode = 'Tag Status Packet';
+        res.has_imu_data = true;
+      }
+
+      // Extract Battery % and mV (tokens 19 and 20 if present)
+      if (tokens.length >= 20 && !isNaN(nums[19])) {
+        const pct = Math.round(nums[19]);
+        const mv = !isNaN(nums[20]) ? nums[20] : null;
+        res.battery_pct = String(pct);
+        res.battery_v = mv ? (mv / 1000.0).toFixed(2) : (3.3 + (pct / 100.0) * 0.9).toFixed(2);
+        updateBatteryDisplay(res.battery_v, pct);
+      }
+    }
+    // Case B: Standard 6-DOF IMU CSV line (6 to 12 numbers, where nums[0..1] are NOT huge GPS values > 100000)
+    else if (nums.length >= 6 && !isNaN(nums[0]) && Math.abs(nums[0]) < 100000 && Math.abs(nums[1]) < 100000) {
       const scale = Math.abs(nums[2]) > 50 ? accelLsbPerG : 1.0;
       const gScale = Math.abs(nums[3]) > 200 ? gyroLsbPerDps : 1.0;
       res.accel_x = (nums[0] / scale).toFixed(3);
@@ -2940,17 +3019,19 @@ function downloadCsvFile(filename, records) {
   const blob = new Blob([csvLines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
+  const outName = filename || `ranchbot_telemetry_${Date.now()}.csv`;
+  link.style.display = 'none';
   link.setAttribute('href', url);
-  link.setAttribute('download', filename || `ranchbot_telemetry_${Date.now()}.csv`);
+  link.setAttribute('download', outName);
   document.body.appendChild(link);
   link.click();
 
   setTimeout(() => {
-    document.body.removeChild(link);
+    if (link.parentNode) link.parentNode.removeChild(link);
     URL.revokeObjectURL(url);
-  }, 500);
+  }, 1000);
 
-  logToConsole('system', `✓ FILE SAVED: "${link.download}" (${records.length} records).`);
+  logToConsole('system', `✓ FILE SAVED & DOWNLOADED: "${outName}" (${records.length} records).`);
 }
 
 function toggleRecording() {
@@ -2984,6 +3065,7 @@ function startRecording() {
   recordingTimerInterval = setInterval(updateRecorderTimerDisplay, 1000);
   updateRecorderTimerDisplay();
   updateRecorderStats();
+  logToConsole('system', `● STREAM RECORDING STARTED: Saving incoming telemetry to "${activeRecordingFileName}"...`);
 }
 
 function writeRecordToFileAndBuffer(recordItem) {
@@ -2994,6 +3076,38 @@ function writeRecordToFileAndBuffer(recordItem) {
 
 function stopRecording() {
   if (!isRecording) return;
+
+  // Flush any remaining buffered line in serialLineBuffer
+  if (serialLineBuffer && serialLineBuffer.trim().length > 0) {
+    const trimmed = serialLineBuffer.trim();
+    serialLineBuffer = '';
+    const extracted = parseTextTelemetry(trimmed);
+    recordedPackets.push({
+      timestamp_iso: new Date().toISOString(),
+      timestamp_local: new Date().toLocaleString(),
+      packet_number: ++packetCounter,
+      source: 'UART',
+      tag_id: extracted.tag_id || (cowTagIdEl && cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UART-FEED'),
+      data_type: 'UART_TEXT',
+      lat: extracted.lat || '',
+      lng: extracted.lng || '',
+      accel_x: extracted.accel_x || '',
+      accel_y: extracted.accel_y || '',
+      accel_z: extracted.accel_z || '',
+      gyro_x: extracted.gyro_x || '',
+      gyro_y: extracted.gyro_y || '',
+      gyro_z: extracted.gyro_z || '',
+      pitch: extracted.pitch || '',
+      roll: extracted.roll || '',
+      yaw: extracted.yaw || '',
+      battery_v: extracted.battery_v || '',
+      battery_pct: extracted.battery_pct || '',
+      activity_mode: extracted.activity_mode || 'UART Serial',
+      payload_text: trimmed,
+      raw_hex: ''
+    });
+  }
+
   isRecording = false;
 
   if (recordingTimerInterval) {
@@ -3010,12 +3124,16 @@ function stopRecording() {
     btnRecordToggle.innerHTML = '<i class="fa-solid fa-circle"></i> Start Recording';
   }
 
-  if (recordedPackets.length > 0) {
+  const recordCount = recordedPackets.length;
+  if (recordCount > 0) {
     downloadCsvFile(activeRecordingFileName, recordedPackets);
+  } else {
+    alert('No telemetry records were captured during the recording session.');
   }
+
   if (recorderFilePill) {
     recorderFilePill.classList.remove('active');
-    recorderFilenameText.textContent = recordedPackets.length > 0 ? `Saved: ${activeRecordingFileName}` : 'No file selected';
+    recorderFilenameText.textContent = recordCount > 0 ? `Saved: ${activeRecordingFileName}` : 'No file selected';
   }
 }
 
