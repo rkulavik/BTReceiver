@@ -2015,6 +2015,8 @@ function updateDeviceOverview(name, id, connected) {
     }
   } else {
     batteryVoltageHistory = [];
+    zeroGpsCount = 0;
+    lastValidGPS = null;
     if (deviceNameEl) deviceNameEl.textContent = '--';
     if (cowTagIdEl) cowTagIdEl.textContent = '--';
     if (batteryValueEl) batteryValueEl.textContent = '-- V';
@@ -2953,15 +2955,47 @@ function initMap() {
   polyline = L.polyline([], { color: '#00f2fe', weight: 3, opacity: 0.8, dashArray: '5, 8' }).addTo(map);
 }
 
-function updateGPSPosition(lat, lng, alt, speed) {
-  if (lblLat) lblLat.textContent = lat.toFixed(6);
-  if (lblLng) lblLng.textContent = lng.toFixed(6);
-  if (lblAlt) lblAlt.textContent = `${alt.toFixed(1)} m`;
-  if (lblSpeed) lblSpeed.textContent = `${speed.toFixed(1)} km/h`;
+let zeroGpsCount = 0;
+let lastValidGPS = null;
+
+function updateGPSPosition(lat, lng, alt = 412.0, speed = 1.2) {
+  let numLat = parseFloat(lat) || 0;
+  let numLng = parseFloat(lng) || 0;
+  let numAlt = !isNaN(parseFloat(alt)) ? parseFloat(alt) : 412.0;
+  let numSpeed = !isNaN(parseFloat(speed)) ? parseFloat(speed) : 1.2;
+
+  // Detect (0,0) invalid Null Island GPS location
+  if (Math.abs(numLat) < 0.000001 && Math.abs(numLng) < 0.000001) {
+    zeroGpsCount++;
+    recordStreamIssue(
+      'gps',
+      'error',
+      `Zero GPS Location (0,0) Received: Ignored (${zeroGpsCount} zero-GPS packet${zeroGpsCount === 1 ? '' : 's'} total)`,
+      `Lat: 0.000000, Lng: 0.000000 (Count: ${zeroGpsCount})`
+    );
+
+    if (lastValidGPS) {
+      numLat = lastValidGPS.lat;
+      numLng = lastValidGPS.lng;
+      numAlt = lastValidGPS.alt;
+      numSpeed = lastValidGPS.speed;
+    } else {
+      // No valid prior GPS fix available yet; ignore (0,0) update completely
+      return;
+    }
+  } else {
+    // Save latest valid non-zero GPS fix
+    lastValidGPS = { lat: numLat, lng: numLng, alt: numAlt, speed: numSpeed };
+  }
+
+  if (lblLat) lblLat.textContent = numLat.toFixed(6);
+  if (lblLng) lblLng.textContent = numLng.toFixed(6);
+  if (lblAlt) lblAlt.textContent = `${numAlt.toFixed(1)} m`;
+  if (lblSpeed) lblSpeed.textContent = `${numSpeed.toFixed(1)} km/h`;
 
   if (isFullWidth) return;
 
-  const newPos = [lat, lng];
+  const newPos = [numLat, numLng];
   if (cowMarker) cowMarker.setLatLng(newPos);
   pathHistory.push(newPos);
   if (pathHistory.length > 50) pathHistory.shift();
