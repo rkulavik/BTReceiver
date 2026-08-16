@@ -444,6 +444,10 @@ const deviceNameEl = document.getElementById('deviceName');
 const batteryValueEl = document.getElementById('batteryValue');
 const batteryPillEl = document.getElementById('batteryPill');
 const batteryLevelFillEl = document.getElementById('batteryLevelFill');
+const chargingPillEl = document.getElementById('chargingPill');
+const chargeCurrentValueEl = document.getElementById('chargeCurrentValue');
+const chargeEnergyValueEl = document.getElementById('chargeEnergyValue');
+const sdFileSizeValueEl = document.getElementById('sdFileSizeValue');
 const rssiValueEl = document.getElementById('rssiValue');
 const activityStateEl = document.getElementById('activityState');
 const packetCountEl = document.getElementById('packetCount');
@@ -461,6 +465,7 @@ const lblGpsSats = document.getElementById('lblGpsSats');
 
 // Telemetry State
 let latestUartDiagnostics = { chars: 0, sent: 0, cksum_err: 0, frm: 0, brk: 0, ovr: 0, ring_drops: 0 };
+let latestPowerStats = { charging: 0, chg_ma: 0, chg_mwh: 0, file_bytes: 0 };
 let lastCumulativeSteps = 0;
 let lastKnownChipTemp = null;
 let lastKnownUptimeSec = null;
@@ -1759,6 +1764,10 @@ function parseAndInitCsvReplay(filename, csvText) {
       const batt_pct = tokens.length >= 20 ? parseInt(tokens[19], 10) : 85;
       const batt_mv = tokens.length >= 21 ? parseInt(tokens[20], 10) : 3850;
       const temp_cc = tokens.length >= 22 ? parseInt(tokens[21], 10) : 2500;
+      const file_bytes = tokens.length >= 23 ? parseInt(tokens[22], 10) : 0;
+      const charging = tokens.length >= 24 ? parseInt(tokens[23], 10) : 0;
+      const chg_ma = tokens.length >= 25 ? parseInt(tokens[24], 10) : 0;
+      const chg_mwh = tokens.length >= 26 ? parseInt(tokens[25], 10) : 0;
 
       const lat = lat_e7 / 1e7;
       const lng = lon_e7 / 1e7;
@@ -1797,6 +1806,10 @@ function parseAndInitCsvReplay(filename, csvText) {
         temp: tempC,
         batt: battV,
         batt_pct: batt_pct,
+        file_bytes: file_bytes,
+        charging: charging,
+        chg_ma: chg_ma,
+        chg_mwh: chg_mwh,
         uart_errs: { chars, sent, cksum_err, frm, brk, ovr, ring_drops },
         mode: `Periodic Telemetry (${up_s}s)`
       });
@@ -1990,6 +2003,10 @@ function seekReplayIndex(idx) {
 
   if (row.uart_errs) {
     updateUartHealthDisplay(row.uart_errs);
+  }
+
+  if (row.charging !== undefined || row.chg_ma !== undefined || row.chg_mwh !== undefined || row.file_bytes !== undefined) {
+    updatePowerAndStorageDisplay(row.charging, row.chg_ma, row.chg_mwh, row.file_bytes);
   }
 
   const timeLabel = row.local ? (row.local.split(',')[1] || row.local) : `Row ${replayCurrentIndex}`;
@@ -2231,6 +2248,7 @@ function updateDeviceOverview(name, id, connected) {
     lastKnownGpsFix = 0;
     lastKnownSats = { total: 0, used: 0 };
     latestUartDiagnostics = { chars: 0, sent: 0, cksum_err: 0, frm: 0, brk: 0, ovr: 0, ring_drops: 0 };
+    latestPowerStats = { charging: 0, chg_ma: 0, chg_mwh: 0, file_bytes: 0 };
 
     if (deviceNameEl) deviceNameEl.textContent = '--';
     if (cowTagIdEl) cowTagIdEl.textContent = '--';
@@ -2249,6 +2267,90 @@ function updateDeviceOverview(name, id, connected) {
     updateUptimeDisplay(null);
     updateGNSSDisplay(0, 0, 0);
     updateUartHealthDisplay({ chars: 0, sent: 0, cksum_err: 0, frm: 0, brk: 0, ovr: 0, ring_drops: 0 });
+    updatePowerAndStorageDisplay(null, null, null, null);
+  }
+}
+
+function formatBytes(bytes) {
+  if (bytes === null || bytes === undefined || isNaN(bytes)) return '--';
+  const b = Number(bytes);
+  if (b < 1024) return `${b.toLocaleString()} B`;
+  if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`;
+  return `${(b / 1048576).toFixed(2)} MB`;
+}
+
+function updatePowerAndStorageDisplay(charging, chg_ma, chg_mwh, file_bytes) {
+  if (charging === null || charging === undefined || isNaN(charging)) {
+    if (chargingPillEl) {
+      chargingPillEl.className = 'pill pill-secondary pill-sm';
+      chargingPillEl.textContent = '--';
+    }
+  } else {
+    latestPowerStats.charging = Number(charging);
+    if (chargingPillEl) {
+      if (latestPowerStats.charging === 1) {
+        chargingPillEl.className = 'pill pill-charging pill-sm';
+        chargingPillEl.innerHTML = '<i class="fa-solid fa-bolt"></i> Charging';
+      } else {
+        chargingPillEl.className = 'pill pill-discharging pill-sm';
+        chargingPillEl.textContent = 'Idle';
+      }
+    }
+  }
+
+  if (chg_ma === null || chg_ma === undefined || isNaN(chg_ma)) {
+    if (chargeCurrentValueEl) {
+      chargeCurrentValueEl.className = 'value';
+      chargeCurrentValueEl.textContent = '-- mA';
+    }
+  } else {
+    latestPowerStats.chg_ma = Number(chg_ma);
+    if (chargeCurrentValueEl) {
+      const ma = latestPowerStats.chg_ma;
+      if (ma > 0) {
+        chargeCurrentValueEl.textContent = `+${ma} mA`;
+        chargeCurrentValueEl.className = 'value charge-current-pos';
+      } else if (ma < 0) {
+        chargeCurrentValueEl.textContent = `${ma} mA`;
+        chargeCurrentValueEl.className = 'value charge-current-neg';
+      } else {
+        chargeCurrentValueEl.textContent = `0 mA`;
+        chargeCurrentValueEl.className = 'value charge-current-zero';
+      }
+    }
+  }
+
+  if (chg_mwh === null || chg_mwh === undefined || isNaN(chg_mwh)) {
+    if (chargeEnergyValueEl) {
+      chargeEnergyValueEl.textContent = '-- mWh';
+      chargeEnergyValueEl.removeAttribute('title');
+    }
+  } else {
+    latestPowerStats.chg_mwh = Number(chg_mwh);
+    if (chargeEnergyValueEl) {
+      const mwh = latestPowerStats.chg_mwh;
+      if (mwh >= 1000) {
+        chargeEnergyValueEl.textContent = `${(mwh / 1000).toFixed(2)} Wh`;
+        chargeEnergyValueEl.title = `${mwh.toLocaleString()} mWh`;
+      } else {
+        chargeEnergyValueEl.textContent = `${mwh.toLocaleString()} mWh`;
+        chargeEnergyValueEl.title = `${mwh.toLocaleString()} mWh`;
+      }
+    }
+  }
+
+  if (file_bytes === null || file_bytes === undefined || isNaN(file_bytes)) {
+    if (sdFileSizeValueEl) {
+      sdFileSizeValueEl.textContent = '--';
+      sdFileSizeValueEl.removeAttribute('title');
+    }
+  } else {
+    latestPowerStats.file_bytes = Number(file_bytes);
+    if (sdFileSizeValueEl) {
+      const fb = latestPowerStats.file_bytes;
+      sdFileSizeValueEl.textContent = formatBytes(fb);
+      sdFileSizeValueEl.title = `${fb.toLocaleString()} bytes`;
+    }
   }
 }
 
@@ -2922,8 +3024,8 @@ function parseTextTelemetry(line) {
   cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i, '');
   cleanLine = cleanLine.trim();
 
-  // Check for 22-Field Periodic Telemetry Snapshot CSV Row
-  // Format: <up_s>,<gps_fix>,<lat_e7>,<lon_e7>,<sat_tot>,<sat_used>,<ax_mms2>,<ay_mms2>,<az_mms2>,<gx_mdps>,<gy_mdps>,<gz_mdps>,<chars>,<sent>,<cksum_err>,<frm>,<brk>,<ovr>,<ring_drops>,<batt_pct>,<batt_mv>,<temp_cc>
+  // Check for 26-Field Periodic Telemetry Snapshot CSV Row
+  // Format: <up_s>,<gps_fix>,<lat_e7>,<lon_e7>,<sat_tot>,<sat_used>,<ax_mms2>,<ay_mms2>,<az_mms2>,<gx_mdps>,<gy_mdps>,<gz_mdps>,<chars>,<sent>,<cksum_err>,<frm>,<brk>,<ovr>,<ring_drops>,<batt_pct>,<batt_mv>,<temp_cc>,<file_bytes>,<charging>,<chg_ma>,<chg_mwh>
   const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
   const nums = tokens.map(t => parseFloat(t));
 
@@ -2950,6 +3052,10 @@ function parseTextTelemetry(line) {
     const batt_pct = tokens.length >= 20 ? parseInt(tokens[19], 10) : 0;
     const batt_mv = tokens.length >= 21 ? parseInt(tokens[20], 10) : 3850;
     const temp_cc = tokens.length >= 22 ? parseInt(tokens[21], 10) : 2500;
+    const file_bytes = tokens.length >= 23 ? parseInt(tokens[22], 10) : 0;
+    const charging = tokens.length >= 24 ? parseInt(tokens[23], 10) : 0;
+    const chg_ma = tokens.length >= 25 ? parseInt(tokens[24], 10) : 0;
+    const chg_mwh = tokens.length >= 26 ? parseInt(tokens[25], 10) : 0;
 
     const lat = lat_e7 / 1e7;
     const lon = lon_e7 / 1e7;
@@ -3013,6 +3119,7 @@ function parseTextTelemetry(line) {
     updateBatteryDisplay(battV, batt_pct);
     updateTemperatureDisplay(tempC);
     updateUartHealthDisplay({ chars, sent, cksum_err, frm, brk, ovr, ring_drops });
+    updatePowerAndStorageDisplay(charging, chg_ma, chg_mwh, file_bytes);
 
     if (gps_fix === 1 && !isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && (Math.abs(lat) > 0.00001 || Math.abs(lon) > 0.00001)) {
       res.lat = lat.toFixed(6);
@@ -3044,6 +3151,10 @@ function parseTextTelemetry(line) {
     res.temp_c = tempC;
     res.temp_f = tempF;
     res.temp_cc = temp_cc;
+    res.file_bytes = file_bytes;
+    res.charging = charging;
+    res.chg_ma = chg_ma;
+    res.chg_mwh = chg_mwh;
     res.accel_x = ax_g;
     res.accel_y = ay_g;
     res.accel_z = az_g;
@@ -3065,6 +3176,9 @@ function parseTextTelemetry(line) {
       'GPS UART Traffic': `${chars.toLocaleString()} B (${sent} Valid NMEA, ${cksum_err} Checksum Errs)`,
       'UART Driver Errors': `Framing: ${frm} | Overrun: ${ovr} | Break: ${brk} | Ring Drops: ${ring_drops}`,
       'Battery Status': `${batt_pct}% (${battV} V / ${batt_mv} mV)`,
+      'Solar / Charger': charging === 1 ? `Actively Charging (${chg_ma > 0 ? `+${chg_ma}` : chg_ma} mA)` : `Idle / Discharging (${chg_ma} mA)`,
+      'Energy Delivered': `${chg_mwh.toLocaleString()} mWh (${(chg_mwh / 1000).toFixed(3)} Wh)`,
+      'SD Log File Size': `${formatBytes(file_bytes)} (${file_bytes.toLocaleString()} bytes)`,
       'Board Temperature': `${tempC.toFixed(2)} °C (${tempF.toFixed(1)} °F)`
     });
 
@@ -3252,6 +3366,10 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
             temp_c: lastKnownChipTemp !== null ? lastKnownChipTemp.toFixed(2) : '',
             battery_v: extracted.battery_v || '',
             battery_pct: extracted.battery_pct || '',
+            file_bytes: extracted.file_bytes !== undefined ? extracted.file_bytes : latestPowerStats.file_bytes,
+            charging: extracted.charging !== undefined ? extracted.charging : latestPowerStats.charging,
+            chg_ma: extracted.chg_ma !== undefined ? extracted.chg_ma : latestPowerStats.chg_ma,
+            chg_mwh: extracted.chg_mwh !== undefined ? extracted.chg_mwh : latestPowerStats.chg_mwh,
             uart_errs: String(latestUartDiagnostics.frm + latestUartDiagnostics.ovr + latestUartDiagnostics.brk + latestUartDiagnostics.ring_drops + latestUartDiagnostics.cksum_err),
             activity_mode: extracted.activity_mode || 'Periodic Telemetry',
             payload_text: trimmed,
@@ -3307,10 +3425,13 @@ function logDecodedPeriodicTelemetry(p, source = 'SERIAL') {
 
   entry.innerHTML = `
     <div class="decoded-entry-header">
-      <span class="decoded-badge badge-telemetry"><i class="fa-solid fa-satellite-dish"></i> 22-FIELD TELEMETRY [${source}]</span>
+      <span class="decoded-badge badge-telemetry"><i class="fa-solid fa-satellite-dish"></i> 26-FIELD TELEMETRY [${source}]</span>
       <span class="decoded-time">[${time}]</span>
       <span class="decoded-pill"><i class="fa-solid fa-stopwatch"></i> Up: ${p.up_s}s</span>
       <span class="decoded-pill"><i class="fa-solid fa-battery-three-quarters"></i> ${p.batt_pct}% (${p.batt_v}V)</span>
+      <span class="decoded-pill"><i class="fa-solid fa-bolt"></i> ${p.charging === 1 ? 'Chg' : 'Idle'}: ${p.chg_ma > 0 ? `+${p.chg_ma}` : (p.chg_ma !== undefined ? p.chg_ma : 0)}mA</span>
+      <span class="decoded-pill"><i class="fa-solid fa-battery-charging"></i> ${p.chg_mwh !== undefined ? p.chg_mwh : 0} mWh</span>
+      <span class="decoded-pill"><i class="fa-solid fa-sd-card"></i> ${formatBytes(p.file_bytes || 0)}</span>
       <span class="decoded-pill"><i class="fa-solid fa-temperature-half"></i> ${p.temp_c !== undefined ? p.temp_c.toFixed(2) : '--'}°C</span>
     </div>
     <div class="decoded-metrics-row">
@@ -3690,8 +3811,9 @@ const CSV_HEADERS = [
   'Accel X (g)', 'Accel Y (g)', 'Accel Z (g)',
   'Gyro X (°/s)', 'Gyro Y (°/s)', 'Gyro Z (°/s)',
   'Pitch (°)', 'Roll (°)', 'Yaw (°)',
-  'Pedometer Steps', 'Temp (°C)', 'Battery (V)', 'Battery (%)', 'UART Errors',
-  'Activity Mode', 'Payload Text', 'Raw Hex'
+  'Pedometer Steps', 'Temp (°C)', 'Battery (V)', 'Battery (%)',
+  'SD Log Bytes', 'Charging State', 'Charge Current (mA)', 'Energy Delivered (mWh)',
+  'UART Errors', 'Activity Mode', 'Payload Text', 'Raw Hex'
 ];
 
 function escapeCsvField(field) {
@@ -3725,6 +3847,10 @@ function buildCsvRow(p) {
     p.temp_c !== undefined ? p.temp_c : '',
     p.battery_v !== undefined ? p.battery_v : '',
     p.battery_pct !== undefined ? p.battery_pct : '',
+    p.file_bytes !== undefined ? p.file_bytes : '',
+    p.charging !== undefined ? p.charging : '',
+    p.chg_ma !== undefined ? p.chg_ma : '',
+    p.chg_mwh !== undefined ? p.chg_mwh : '',
     p.uart_errs !== undefined ? p.uart_errs : '',
     escapeCsvField(p.activity_mode || ''),
     escapeCsvField(p.payload_text || ''),
@@ -3781,8 +3907,8 @@ function startRecording() {
     recorderFilenameText.textContent = activeRecordingFileName;
   }
   if (btnRecordToggle) {
-    btnRecordToggle.className = 'btn btn-sm btn-record is-recording';
-    btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop & Save';
+    btnRecordToggle.className = 'btn btn-sm btn-danger btn-recording';
+    btnRecordToggle.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Recording';
   }
   if (btnExportCsv) btnExportCsv.removeAttribute('disabled');
 
@@ -3832,6 +3958,10 @@ function stopRecording() {
       temp_c: lastKnownChipTemp !== null ? lastKnownChipTemp.toFixed(2) : '',
       battery_v: extracted.battery_v || '',
       battery_pct: extracted.battery_pct || '',
+      file_bytes: extracted.file_bytes !== undefined ? extracted.file_bytes : latestPowerStats.file_bytes,
+      charging: extracted.charging !== undefined ? extracted.charging : latestPowerStats.charging,
+      chg_ma: extracted.chg_ma !== undefined ? extracted.chg_ma : latestPowerStats.chg_ma,
+      chg_mwh: extracted.chg_mwh !== undefined ? extracted.chg_mwh : latestPowerStats.chg_mwh,
       uart_errs: String(latestUartDiagnostics.frm + latestUartDiagnostics.ovr + latestUartDiagnostics.brk + latestUartDiagnostics.ring_drops + latestUartDiagnostics.cksum_err),
       activity_mode: extracted.activity_mode || 'Periodic Telemetry',
       payload_text: trimmed,
@@ -3990,8 +4120,12 @@ function toggleSimulatorStream() {
         const lat_e7 = Math.round(simLat * 1e7);
         const lon_e7 = Math.round(simLng * 1e7);
         const temp_cc = Math.round(simTempC * 100);
+        const simFileBytes = 1048576 + (count * 128);
+        const simCharging = count % 200 < 150 ? 1 : 0;
+        const simChgMa = simCharging === 1 ? Math.round(140 + Math.sin(count * 0.1) * 25) : -42;
+        const simChgMwh = Math.round(25 + (count * 0.05));
 
-        const periodicCsvLine = `${up_s},${testGpsFix},${lat_e7},${lon_e7},${testSatsTot},${testSatsUsed},${ax_mms2},${ay_mms2},${az_mms2},${gx_mdps},${gy_mdps},${gz_mdps},${simChars},${simSent},${simCksumErr},${simFrm},${simBrk},${simOvr},${simRingDrops},${battPct},${battMv},${temp_cc}\n`;
+        const periodicCsvLine = `${up_s},${testGpsFix},${lat_e7},${lon_e7},${testSatsTot},${testSatsUsed},${ax_mms2},${ay_mms2},${az_mms2},${gx_mdps},${gy_mdps},${gz_mdps},${simChars},${simSent},${simCksumErr},${simFrm},${simBrk},${simOvr},${simRingDrops},${battPct},${battMv},${temp_cc},${simFileBytes},${simCharging},${simChgMa},${simChgMwh}\n`;
         processRawUartChunk(periodicCsvLine, 'SIM_UART');
       }
 

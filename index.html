@@ -107,6 +107,21 @@
             <div class="battery-bar-fill" id="batteryLevelFill" style="width: 0%;"></div>
           </div>
           <div class="info-row">
+            <span class="label"><i class="fa-solid fa-bolt"></i> Solar / Charger</span>
+            <div class="battery-val-container">
+              <span class="pill pill-secondary pill-sm" id="chargingPill">--</span>
+              <span class="value" id="chargeCurrentValue">-- mA</span>
+            </div>
+          </div>
+          <div class="info-row">
+            <span class="label"><i class="fa-solid fa-battery-charging"></i> Energy Delivered</span>
+            <span class="valueHighlight energy-pill" id="chargeEnergyValue">-- mWh</span>
+          </div>
+          <div class="info-row">
+            <span class="label"><i class="fa-solid fa-sd-card"></i> SD Log Size</span>
+            <span class="value" id="sdFileSizeValue">--</span>
+          </div>
+          <div class="info-row">
             <span class="label"><i class="fa-solid fa-stopwatch"></i> System Uptime</span>
             <span class="value" id="uptimeValue">--:--:--</span>
           </div>
@@ -167,7 +182,7 @@
             <label for="decoderSelect">Telemetry Payload Decoder</label>
             <select id="decoderSelect" class="form-control">
               <option value="binary_0xaa" selected>Compressed Binary Frame (0xAA / 29-Byte)</option>
-              <option value="periodic_csv">Periodic CSV Snapshot (22-Field / 5.6s)</option>
+              <option value="periodic_csv">Periodic CSV Snapshot (26-Field / 5.6s)</option>
               <option value="auto_detect">Auto-Detect Format</option>
               <option value="raw_hex">Raw Byte Inspector</option>
             </select>

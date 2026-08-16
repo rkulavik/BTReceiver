@@ -489,6 +489,48 @@ body {
   padding: 0.1rem 0.4rem;
 }
 
+.energy-pill {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 0.1rem 0.45rem;
+  background: rgba(0, 198, 255, 0.12);
+  color: var(--primary);
+  border: 1px solid rgba(0, 198, 255, 0.25);
+}
+
+.charge-current-pos {
+  color: #38ef7d !important;
+  font-weight: 700;
+}
+
+.charge-current-neg {
+  color: #ffb703 !important;
+  font-weight: 600;
+}
+
+.charge-current-zero {
+  color: var(--text-muted) !important;
+}
+
+.pill-charging {
+  background: rgba(56, 239, 125, 0.2) !important;
+  color: #38ef7d !important;
+  border: 1px solid rgba(56, 239, 125, 0.4) !important;
+  box-shadow: 0 0 8px rgba(56, 239, 125, 0.25);
+  animation: pulse-green-subtle 2s infinite ease-in-out;
+}
+
+@keyframes pulse-green-subtle {
+  0%, 100% { box-shadow: 0 0 5px rgba(56, 239, 125, 0.2); }
+  50% { box-shadow: 0 0 12px rgba(56, 239, 125, 0.5); }
+}
+
+.pill-discharging {
+  background: rgba(255, 255, 255, 0.06) !important;
+  color: var(--text-muted) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
 .battery-bar-track {
   width: 100%;
   height: 4px;

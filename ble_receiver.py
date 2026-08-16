@@ -78,8 +78,8 @@ def decode_compressed_binary_frame(data: bytes):
 
 def decode_periodic_telemetry_csv(line: str):
     """
-    Decodes 22-field periodic telemetry snapshot CSV line (~5.6s cadence).
-    Format: up_s,gps_fix,lat_e7,lon_e7,sat_tot,sat_used,ax_mms2,ay_mms2,az_mms2,gx_mdps,gy_mdps,gz_mdps,chars,sent,cksum_err,frm,brk,ovr,ring_drops,batt_pct,batt_mv,temp_cc
+    Decodes 26-field periodic telemetry snapshot CSV line (~5.6s cadence).
+    Format: up_s,gps_fix,lat_e7,lon_e7,sat_tot,sat_used,ax_mms2,ay_mms2,az_mms2,gx_mdps,gy_mdps,gz_mdps,chars,sent,cksum_err,frm,brk,ovr,ring_drops,batt_pct,batt_mv,temp_cc,file_bytes,charging,chg_ma,chg_mwh
     """
     clean = line.strip()
     tokens = [t.strip() for t in clean.split(",") if len(t.strip()) > 0]
@@ -110,6 +110,10 @@ def decode_periodic_telemetry_csv(line: str):
         batt_pct = int(tokens[19]) if len(tokens) >= 20 else 0
         batt_mv = int(tokens[20]) if len(tokens) >= 21 else 3850
         temp_cc = int(tokens[21]) if len(tokens) >= 22 else 2500
+        file_bytes = int(tokens[22]) if len(tokens) >= 23 else 0
+        charging = int(tokens[23]) if len(tokens) >= 24 else 0
+        chg_ma = int(tokens[24]) if len(tokens) >= 25 else 0
+        chg_mwh = int(tokens[25]) if len(tokens) >= 26 else 0
 
         lat = lat_e7 / 1e7
         lon = lon_e7 / 1e7
@@ -118,6 +122,8 @@ def decode_periodic_telemetry_csv(line: str):
         temp_f = (temp_c * 9.0 / 5.0) + 32.0
 
         fix_str = f"3D Fix ({sat_used}/{sat_tot} Sats)" if gps_fix == 1 else f"Searching Fix ({sat_tot} Visible)"
+        chg_status_str = f"Charging ({'+' if chg_ma > 0 else ''}{chg_ma} mA)" if charging == 1 else f"Discharging / Idle ({chg_ma} mA)"
+        file_size_str = f"{file_bytes / (1024 * 1024):.2f} MB ({file_bytes:,} Bytes)" if file_bytes >= 1048576 else f"{file_bytes / 1024:.1f} KB ({file_bytes:,} Bytes)"
 
         print("*" * 70)
         print(f"      PERIODIC TELEMETRY SNAPSHOT (~5.6s)  |  Uptime: {up_s}s      ")
@@ -128,7 +134,9 @@ def decode_periodic_telemetry_csv(line: str):
         print(f" Peak Gyro (5.6s) : X: {gx_mdps} | Y: {gy_mdps} | Z: {gz_mdps} mdps")
         print(f" GPS UART Traffic : {chars:,} Bytes ({sent} Valid NMEA Sentences, {cksum_err} Checksum Errs)")
         print(f" UART Driver Errs : Framing: {frm} | Break: {brk} | Overrun: {ovr} | Ring Drops: {ring_drops}")
-        print(f" Power & Battery  : {batt_pct}% ({batt_v:.2f} V / {batt_mv} mV)")
+        print(f" Power & Battery  : {batt_pct}% ({batt_v:.2f} V / {batt_mv} mV) | {chg_status_str}")
+        print(f" Energy Delivered : {chg_mwh:,} mWh ({chg_mwh / 1000.0:.3f} Wh)")
+        print(f" SD Log File Size : {file_size_str}")
         print(f" Board Temp       : {temp_c:.2f} °C ({temp_f:.1f} °F)")
         print("*" * 70)
 

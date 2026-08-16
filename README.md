@@ -31,11 +31,11 @@ Transmitted for each FIFO sample batch (e.g. 52 Hz IMU window, indices 0..31):
 
 ---
 
-### 2. Periodic Telemetry Snapshot (22-Field CSV Row)
+### 2. Periodic Telemetry Snapshot (26-Field CSV Row)
 Transmitted automatically at the end of every IMU FIFO window (~5.6 seconds at 52 Hz) and saved to SD card as `TELEM-YYYYMMDD.csv`:
 
 ```text
-<up_s>,<gps_fix>,<lat_e7>,<lon_e7>,<sat_tot>,<sat_used>,<ax_mms2>,<ay_mms2>,<az_mms2>,<gx_mdps>,<gy_mdps>,<gz_mdps>,<chars>,<sent>,<cksum_err>,<frm>,<brk>,<ovr>,<ring_drops>,<batt_pct>,<batt_mv>,<temp_cc>\n
+<up_s>,<gps_fix>,<lat_e7>,<lon_e7>,<sat_tot>,<sat_used>,<ax_mms2>,<ay_mms2>,<az_mms2>,<gx_mdps>,<gy_mdps>,<gz_mdps>,<chars>,<sent>,<cksum_err>,<frm>,<brk>,<ovr>,<ring_drops>,<batt_pct>,<batt_mv>,<temp_cc>,<file_bytes>,<charging>,<chg_ma>,<chg_mwh>\n
 ```
 
 | Index | Field | Type | Scale / Units | Description |
@@ -58,6 +58,10 @@ Transmitted automatically at the end of every IMU FIFO window (~5.6 seconds at 5
 | `19` | `batt_pct` | `uint8_t` | `0 .. 100%` | Fuel-gauge battery percentage |
 | `20` | `batt_mv` | `uint16_t` | Millivolts | Battery voltage (`V = batt_mv / 1000.0`) |
 | `21` | `temp_cc` | `int16_t` | `°C × 100` | Board temperature (`°C = temp_cc / 100.0`) |
+| `22` | `file_bytes` | `uint32_t` | Bytes | Size in bytes of active `TELEM-*.csv` file on SD card |
+| `23` | `charging` | `int` | Flag (`0`/`1`) | `1` if actively charging (CC, CV, trickle), `0` if idle/discharging |
+| `24` | `chg_ma` | `int` | Milliamps | Real-time current (`>0` charging, `<0` discharging) |
+| `25` | `chg_mwh` | `uint32_t` | `mWh` | Cumulative energy delivered into battery since last reset |
 
 ---
 
