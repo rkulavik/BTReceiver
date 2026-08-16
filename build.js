@@ -16,6 +16,7 @@ fs.mkdirSync(distDir, { recursive: true });
 const entriesToCopy = [
   'index.html',
   'app.js',
+  'dsp-worker.js',
   'styles.css',
   'README.md'
 ];

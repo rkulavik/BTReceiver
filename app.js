@@ -585,6 +585,15 @@ const btnToggleFullWidth = document.getElementById('btnToggleFullWidth');
 const btnPauseStream = document.getElementById('btnPauseStream');
 const btnToggleAutoScroll = document.getElementById('btnToggleAutoScroll');
 
+// Stream Feed Mode & Header Elements (RAW vs DECODED vs HEX)
+const streamModeToggleGroup = document.getElementById('streamModeToggleGroup');
+const btnModeRaw = document.getElementById('btnModeRaw');
+const btnModeDecoded = document.getElementById('btnModeDecoded');
+const btnModeHex = document.getElementById('btnModeHex');
+const terminalFeedTitle = document.getElementById('terminalFeedTitle');
+const terminalModeBadge = document.getElementById('terminalModeBadge');
+let streamDisplayMode = localStorage.getItem('ranchbot_uart_display_mode') || 'raw';
+
 // CSV Stream Recorder Elements
 const btnRecordToggle = document.getElementById('btnRecordToggle');
 const btnSimulateStream = document.getElementById('btnSimulateStream');
@@ -608,6 +617,7 @@ const dashboardGrid = document.querySelector('.dashboard-grid');
 // ==========================================================================
 document.addEventListener('DOMContentLoaded', () => {
   loadSavedTareBiases();
+  initStreamDisplayMode();
   initDspWorker();
   initMap();
   initChart();
@@ -629,6 +639,56 @@ document.addEventListener('DOMContentLoaded', () => {
   
   logToConsole('system', 'Ranchbot Cow Tag Receiver: High-Performance Engine, Stream Issue Monitor & Zero-Hang View Switching ACTIVE.');
 });
+
+// ==========================================================================
+// Stream Feed Display Mode Controller (RAW vs DECODED vs HEX)
+// ==========================================================================
+function initStreamDisplayMode() {
+  const savedMode = localStorage.getItem('ranchbot_uart_display_mode') || 'raw';
+  setStreamDisplayMode(savedMode, false);
+}
+
+function setStreamDisplayMode(mode, logNotice = true) {
+  if (mode === 'text') mode = 'raw';
+  if (!['raw', 'decoded', 'hex'].includes(mode)) mode = 'raw';
+
+  streamDisplayMode = mode;
+  try {
+    localStorage.setItem('ranchbot_uart_display_mode', mode);
+  } catch (e) {}
+
+  if (btnModeRaw) btnModeRaw.classList.toggle('active', mode === 'raw');
+  if (btnModeDecoded) btnModeDecoded.classList.toggle('active', mode === 'decoded');
+  if (btnModeHex) btnModeHex.classList.toggle('active', mode === 'hex');
+
+  if (streamFormatSelect && streamFormatSelect.value !== mode) {
+    streamFormatSelect.value = mode;
+  }
+
+  if (terminalFeedTitle) {
+    if (mode === 'raw') {
+      terminalFeedTitle.textContent = 'Raw UART Stream / Received Bytes';
+    } else if (mode === 'decoded') {
+      terminalFeedTitle.textContent = 'Decoded IMU Data & Telemetry Stream (Live Numbers)';
+    } else if (mode === 'hex') {
+      terminalFeedTitle.textContent = 'Raw Hex Byte Stream (Inspector)';
+    }
+  }
+
+  if (terminalModeBadge) {
+    terminalModeBadge.className = `terminal-mode-pill mode-${mode}`;
+    terminalModeBadge.textContent = mode === 'raw' ? 'RAW STREAM' : (mode === 'decoded' ? 'DECODED IMU' : 'HEX BYTES');
+  }
+
+  if (logNotice) {
+    const labels = {
+      raw: 'RAW (Captured live UART text / binary packets as received)',
+      decoded: 'DECODED (Parsed IMU numbers, engineering units & telemetry values)',
+      hex: 'HEX (Raw hexadecimal byte stream inspector)'
+    };
+    logToConsole('system', `UART Feed Display Mode set to: ${labels[mode] || mode}`);
+  }
+}
 
 // ==========================================================================
 // Page Visibility Power Caching
@@ -756,6 +816,20 @@ function setupEventListeners() {
   if (btnExportCsv) btnExportCsv.addEventListener('click', exportCsv);
   if (btnClearCsv) btnClearCsv.addEventListener('click', clearCsvBuffer);
   if (btnToggleFullWidth) btnToggleFullWidth.addEventListener('click', toggleFullWidthStream);
+
+  if (streamModeToggleGroup) {
+    streamModeToggleGroup.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-mode]');
+      if (!btn) return;
+      setStreamDisplayMode(btn.dataset.mode, true);
+    });
+  }
+
+  if (streamFormatSelect) {
+    streamFormatSelect.addEventListener('change', () => {
+      setStreamDisplayMode(streamFormatSelect.value, true);
+    });
+  }
 }
 
 // ==========================================================================
@@ -2765,6 +2839,22 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
     const timeStr = new Date().toLocaleTimeString();
     addChartData(timeStr, orientation.ax, orientation.ay, orientation.az, orientation.gx, orientation.gy, orientation.gz);
 
+    // Stream Mode Routing: RAW vs DECODED vs HEX
+    if (streamDisplayMode === 'raw') {
+      logToConsole('uart-text', `[${source}:29B] Sample #${sampleIdx} (t=${timestampMs}ms) Ax=${rawAxInt} Ay=${rawAyInt} Az=${rawAzInt} Gx=${rawGxInt} Gy=${rawGyInt} Gz=${rawGzInt} Steps=${totalSteps} Temp=${tempC.toFixed(1)}C`);
+    } else if (streamDisplayMode === 'hex') {
+      logToConsole('raw-hex', `[${source}:HEX] ${rawHexStr}`);
+    } else if (streamDisplayMode === 'decoded') {
+      logDecodedBinaryFrame({
+        sampleIdx, timestampMs,
+        rawAxInt, rawAyInt, rawAzInt,
+        rawGxInt, rawGyInt, rawGzInt,
+        orientation, pitchDeg, rollDeg, yawDeg,
+        stepDetected, totalSteps,
+        tempC, tempF, rawHexStr
+      }, source);
+    }
+
     if (isRecording) {
       writeRecordToFileAndBuffer({
         timestamp_iso: new Date().toISOString(),
@@ -2812,7 +2902,8 @@ function parseTextTelemetry(line) {
     gyro_x: '', gyro_y: '', gyro_z: '',
     pitch: '', roll: '', yaw: '',
     battery_v: '', battery_pct: '',
-    activity_mode: '', has_imu_data: false
+    activity_mode: '', has_imu_data: false,
+    is_periodic_telemetry: false
   };
 
   if (!line || typeof line !== 'string') return res;
@@ -2873,9 +2964,7 @@ function parseTextTelemetry(line) {
     const gy_dps = (gy_mdps / 1000.0).toFixed(1);
     const gz_dps = (gz_mdps / 1000.0).toFixed(1);
 
-    // ========================================================================
     // Real-Time Alarms Matching Inbound UART Transmission Metrics
-    // ========================================================================
     if (frm > 0 && frm !== latestUartDiagnostics.frm) {
       recordStreamIssue('uart', 'error', `UART Framing Errors: ${frm} signal integrity / baud rate mismatch errors`, cleanLine);
     }
@@ -2931,14 +3020,36 @@ function parseTextTelemetry(line) {
       updateGPSPosition(lat, lon, 412.0, 1.2);
     }
 
+    res.is_periodic_telemetry = true;
+    res.up_s = up_s;
+    res.gps_fix = gps_fix;
+    res.sat_tot = sat_tot;
+    res.sat_used = sat_used;
+    res.ax_mms2 = ax_mms2;
+    res.ay_mms2 = ay_mms2;
+    res.az_mms2 = az_mms2;
+    res.gx_mdps = gx_mdps;
+    res.gy_mdps = gy_mdps;
+    res.gz_mdps = gz_mdps;
+    res.chars = chars;
+    res.sent = sent;
+    res.cksum_err = cksum_err;
+    res.frm = frm;
+    res.brk = brk;
+    res.ovr = ovr;
+    res.ring_drops = ring_drops;
+    res.batt_pct = batt_pct;
+    res.batt_mv = batt_mv;
+    res.batt_v = battV;
+    res.temp_c = tempC;
+    res.temp_f = tempF;
+    res.temp_cc = temp_cc;
     res.accel_x = ax_g;
     res.accel_y = ay_g;
     res.accel_z = az_g;
     res.gyro_x = gx_dps;
     res.gyro_y = gy_dps;
     res.gyro_z = gz_dps;
-    res.battery_v = battV;
-    res.battery_pct = String(batt_pct);
     res.activity_mode = `Periodic Telemetry (${up_s}s)`;
 
     // Push peak motion to chart
@@ -3086,7 +3197,6 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
   }
 
   const rawHexStr = hexBytes.join(' ');
-  const displayFormat = streamFormatSelect ? streamFormatSelect.value : 'text';
 
   // Process text lines (e.g. Periodic Telemetry CSV, NMEA, or debug logs)
   if (textChunk) {
@@ -3097,10 +3207,24 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
     for (const line of lines) {
       const trimmed = line.trim();
       if (trimmed.length > 0) {
-        if (displayFormat !== 'hex') logToConsole('uart-text', `[${source}] ${trimmed}`);
         packetCounter++;
         packetCountEl.textContent = packetCounter;
         const extracted = parseTextTelemetry(trimmed);
+
+        // Stream Mode Display Routing: RAW vs DECODED vs HEX
+        if (streamDisplayMode === 'raw') {
+          logToConsole('uart-text', `[${source}] ${trimmed}`);
+        } else if (streamDisplayMode === 'hex') {
+          logToConsole('raw-hex', `[${source}:HEX] ${rawHexStr || trimmed}`);
+        } else if (streamDisplayMode === 'decoded') {
+          if (extracted.is_periodic_telemetry) {
+            logDecodedPeriodicTelemetry(extracted, source);
+          } else if (extracted.has_imu_data) {
+            logDecodedImuTelemetry(extracted, source);
+          } else {
+            logToConsole('uart-text', `[${source}] ${trimmed}`);
+          }
+        }
 
         if (isRecording) {
           writeRecordToFileAndBuffer({
@@ -3162,6 +3286,160 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
       uartByteRingBuffer = uartByteRingBuffer.slice(syncIdx + 29);
     }
   }
+}
+
+// ==========================================================================
+// Decoded Telemetry Formatters for Real-Time Console
+// ==========================================================================
+function logDecodedPeriodicTelemetry(p, source = 'SERIAL') {
+  if (!terminalLog) return;
+  const time = new Date().toLocaleTimeString();
+  const entry = document.createElement('div');
+  entry.className = 'log-entry decoded telemetry';
+
+  const numAx = parseFloat(p.accel_x) || 0;
+  const numAy = parseFloat(p.accel_y) || 0;
+  const numAz = parseFloat(p.accel_z) || 0;
+  const totalG = Math.sqrt(numAx * numAx + numAy * numAy + numAz * numAz).toFixed(3);
+  const fixText = p.gps_fix === 1 ? `3D Fix (${p.sat_used}/${p.sat_tot} Sats)` : `Searching (${p.sat_tot} Visible)`;
+  const coordsText = (p.lat && p.lng && (Math.abs(parseFloat(p.lat)) > 0.0001 || Math.abs(parseFloat(p.lng)) > 0.0001)) ? `${parseFloat(p.lat).toFixed(6)}°, ${parseFloat(p.lng).toFixed(6)}°` : 'No GPS Fix';
+  const totalUartErrs = (p.frm || 0) + (p.ovr || 0) + (p.brk || 0) + (p.ring_drops || 0) + (p.cksum_err || 0);
+
+  entry.innerHTML = `
+    <div class="decoded-entry-header">
+      <span class="decoded-badge badge-telemetry"><i class="fa-solid fa-satellite-dish"></i> 22-FIELD TELEMETRY [${source}]</span>
+      <span class="decoded-time">[${time}]</span>
+      <span class="decoded-pill"><i class="fa-solid fa-stopwatch"></i> Up: ${p.up_s}s</span>
+      <span class="decoded-pill"><i class="fa-solid fa-battery-three-quarters"></i> ${p.batt_pct}% (${p.batt_v}V)</span>
+      <span class="decoded-pill"><i class="fa-solid fa-temperature-half"></i> ${p.temp_c !== undefined ? p.temp_c.toFixed(2) : '--'}°C</span>
+    </div>
+    <div class="decoded-metrics-row">
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-gauge"></i> IMU Accel:</span>
+        <span class="d-val d-ax">X: ${numAx >= 0 ? '+' : ''}${p.accel_x}g <small>(${p.ax_mms2} mm/s²)</small></span>
+        <span class="d-val d-ay">Y: ${numAy >= 0 ? '+' : ''}${p.accel_y}g <small>(${p.ay_mms2} mm/s²)</small></span>
+        <span class="d-val d-az">Z: ${numAz >= 0 ? '+' : ''}${p.accel_z}g <small>(${p.az_mms2} mm/s²)</small></span>
+        <span class="d-val d-mag">|A|: ${totalG}g</span>
+      </div>
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-compass"></i> IMU Gyro:</span>
+        <span class="d-val d-gx">X: ${parseFloat(p.gyro_x) >= 0 ? '+' : ''}${p.gyro_x}°/s <small>(${p.gx_mdps} mdps)</small></span>
+        <span class="d-val d-gy">Y: ${parseFloat(p.gyro_y) >= 0 ? '+' : ''}${p.gyro_y}°/s <small>(${p.gy_mdps} mdps)</small></span>
+        <span class="d-val d-gz">Z: ${parseFloat(p.gyro_z) >= 0 ? '+' : ''}${p.gyro_z}°/s <small>(${p.gz_mdps} mdps)</small></span>
+      </div>
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-location-dot"></i> GPS &amp; Link:</span>
+        <span class="d-val">${fixText} • ${coordsText}</span>
+        <span class="d-val" style="color:${totalUartErrs > 0 ? '#ff4d6d' : '#38ef7d'};">UART: ${totalUartErrs} Errs (${(p.chars || 0).toLocaleString()} B rx)</span>
+      </div>
+    </div>
+  `;
+
+  terminalLog.appendChild(entry);
+  while (terminalLog.childNodes.length > MAX_TERMINAL_LOG_ENTRIES) {
+    terminalLog.removeChild(terminalLog.firstChild);
+  }
+  if (autoScroll) terminalLog.scrollTop = terminalLog.scrollHeight;
+}
+
+function logDecodedBinaryFrame(data, source = 'BLE') {
+  if (!terminalLog) return;
+  const time = new Date().toLocaleTimeString();
+  const entry = document.createElement('div');
+  entry.className = 'log-entry decoded binary';
+
+  const { sampleIdx, timestampMs, rawAxInt, rawAyInt, rawAzInt, rawGxInt, rawGyInt, rawGzInt, orientation, pitchDeg, rollDeg, yawDeg, stepDetected, totalSteps, tempC } = data;
+  const stepLabel = stepDetected === 1 ? '<span style="color:#38ef7d; font-weight:700;">● STEP DETECTED</span>' : 'None';
+  const axMms2 = Math.round(orientation.ax * 9806.65);
+  const ayMms2 = Math.round(orientation.ay * 9806.65);
+  const azMms2 = Math.round(orientation.az * 9806.65);
+  const gxMdps = Math.round(orientation.gx * 1000);
+  const gyMdps = Math.round(orientation.gy * 1000);
+  const gzMdps = Math.round(orientation.gz * 1000);
+
+  const battVal = batteryValueEl && batteryValueEl.textContent !== '-- V' ? batteryValueEl.textContent : '';
+  const battPct = batteryPillEl && batteryPillEl.textContent !== '--%' ? batteryPillEl.textContent : '';
+
+  entry.innerHTML = `
+    <div class="decoded-entry-header">
+      <span class="decoded-badge badge-binary"><i class="fa-solid fa-microchip"></i> 29B BINARY IMU [${source}] • #${sampleIdx}/31</span>
+      <span class="decoded-time">[${time}]</span>
+      <span class="decoded-pill"><i class="fa-solid fa-stopwatch"></i> Up: ${timestampMs}ms (${(timestampMs / 1000).toFixed(2)}s)</span>
+      <span class="decoded-pill"><i class="fa-solid fa-shoe-prints"></i> ${totalSteps.toLocaleString()} Steps</span>
+      <span class="decoded-pill"><i class="fa-solid fa-temperature-half"></i> ${tempC.toFixed(2)}°C</span>
+      ${battPct ? `<span class="decoded-pill"><i class="fa-solid fa-battery-three-quarters"></i> ${battPct} (${battVal})</span>` : ''}
+    </div>
+    <div class="decoded-metrics-row">
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-gauge"></i> IMU Accel:</span>
+        <span class="d-val d-ax">X: ${orientation.ax >= 0 ? '+' : ''}${orientation.ax.toFixed(3)}g <small>(${rawAxInt} LSB / ${axMms2} mm/s²)</small></span>
+        <span class="d-val d-ay">Y: ${orientation.ay >= 0 ? '+' : ''}${orientation.ay.toFixed(3)}g <small>(${rawAyInt} LSB / ${ayMms2} mm/s²)</small></span>
+        <span class="d-val d-az">Z: ${orientation.az >= 0 ? '+' : ''}${orientation.az.toFixed(3)}g <small>(${rawAzInt} LSB / ${azMms2} mm/s²)</small></span>
+        <span class="d-val d-mag">|A|: ${orientation.totalG.toFixed(3)}g</span>
+      </div>
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-compass"></i> IMU Gyro:</span>
+        <span class="d-val d-gx">X: ${orientation.gx >= 0 ? '+' : ''}${orientation.gx.toFixed(1)}°/s <small>(${rawGxInt} LSB / ${gxMdps} mdps)</small></span>
+        <span class="d-val d-gy">Y: ${orientation.gy >= 0 ? '+' : ''}${orientation.gy.toFixed(1)}°/s <small>(${rawGyInt} LSB / ${gyMdps} mdps)</small></span>
+        <span class="d-val d-gz">Z: ${orientation.gz >= 0 ? '+' : ''}${orientation.gz.toFixed(1)}°/s <small>(${rawGzInt} LSB / ${gzMdps} mdps)</small></span>
+      </div>
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-arrows-spin"></i> Attitude &amp; Mot:</span>
+        <span class="d-val d-pitch">Pitch: ${pitchDeg}°</span>
+        <span class="d-val d-roll">Roll: ${rollDeg}°</span>
+        <span class="d-val d-yaw">Yaw: ${yawDeg}°</span>
+        <span class="d-val">Pedometer: ${stepLabel}</span>
+      </div>
+    </div>
+  `;
+
+  terminalLog.appendChild(entry);
+  while (terminalLog.childNodes.length > MAX_TERMINAL_LOG_ENTRIES) {
+    terminalLog.removeChild(terminalLog.firstChild);
+  }
+  if (autoScroll) terminalLog.scrollTop = terminalLog.scrollHeight;
+}
+
+function logDecodedImuTelemetry(p, source = 'SERIAL') {
+  if (!terminalLog) return;
+  const time = new Date().toLocaleTimeString();
+  const entry = document.createElement('div');
+  entry.className = 'log-entry decoded imu';
+
+  entry.innerHTML = `
+    <div class="decoded-entry-header">
+      <span class="decoded-badge badge-imu"><i class="fa-solid fa-compass"></i> ${p.activity_mode || '$IMU DATA'} [${source}]</span>
+      <span class="decoded-time">[${time}]</span>
+      ${p.battery_v ? `<span class="decoded-pill"><i class="fa-solid fa-battery-three-quarters"></i> ${p.battery_pct ? p.battery_pct + '%' : ''} (${p.battery_v}V)</span>` : ''}
+    </div>
+    <div class="decoded-metrics-row">
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-gauge"></i> IMU Accel:</span>
+        <span class="d-val d-ax">X: ${p.accel_x || '0.00'}g</span>
+        <span class="d-val d-ay">Y: ${p.accel_y || '0.00'}g</span>
+        <span class="d-val d-az">Z: ${p.accel_z || '1.00'}g</span>
+      </div>
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-compass"></i> IMU Gyro:</span>
+        <span class="d-val d-gx">X: ${p.gyro_x || '0.0'}°/s</span>
+        <span class="d-val d-gy">Y: ${p.gyro_y || '0.0'}°/s</span>
+        <span class="d-val d-gz">Z: ${p.gyro_z || '0.0'}°/s</span>
+      </div>
+      ${(p.pitch || p.roll || p.yaw) ? `
+      <div class="decoded-metric-group">
+        <span class="d-label"><i class="fa-solid fa-arrows-spin"></i> Attitude:</span>
+        <span class="d-val d-pitch">Pitch: ${p.pitch || '0.0'}°</span>
+        <span class="d-val d-roll">Roll: ${p.roll || '0.0'}°</span>
+        <span class="d-val d-yaw">Yaw: ${p.yaw || '0.0'}°</span>
+      </div>` : ''}
+    </div>
+  `;
+
+  terminalLog.appendChild(entry);
+  while (terminalLog.childNodes.length > MAX_TERMINAL_LOG_ENTRIES) {
+    terminalLog.removeChild(terminalLog.firstChild);
+  }
+  if (autoScroll) terminalLog.scrollTop = terminalLog.scrollHeight;
 }
 
 // ==========================================================================

@@ -158,9 +158,9 @@
           <div class="form-group">
             <label for="streamFormatSelect">UART Feed Display Mode</label>
             <select id="streamFormatSelect" class="form-control">
-              <option value="text" selected>Raw ASCII / Text Stream</option>
+              <option value="raw" selected>Raw UART / Text Stream</option>
+              <option value="decoded">Decoded IMU &amp; Telemetry Numbers</option>
               <option value="hex">Raw Hex Bytes Inspector</option>
-              <option value="decoded">Decoded Payload Fields</option>
             </select>
           </div>
           <div class="form-group">
@@ -634,8 +634,20 @@
       <!-- Right Panel: Packet Telemetry Console & Raw Hex Payload Inspector -->
       <aside class="card console-card" id="consoleCard">
         <div class="card-header">
-          <h2><i class="fa-solid fa-terminal"></i> Live Raw UART Feed & Telemetry</h2>
+          <h2><i class="fa-solid fa-terminal"></i> Live UART Feed &amp; Telemetry</h2>
           <div class="header-actions">
+            <!-- Mode Toggle Group: RAW vs DECODED vs HEX -->
+            <div class="btn-group stream-mode-group" id="streamModeToggleGroup" role="group" aria-label="UART Feed Display Mode">
+              <button class="btn btn-sm active" id="btnModeRaw" data-mode="raw" title="Display raw inbound UART stream as captured">
+                <i class="fa-solid fa-code"></i> RAW
+              </button>
+              <button class="btn btn-sm" id="btnModeDecoded" data-mode="decoded" title="Display decoded engineering values and IMU numbers">
+                <i class="fa-solid fa-calculator"></i> DECODED
+              </button>
+              <button class="btn btn-sm" id="btnModeHex" data-mode="hex" title="Display raw hex byte inspector">
+                <i class="fa-solid fa-binary"></i> HEX
+              </button>
+            </div>
             <button class="btn btn-sm btn-icon" id="btnPauseStream" title="Pause / Resume Live Feed Stream">
               <i class="fa-solid fa-pause"></i>
             </button>
@@ -731,7 +743,8 @@
             <div class="terminal-wrapper">
               <div class="terminal-header">
                 <span>Time</span>
-                <span>Raw UART Stream / Received Bytes</span>
+                <span id="terminalFeedTitle">Raw UART Stream / Received Bytes</span>
+                <span class="terminal-mode-pill mode-raw" id="terminalModeBadge">RAW</span>
               </div>
               <div class="terminal-log" id="terminalLog">
                 <div class="log-entry system">[SYSTEM] Ready for device feed. Click "Connect Serial / UART" (USB) or "Connect Ear Tag" (BLE).</div>
