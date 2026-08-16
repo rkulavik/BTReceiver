@@ -3083,7 +3083,7 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
         timestamp_local: new Date().toLocaleString(),
         packet_number: packetCounter,
         source: source,
-        tag_id: cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'COMPRESSED-TAG',
+        tag_id: cowTagIdEl && cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'COMPRESSED-TAG',
         data_type: 'BINARY_29B_FRAME',
         uptime_s: (timestampMs / 1000).toFixed(3),
         lat: lastValidGPS ? lastValidGPS.lat.toFixed(6) : '',
@@ -3101,8 +3101,8 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
         yaw: yawDeg,
         steps: String(totalSteps),
         temp_c: tempC.toFixed(2),
-        battery_v: batteryValueEl.textContent.replace(' V', '').replace('--', ''),
-        battery_pct: batteryPillEl.textContent.replace('%', '').replace('--', ''),
+        battery_v: batteryValueEl ? batteryValueEl.textContent.replace(' V', '').replace('--', '') : '',
+        battery_pct: batteryPillEl ? batteryPillEl.textContent.replace('%', '').replace('--', '') : '',
         uart_errs: String(latestUartDiagnostics.frm + latestUartDiagnostics.ovr + latestUartDiagnostics.brk + latestUartDiagnostics.ring_drops + latestUartDiagnostics.cksum_err),
         activity_mode: actStr,
         payload_text: `idx=${sampleIdx}, t=${timestampMs}ms, steps=${totalSteps}, temp=${tempC.toFixed(2)}C`,
@@ -3951,7 +3951,16 @@ function escapeCsvField(field) {
   return `"${String(field).replace(/"/g, '""')}"`;
 }
 
+function escapeCsvField(field) {
+  if (field === null || field === undefined) return '""';
+  if (typeof field === 'object') {
+    try { return `"${JSON.stringify(field).replace(/"/g, '""')}"`; } catch (e) { return '""'; }
+  }
+  return `"${String(field).replace(/"/g, '""')}"`;
+}
+
 function buildCsvRow(p) {
+  if (!p) return '';
   return [
     escapeCsvField(p.timestamp_iso || new Date().toISOString()),
     escapeCsvField(p.timestamp_local || new Date().toLocaleString()),
@@ -3981,7 +3990,7 @@ function buildCsvRow(p) {
     p.charging !== undefined ? p.charging : '',
     p.chg_ma !== undefined ? p.chg_ma : '',
     p.chg_mwh !== undefined ? p.chg_mwh : '',
-    p.uart_errs !== undefined ? p.uart_errs : '',
+    p.uart_errs !== undefined ? escapeCsvField(p.uart_errs) : '',
     escapeCsvField(p.activity_mode || ''),
     escapeCsvField(p.payload_text || ''),
     escapeCsvField(p.raw_hex || '')
@@ -3990,7 +3999,7 @@ function buildCsvRow(p) {
 
 function downloadCsvFile(filename, records) {
   if (!records || records.length === 0) {
-    alert('No telemetry records captured to export.');
+    logToConsole('warn', 'No telemetry records captured to export.');
     return;
   }
 
@@ -4001,39 +4010,44 @@ function downloadCsvFile(filename, records) {
   if (recorderStatusText) recorderStatusText.textContent = 'EXPORTING...';
   
   function processChunk() {
-    const end = Math.min(records.length, idx + CHUNK_SIZE);
-    const sliceLines = [];
-    for (let i = idx; i < end; i++) {
-      sliceLines.push(buildCsvRow(records[i]));
-    }
-    chunks.push(sliceLines.join('\r\n') + (end < records.length ? '\r\n' : ''));
-    idx = end;
+    try {
+      const end = Math.min(records.length, idx + CHUNK_SIZE);
+      const sliceLines = [];
+      for (let i = idx; i < end; i++) {
+        sliceLines.push(buildCsvRow(records[i]));
+      }
+      chunks.push(sliceLines.join('\r\n') + (end < records.length ? '\r\n' : ''));
+      idx = end;
 
-    if (recorderStatusText) {
-      const pct = Math.round((idx / records.length) * 100);
-      recorderStatusText.textContent = `EXPORTING (${pct}%)...`;
-    }
+      if (recorderStatusText) {
+        const pct = Math.round((idx / records.length) * 100);
+        recorderStatusText.textContent = `EXPORTING (${pct}%)...`;
+      }
 
-    if (idx < records.length) {
-      setTimeout(processChunk, 0); // Yield to browser event loop
-    } else {
-      const blob = new Blob(chunks, { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      const outName = filename || `compressed_telemetry_${Date.now()}.csv`;
-      link.style.display = 'none';
-      link.setAttribute('href', url);
-      link.setAttribute('download', outName);
-      document.body.appendChild(link);
-      link.click();
+      if (idx < records.length) {
+        setTimeout(processChunk, 0); // Yield to browser event loop
+      } else {
+        const blob = new Blob(chunks, { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        const outName = filename || `compressed_telemetry_${Date.now()}.csv`;
+        link.style.display = 'none';
+        link.setAttribute('href', url);
+        link.setAttribute('download', outName);
+        document.body.appendChild(link);
+        link.click();
 
-      setTimeout(() => {
-        if (link.parentNode) link.parentNode.removeChild(link);
-        URL.revokeObjectURL(url);
-      }, 1000);
+        setTimeout(() => {
+          if (link.parentNode) link.parentNode.removeChild(link);
+          URL.revokeObjectURL(url);
+        }, 1000);
 
-      if (recorderStatusText) recorderStatusText.textContent = isRecording ? 'RECORDING...' : 'REC IDLE';
-      logToConsole('system', `✓ FILE SAVED & DOWNLOADED: "${outName}" (${records.length.toLocaleString()} records).`);
+        if (recorderStatusText) recorderStatusText.textContent = isRecording ? 'RECORDING...' : 'REC IDLE';
+        logToConsole('system', `✓ FILE SAVED & DOWNLOADED: "${outName}" (${records.length.toLocaleString()} records).`);
+      }
+    } catch (chunkErr) {
+      console.error('CSV chunk export error:', chunkErr);
+      if (recorderStatusText) recorderStatusText.textContent = 'REC IDLE';
     }
   }
 
@@ -4074,82 +4088,99 @@ function startRecording() {
   logToConsole('system', `● STREAM RECORDING STARTED: Saving incoming telemetry to "${activeRecordingFileName}"...`);
 }
 
+let lastRecorderStatsUpdate = 0;
 function writeRecordToFileAndBuffer(recordItem) {
   if (!isRecording) return;
   recordedPackets.push(recordItem);
-  updateRecorderStats();
+  const now = Date.now();
+  if (now - lastRecorderStatsUpdate > 250) {
+    lastRecorderStatsUpdate = now;
+    updateRecorderStats();
+  }
 }
 
 function stopRecording() {
   if (!isRecording) return;
-
-  // Flush any remaining buffered line in serialLineBuffer
-  if (serialLineBuffer && serialLineBuffer.trim().length > 0) {
-    const trimmed = serialLineBuffer.trim();
-    serialLineBuffer = '';
-    const extracted = parseTextTelemetry(trimmed);
-    recordedPackets.push({
-      timestamp_iso: new Date().toISOString(),
-      timestamp_local: new Date().toLocaleString(),
-      packet_number: ++packetCounter,
-      source: 'UART',
-      tag_id: extracted.tag_id || (cowTagIdEl && cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UART-FEED'),
-      data_type: 'UART_PERIODIC_CSV',
-      uptime_s: String(lastKnownUptimeSec || ''),
-      lat: extracted.lat || '',
-      lng: extracted.lng || '',
-      gps_fix: lastKnownGpsFix ? '1' : '0',
-      sats: `${lastKnownSats.used}/${lastKnownSats.total}`,
-      accel_x: extracted.accel_x || '',
-      accel_y: extracted.accel_y || '',
-      accel_z: extracted.accel_z || '',
-      gyro_x: extracted.gyro_x || '',
-      gyro_y: extracted.gyro_y || '',
-      gyro_z: extracted.gyro_z || '',
-      pitch: extracted.pitch || '',
-      roll: extracted.roll || '',
-      yaw: extracted.yaw || '',
-      steps: String(lastCumulativeSteps || 0),
-      temp_c: lastKnownChipTemp !== null ? lastKnownChipTemp.toFixed(2) : '',
-      battery_v: extracted.battery_v || '',
-      battery_pct: extracted.battery_pct || '',
-      file_bytes: extracted.file_bytes !== undefined ? extracted.file_bytes : latestPowerStats.file_bytes,
-      charging: extracted.charging !== undefined ? extracted.charging : latestPowerStats.charging,
-      chg_ma: extracted.chg_ma !== undefined ? extracted.chg_ma : latestPowerStats.chg_ma,
-      chg_mwh: extracted.chg_mwh !== undefined ? extracted.chg_mwh : latestPowerStats.chg_mwh,
-      uart_errs: String(latestUartDiagnostics.frm + latestUartDiagnostics.ovr + latestUartDiagnostics.brk + latestUartDiagnostics.ring_drops + latestUartDiagnostics.cksum_err),
-      activity_mode: extracted.activity_mode || 'Periodic Telemetry',
-      payload_text: trimmed,
-      raw_hex: ''
-    });
-  }
-
   isRecording = false;
 
-  if (recordingTimerInterval) {
-    clearInterval(recordingTimerInterval);
-    recordingTimerInterval = null;
-  }
+  try {
+    if (recordingTimerInterval) {
+      clearInterval(recordingTimerInterval);
+      recordingTimerInterval = null;
+    }
 
-  if (recorderBadge) {
-    recorderBadge.className = 'recorder-status-badge stopped';
-    recorderStatusText.textContent = 'REC IDLE';
-  }
-  if (btnRecordToggle) {
-    btnRecordToggle.className = 'btn btn-sm btn-record';
-    btnRecordToggle.innerHTML = '<i class="fa-solid fa-circle"></i> Start Recording';
-  }
+    if (recorderBadge) {
+      recorderBadge.className = 'recorder-status-badge stopped';
+      recorderStatusText.textContent = 'REC IDLE';
+    }
+    if (btnRecordToggle) {
+      btnRecordToggle.className = 'btn btn-sm btn-record';
+      btnRecordToggle.innerHTML = '<i class="fa-solid fa-circle"></i> Start Recording';
+    }
 
-  const recordCount = recordedPackets.length;
-  if (recordCount > 0) {
-    downloadCsvFile(activeRecordingFileName, recordedPackets);
-  } else {
-    alert('No telemetry records were captured during the recording session.');
-  }
+    // Flush any remaining buffered line in serialLineBuffer
+    if (serialLineBuffer && serialLineBuffer.trim().length > 0) {
+      const trimmed = serialLineBuffer.trim();
+      serialLineBuffer = '';
+      try {
+        const extracted = parseTextTelemetry(trimmed);
+        recordedPackets.push({
+          timestamp_iso: new Date().toISOString(),
+          timestamp_local: new Date().toLocaleString(),
+          packet_number: ++packetCounter,
+          source: 'UART',
+          tag_id: extracted.tag_id || (cowTagIdEl && cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UART-FEED'),
+          data_type: 'UART_PERIODIC_CSV',
+          uptime_s: String(lastKnownUptimeSec || ''),
+          lat: extracted.lat || '',
+          lng: extracted.lng || '',
+          gps_fix: lastKnownGpsFix ? '1' : '0',
+          sats: `${lastKnownSats.used}/${lastKnownSats.total}`,
+          accel_x: extracted.accel_x || '',
+          accel_y: extracted.accel_y || '',
+          accel_z: extracted.accel_z || '',
+          gyro_x: extracted.gyro_x || '',
+          gyro_y: extracted.gyro_y || '',
+          gyro_z: extracted.gyro_z || '',
+          pitch: extracted.pitch || '',
+          roll: extracted.roll || '',
+          yaw: extracted.yaw || '',
+          steps: String(lastCumulativeSteps || 0),
+          temp_c: lastKnownChipTemp !== null ? lastKnownChipTemp.toFixed(2) : '',
+          battery_v: extracted.battery_v || '',
+          battery_pct: extracted.battery_pct || '',
+          file_bytes: extracted.file_bytes !== undefined ? extracted.file_bytes : latestPowerStats.file_bytes,
+          charging: extracted.charging !== undefined ? extracted.charging : latestPowerStats.charging,
+          chg_ma: extracted.chg_ma !== undefined ? extracted.chg_ma : latestPowerStats.chg_ma,
+          chg_mwh: extracted.chg_mwh !== undefined ? extracted.chg_mwh : latestPowerStats.chg_mwh,
+          uart_errs: String(latestUartDiagnostics.frm + latestUartDiagnostics.ovr + latestUartDiagnostics.brk + latestUartDiagnostics.ring_drops + latestUartDiagnostics.cksum_err),
+          activity_mode: extracted.activity_mode || 'Periodic Telemetry',
+          payload_text: trimmed,
+          raw_hex: ''
+        });
+      } catch (e) {}
+    }
 
-  if (recorderFilePill) {
-    recorderFilePill.classList.remove('active');
-    recorderFilenameText.textContent = recordCount > 0 ? `Saved: ${activeRecordingFileName}` : 'No file selected';
+    const recordCount = recordedPackets.length;
+    if (recordCount > 0) {
+      downloadCsvFile(activeRecordingFileName, recordedPackets);
+      logToConsole('system', `■ STREAM RECORDING STOPPED: Captured ${recordCount.toLocaleString()} packets to "${activeRecordingFileName}".`);
+    } else {
+      logToConsole('warn', 'Recording stopped: No packets were received during the session.');
+    }
+
+    if (recorderFilePill) {
+      recorderFilePill.classList.remove('active');
+      if (recorderFilenameText) {
+        recorderFilenameText.textContent = recordCount > 0 ? `Saved: ${activeRecordingFileName}` : 'No file selected';
+      }
+    }
+
+    updateRecorderTimerDisplay();
+    updateRecorderStats();
+  } catch (err) {
+    console.error('stopRecording error:', err);
+    logToConsole('error', `Error stopping recording: ${err.message}`);
   }
 }
 
