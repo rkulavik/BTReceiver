@@ -79,6 +79,18 @@
       </button>
     </nav>
 
+    <!-- Ambient Replay Mode Banner (Visible when CSV file loaded) -->
+    <div class="ambient-replay-banner" id="ambientReplayBanner" style="display: none;">
+      <div class="replay-banner-content">
+        <span class="replay-pulse-dot"></span>
+        <span class="replay-banner-title"><i class="fa-solid fa-film"></i> CSV REPLAY MODE:</span>
+        <span class="replay-banner-file" id="replayBannerFilename">No File Loaded</span>
+      </div>
+      <button class="btn btn-sm btn-replay-exit" id="btnExitReplay" title="Exit replay mode and return to live stream">
+        <i class="fa-solid fa-arrow-right-from-bracket"></i> Exit Replay
+      </button>
+    </div>
+
     <!-- Main Dashboard Grid -->
     <main class="dashboard-grid">
       <!-- Left Sidebar: Cattle Tag Specs & Device Info -->
@@ -154,7 +166,10 @@
           </div>
           <div class="info-row">
             <span class="label">Packets Recv</span>
-            <span class="value" id="packetCount">0</span>
+            <div class="packet-val-container">
+              <span class="stream-heartbeat" id="streamHeartbeat" title="Live telemetry packet stream heartbeat"></span>
+              <span class="value" id="packetCount">0</span>
+            </div>
           </div>
 
           <hr class="divider">
@@ -215,6 +230,21 @@
 
       <!-- Center Section: GPS Pasture Map, 6-DOF Motion Metrics, 3D IMU Chip & Digital Filters -->
       <section class="main-telemetry" id="mainTelemetrySection">
+        <!-- Center Column View Mode Switcher -->
+        <div class="center-view-tabs" id="centerViewTabs">
+          <button class="center-tab-btn active" data-view="overview" id="tabViewOverview" title="Live Cattle GPS Map & 6-DOF IMU Gauges">
+            <i class="fa-solid fa-map-location-dot"></i> <span>Live Map &amp; Gauges</span>
+          </button>
+          <button class="center-tab-btn" data-view="twin3d" id="tabViewTwin3d" title="3D IMU Digital Twin & Orientation">
+            <i class="fa-solid fa-cube"></i> <span>3D Digital Twin</span>
+          </button>
+          <button class="center-tab-btn" data-view="analytics" id="tabViewAnalytics" title="Motion Waveforms & Digital Filters">
+            <i class="fa-solid fa-chart-line"></i> <span>Motion Graph &amp; Filters</span>
+          </button>
+          <button class="center-tab-btn" data-view="all" id="tabViewAll" title="Show All Panels Stacked">
+            <i class="fa-solid fa-table-cells-large"></i> <span>All Panels</span>
+          </button>
+        </div>
         <!-- Top Metrics: Live GPS Map + IMU Motion Status -->
         <div class="metrics-grid">
           <!-- Live Cattle GPS Location Map -->
@@ -421,6 +451,7 @@
                 <span class="pill pill-attitude" id="chipFlatStatusPill"><i class="fa-solid fa-table"></i> Top Up (Flat on Desk)</span>
               </div>
               <div class="viewport-actions">
+                <button class="btn btn-sm btn-tare" id="btnQuickTare3d" title="Quick Tare / Zero Resting Level"><i class="fa-solid fa-crosshairs"></i> Tare Zero</button>
                 <button class="btn btn-sm" id="btnReset3dView" title="Reset 3D Camera View"><i class="fa-solid fa-arrows-to-dot"></i> Reset</button>
                 <button class="btn btn-sm active" id="btnToggle3dAxes" title="Toggle 3D Coordinate Axis Gizmo"><i class="fa-solid fa-crosshairs"></i> Axes</button>
                 <button class="btn btn-sm active" id="btnToggle3dGrid" title="Toggle Desk Plane Grid"><i class="fa-solid fa-border-all"></i> Grid</button>

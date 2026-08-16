@@ -471,6 +471,26 @@ let lastKnownChipTemp = null;
 let lastKnownUptimeSec = null;
 let lastKnownSats = { total: 0, used: 0 };
 let lastKnownGpsFix = 0;
+let lastMapPanTime = 0;
+let lastMapPanPos = null;
+
+// Center Column View Mode Switcher Elements
+const centerViewTabs = document.getElementById('centerViewTabs');
+const mainTelemetrySection = document.getElementById('mainTelemetrySection');
+const tabViewOverview = document.getElementById('tabViewOverview');
+const tabViewTwin3d = document.getElementById('tabViewTwin3d');
+const tabViewAnalytics = document.getElementById('tabViewAnalytics');
+const tabViewAll = document.getElementById('tabViewAll');
+
+// Ambient Replay & Heartbeat Elements
+const ambientReplayBanner = document.getElementById('ambientReplayBanner');
+const replayBannerFilename = document.getElementById('replayBannerFilename');
+const btnExitReplay = document.getElementById('btnExitReplay');
+const streamHeartbeat = document.getElementById('streamHeartbeat');
+const btnQuickTare3d = document.getElementById('btnQuickTare3d');
+
+// Decoupled Gauge Render State
+let isGaugeRenderPending = false;
 
 // GPS Labels
 const lblLat = document.getElementById('lblLat');
@@ -628,6 +648,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initChart();
   init3DImuViewer();
   setupEventListeners();
+  setupCenterViewTabs();
   setupFilterEventListeners();
   setupTareEventListeners();
   setupModelSwitcherListeners();
@@ -644,6 +665,56 @@ document.addEventListener('DOMContentLoaded', () => {
   
   logToConsole('system', 'Ranchbot Cow Tag Receiver: High-Performance Engine, Stream Issue Monitor & Zero-Hang View Switching ACTIVE.');
 });
+
+// ==========================================================================
+// Center Column View Mode Switcher & Stream Heartbeat Indicator
+// ==========================================================================
+function setupCenterViewTabs() {
+  if (!centerViewTabs || !mainTelemetrySection) return;
+  centerViewTabs.addEventListener('click', (e) => {
+    const btn = e.target.closest('.center-tab-btn');
+    if (!btn) return;
+    const view = btn.dataset.view || 'overview';
+    setCenterViewMode(view);
+  });
+
+  if (btnExitReplay) {
+    btnExitReplay.addEventListener('click', () => {
+      ejectCsvReplay();
+    });
+  }
+}
+
+function setCenterViewMode(view) {
+  if (!mainTelemetrySection) return;
+  mainTelemetrySection.setAttribute('data-view', view);
+  document.querySelectorAll('.center-tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.view === view);
+  });
+
+  if (view === 'twin3d' || view === 'all') {
+    setTimeout(on3dWindowResize, 60);
+  }
+  if (view === 'analytics' || view === 'all') {
+    if (motionChart) {
+      setTimeout(() => {
+        motionChart.resize();
+        rebuildChartFromBuffer();
+      }, 60);
+    }
+  }
+  if (view === 'overview' || view === 'all') {
+    if (map) setTimeout(() => map.invalidateSize(), 60);
+  }
+}
+
+function triggerStreamHeartbeat() {
+  if (!streamHeartbeat) return;
+  streamHeartbeat.classList.add('active-beat');
+  setTimeout(() => {
+    if (streamHeartbeat) streamHeartbeat.classList.remove('active-beat');
+  }, 120);
+}
 
 // ==========================================================================
 // Stream Feed Display Mode Controller (RAW vs DECODED vs HEX)
@@ -1004,6 +1075,13 @@ function updateBiDirectionalAxis(barEl, ballEl, val, maxScale) {
 function setupTareEventListeners() {
   if (btnTareImu) {
     btnTareImu.addEventListener('click', () => {
+      if (isTareCalibrating) return;
+      startImuTareCalibration();
+    });
+  }
+
+  if (btnQuickTare3d) {
+    btnQuickTare3d.addEventListener('click', () => {
       if (isTareCalibrating) return;
       startImuTareCalibration();
     });
@@ -1467,104 +1545,125 @@ function updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx = 0, rawGy = 0, rawG
   currentImuState.yaw = numYaw;
   currentImuState.totalG = totalG;
 
-  if (!isFullWidth) {
-    if (valAccelX) valAccelX.textContent = `${ax >= 0 ? '+' : ''}${ax.toFixed(2)} g`;
-    if (valAccelY) valAccelY.textContent = `${ay >= 0 ? '+' : ''}${ay.toFixed(2)} g`;
-    if (valAccelZ) valAccelZ.textContent = `${az >= 0 ? '+' : ''}${az.toFixed(2)} g`;
-
-    updateBiDirectionalAxis(barAccelX, ballAccelX, ax, accelFullScale);
-    updateBiDirectionalAxis(barAccelY, ballAccelY, ay, accelFullScale);
-    updateBiDirectionalAxis(barAccelZ, ballAccelZ, az, accelFullScale);
-
-    if (valGyroX) valGyroX.textContent = `${gx >= 0 ? '+' : ''}${gx.toFixed(1)} °/s`;
-    if (valGyroY) valGyroY.textContent = `${gy >= 0 ? '+' : ''}${gy.toFixed(1)} °/s`;
-    if (valGyroZ) valGyroZ.textContent = `${gz >= 0 ? '+' : ''}${gz.toFixed(1)} °/s`;
-
-    updateBiDirectionalAxis(barGyroX, ballGyroX, gx, gyroFullScale);
-    updateBiDirectionalAxis(barGyroY, ballGyroY, gy, gyroFullScale);
-    updateBiDirectionalAxis(barGyroZ, ballGyroZ, gz, gyroFullScale);
-
-    if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
-    if (valRoll) valRoll.textContent = `${numRoll >= 0 ? '+' : ''}${numRoll.toFixed(1)}°`;
-    if (valYaw) valYaw.textContent = `${numYaw.toFixed(1)}° ${getCompassHeading(numYaw)}`;
-
-    if (barPitch) {
-      const pPct = Math.min(50, (Math.abs(numPitch) / 90.0) * 50.0);
-      barPitch.style.width = `${pPct}%`;
-      barPitch.style.marginLeft = numPitch >= 0 ? '50%' : `${50 - pPct}%`;
-    }
-
-    if (barRoll) {
-      const rPct = Math.min(50, (Math.abs(numRoll) / 180.0) * 50.0);
-      barRoll.style.width = `${rPct}%`;
-      barRoll.style.marginLeft = numRoll >= 0 ? '50%' : `${50 - rPct}%`;
-    }
-
-    if (barYaw) {
-      const yPct = Math.min(100, Math.max(0, (numYaw / 360.0) * 100));
-      barYaw.style.width = `${yPct}%`;
-      barYaw.style.marginLeft = '0';
-    }
-
-    if (attitudeModeText) {
-      attitudeModeText.textContent = fusionMode === 'madgwick' ? 'Madgwick 6-DOF Fusion' : (fusionMode === 'complementary' ? 'Complementary Filter' : 'Accel Gravity');
-    }
-
-    const isFlat = Math.abs(numPitch) < 3.0 && Math.abs(numRoll) < 3.0;
-
-    if (attitudePill) {
-      if (isFlat) {
-        attitudePill.className = 'pill pill-attitude';
-        attitudePill.style.borderColor = 'rgba(56, 239, 125, 0.4)';
-        attitudePill.style.color = '#38ef7d';
-        attitudePill.textContent = 'Flat (Top Up)';
-      } else if (numPitch > 18) {
-        attitudePill.className = 'pill pill-attitude';
-        attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
-        attitudePill.style.color = '#ffb703';
-        attitudePill.textContent = `Nose Up (+${numPitch.toFixed(0)}°)`;
-      } else if (numPitch < -18) {
-        attitudePill.className = 'pill pill-attitude';
-        attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
-        attitudePill.style.color = '#ffb703';
-        attitudePill.textContent = `Nosedown (${numPitch.toFixed(0)}°)`;
-      } else if (numRoll > 20) {
-        attitudePill.className = 'pill pill-attitude';
-        attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
-        attitudePill.style.color = '#00f2fe';
-        attitudePill.textContent = `Bank Right (+${numRoll.toFixed(0)}°)`;
-      } else if (numRoll < -20) {
-        attitudePill.className = 'pill pill-attitude';
-        attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
-        attitudePill.style.color = '#00f2fe';
-        attitudePill.textContent = `Bank Left (${numRoll.toFixed(0)}°)`;
-      } else {
-        attitudePill.className = 'pill pill-attitude';
-        attitudePill.style.borderColor = 'rgba(245, 158, 11, 0.4)';
-        attitudePill.style.color = '#f59e0b';
-        attitudePill.textContent = `Tilt P:${numPitch.toFixed(0)}° R:${numRoll.toFixed(0)}°`;
-      }
-    }
-
-    if (motionPill) {
-      if (totalG > 1.8) {
-        motionPill.className = 'pill pill-danger';
-        motionPill.textContent = 'RAPID MOTION / ALARM';
-      } else if (totalG > 1.2) {
-        motionPill.className = 'pill pill-warning';
-        motionPill.textContent = 'ACTIVE MOTION';
-      } else {
-        motionPill.className = 'pill pill-info';
-        motionPill.textContent = isFlat ? 'AT REST (DESK)' : 'NORMAL REST';
-      }
-    }
-
-    if (activityStateEl && activityStr && activityStateEl.textContent !== '--') {
-      activityStateEl.textContent = activityStr;
-    }
-
-    update3DOrientation(numPitch, numRoll, numYaw, totalG, isFlat);
+  if (activityStateEl && activityStr && activityStateEl.textContent !== '--') {
+    activityStateEl.textContent = activityStr;
   }
+
+  const isFlat = Math.abs(numPitch) < 3.0 && Math.abs(numRoll) < 3.0;
+  update3DOrientation(numPitch, numRoll, numYaw, totalG, isFlat);
+  scheduleGaugeRender();
+
+  return { pitch: numPitch, roll: numRoll, yaw: numYaw, ax, ay, az, gx, gy, gz, totalG };
+}
+
+function scheduleGaugeRender() {
+  if (isGaugeRenderPending || isFullWidth || !isPageVisible) return;
+  isGaugeRenderPending = true;
+  requestAnimationFrame(() => {
+    isGaugeRenderPending = false;
+    renderGaugesFromState();
+  });
+}
+
+function renderGaugesFromState() {
+  if (isFullWidth || !isPageVisible) return;
+  const s = currentImuState;
+  const ax = s.filtAx, ay = s.filtAy, az = s.filtAz;
+  const gx = s.filtGx, gy = s.filtGy, gz = s.filtGz;
+  const numPitch = s.pitch, numRoll = s.roll, numYaw = s.yaw;
+  const totalG = s.totalG;
+
+  if (valAccelX) valAccelX.textContent = `${ax >= 0 ? '+' : ''}${ax.toFixed(2)} g`;
+  if (valAccelY) valAccelY.textContent = `${ay >= 0 ? '+' : ''}${ay.toFixed(2)} g`;
+  if (valAccelZ) valAccelZ.textContent = `${az >= 0 ? '+' : ''}${az.toFixed(2)} g`;
+
+  updateBiDirectionalAxis(barAccelX, ballAccelX, ax, accelFullScale);
+  updateBiDirectionalAxis(barAccelY, ballAccelY, ay, accelFullScale);
+  updateBiDirectionalAxis(barAccelZ, ballAccelZ, az, accelFullScale);
+
+  if (valGyroX) valGyroX.textContent = `${gx >= 0 ? '+' : ''}${gx.toFixed(1)} °/s`;
+  if (valGyroY) valGyroY.textContent = `${gy >= 0 ? '+' : ''}${gy.toFixed(1)} °/s`;
+  if (valGyroZ) valGyroZ.textContent = `${gz >= 0 ? '+' : ''}${gz.toFixed(1)} °/s`;
+
+  updateBiDirectionalAxis(barGyroX, ballGyroX, gx, gyroFullScale);
+  updateBiDirectionalAxis(barGyroY, ballGyroY, gy, gyroFullScale);
+  updateBiDirectionalAxis(barGyroZ, ballGyroZ, gz, gyroFullScale);
+
+  if (valPitch) valPitch.textContent = `${numPitch >= 0 ? '+' : ''}${numPitch.toFixed(1)}°`;
+  if (valRoll) valRoll.textContent = `${numRoll >= 0 ? '+' : ''}${numRoll.toFixed(1)}°`;
+  if (valYaw) valYaw.textContent = `${numYaw.toFixed(1)}° ${getCompassHeading(numYaw)}`;
+
+  if (barPitch) {
+    const pPct = Math.min(50, (Math.abs(numPitch) / 90.0) * 50.0);
+    barPitch.style.width = `${pPct}%`;
+    barPitch.style.marginLeft = numPitch >= 0 ? '50%' : `${50 - pPct}%`;
+  }
+
+  if (barRoll) {
+    const rPct = Math.min(50, (Math.abs(numRoll) / 180.0) * 50.0);
+    barRoll.style.width = `${rPct}%`;
+    barRoll.style.marginLeft = numRoll >= 0 ? '50%' : `${50 - rPct}%`;
+  }
+
+  if (barYaw) {
+    const yPct = Math.min(100, Math.max(0, (numYaw / 360.0) * 100));
+    barYaw.style.width = `${yPct}%`;
+    barYaw.style.marginLeft = '0';
+  }
+
+  if (attitudeModeText) {
+    attitudeModeText.textContent = fusionMode === 'madgwick' ? 'Madgwick 6-DOF Fusion' : (fusionMode === 'complementary' ? 'Complementary Filter' : 'Accel Gravity');
+  }
+
+  const isFlat = Math.abs(numPitch) < 3.0 && Math.abs(numRoll) < 3.0;
+
+  if (attitudePill) {
+    if (isFlat) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(56, 239, 125, 0.4)';
+      attitudePill.style.color = '#38ef7d';
+      attitudePill.textContent = 'Flat (Top Up)';
+    } else if (numPitch > 18) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
+      attitudePill.style.color = '#ffb703';
+      attitudePill.textContent = `Nose Up (+${numPitch.toFixed(0)}°)`;
+    } else if (numPitch < -18) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(255, 183, 3, 0.4)';
+      attitudePill.style.color = '#ffb703';
+      attitudePill.textContent = `Nosedown (${numPitch.toFixed(0)}°)`;
+    } else if (numRoll > 20) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+      attitudePill.style.color = '#00f2fe';
+      attitudePill.textContent = `Bank Right (+${numRoll.toFixed(0)}°)`;
+    } else if (numRoll < -20) {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(0, 242, 254, 0.4)';
+      attitudePill.style.color = '#00f2fe';
+      attitudePill.textContent = `Bank Left (${numRoll.toFixed(0)}°)`;
+    } else {
+      attitudePill.className = 'pill pill-attitude';
+      attitudePill.style.borderColor = 'rgba(245, 158, 11, 0.4)';
+      attitudePill.style.color = '#f59e0b';
+      attitudePill.textContent = `Tilt P:${numPitch.toFixed(0)}° R:${numRoll.toFixed(0)}°`;
+    }
+  }
+
+  if (motionPill) {
+    if (totalG > 1.8) {
+      motionPill.className = 'pill pill-danger';
+      motionPill.textContent = 'RAPID MOTION / ALARM';
+    } else if (totalG > 1.2) {
+      motionPill.className = 'pill pill-warning';
+      motionPill.textContent = 'ACTIVE MOTION';
+    } else {
+      motionPill.className = 'pill pill-info';
+      motionPill.textContent = isFlat ? 'AT REST (DESK)' : 'NORMAL REST';
+    }
+  }
+}
 
   return { pitch: numPitch, roll: numRoll, yaw: numYaw, ax, ay, az, gx, gy, gz, totalG };
 }
@@ -1872,6 +1971,10 @@ function parseAndInitCsvReplay(filename, csvText) {
   if (csvDropZone) csvDropZone.style.display = 'none';
   if (csvPlayerContainer) csvPlayerContainer.style.display = 'flex';
   if (btnEjectCsvFile) btnEjectCsvFile.style.display = 'inline-flex';
+  if (ambientReplayBanner) {
+    ambientReplayBanner.style.display = 'flex';
+    if (replayBannerFilename) replayBannerFilename.textContent = filename;
+  }
   if (replayStatusPill) {
     replayStatusPill.className = 'pill pill-success';
     replayStatusPill.textContent = 'CSV Loaded';
@@ -1940,24 +2043,43 @@ function toggleReplayPlayPause() {
   }
 }
 
-function startReplayPlayback() {
-  if (replayPlaybackTimer) clearInterval(replayPlaybackTimer);
-  const baseIntervalMs = 50;
-  const interval = Math.max(10, Math.round(baseIntervalMs / replaySpeedMultiplier));
+let replayRafId = null;
+let lastReplayTickTime = 0;
 
-  replayPlaybackTimer = setInterval(() => {
-    if (replayCurrentIndex >= replayDataRows.length - 1) {
-      toggleReplayPlayPause();
-      return;
+function startReplayPlayback() {
+  stopReplayPlayback();
+  lastReplayTickTime = performance.now();
+
+  function replayLoop(now) {
+    if (!isReplayActive || !isReplayPlaying) return;
+    const elapsed = now - lastReplayTickTime;
+    const targetInterval = 50.0 / Math.max(0.25, replaySpeedMultiplier);
+
+    if (elapsed >= targetInterval) {
+      const stepsToAdvance = Math.max(1, Math.floor(elapsed / targetInterval));
+      lastReplayTickTime = now - (elapsed % targetInterval);
+
+      if (replayCurrentIndex + stepsToAdvance >= replayDataRows.length - 1) {
+        seekReplayIndex(replayDataRows.length - 1);
+        toggleReplayPlayPause();
+        return;
+      }
+      seekReplayIndex(replayCurrentIndex + stepsToAdvance);
     }
-    seekReplayIndex(replayCurrentIndex + 1);
-  }, interval);
+    replayRafId = requestAnimationFrame(replayLoop);
+  }
+
+  replayRafId = requestAnimationFrame(replayLoop);
 }
 
 function stopReplayPlayback() {
   if (replayPlaybackTimer) {
     clearInterval(replayPlaybackTimer);
     replayPlaybackTimer = null;
+  }
+  if (replayRafId) {
+    cancelAnimationFrame(replayRafId);
+    replayRafId = null;
   }
 }
 
@@ -2037,6 +2159,7 @@ function ejectCsvReplay() {
   if (csvDropZone) csvDropZone.style.display = 'block';
   if (csvPlayerContainer) csvPlayerContainer.style.display = 'none';
   if (btnEjectCsvFile) btnEjectCsvFile.style.display = 'none';
+  if (ambientReplayBanner) ambientReplayBanner.style.display = 'none';
   if (csvFileInput) csvFileInput.value = '';
   if (replayStatusPill) {
     replayStatusPill.className = 'pill pill-secondary';
@@ -3304,13 +3427,11 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
   } else if (chunkData instanceof ArrayBuffer || ArrayBuffer.isView(chunkData)) {
     uint8Array = new Uint8Array(chunkData.buffer || chunkData, chunkData.byteOffset || 0, chunkData.byteLength);
     textChunk = new TextDecoder('utf-8', { fatal: false }).decode(uint8Array);
-  }
-
-  if (uint8Array) {
+  let rawHexStr = '';
+  if (uint8Array && (streamDisplayMode === 'hex' || isRecording)) {
     for (let i = 0; i < uint8Array.length; i++) hexBytes.push(uint8Array[i].toString(16).padStart(2, '0').toUpperCase());
+    rawHexStr = hexBytes.join(' ');
   }
-
-  const rawHexStr = hexBytes.join(' ');
 
   // Process text lines (e.g. Periodic Telemetry CSV, NMEA, or debug logs)
   if (textChunk) {
@@ -3323,6 +3444,7 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
       if (trimmed.length > 0) {
         packetCounter++;
         packetCountEl.textContent = packetCounter;
+        triggerStreamHeartbeat();
         const extracted = parseTextTelemetry(trimmed);
 
         // Stream Mode Display Routing: RAW vs DECODED vs HEX
@@ -3614,9 +3736,6 @@ function addChartData(timeLabel, ax, ay, az, gx = 0, gy = 0, gz = 0) {
 
   chartRingBuffer.push(now, timeLabel, numAx, numAy, numAz, Number(gx) || 0, Number(gy) || 0, Number(gz) || 0);
   chartNeedsUpdate = true;
-  if (!isFullWidth && isPageVisible) {
-    rebuildChartFromBuffer();
-  }
 }
 
 function startChartRenderLoop() {
@@ -3741,14 +3860,26 @@ function updateGPSPosition(lat, lng, alt = 412.0, speed = 1.2) {
   if (lblAlt) lblAlt.textContent = `${numAlt.toFixed(1)} m`;
   if (lblSpeed) lblSpeed.textContent = `${numSpeed.toFixed(1)} km/h`;
 
-  if (isFullWidth) return;
-
   const newPos = [numLat, numLng];
   if (cowMarker) cowMarker.setLatLng(newPos);
   pathHistory.push(newPos);
   if (pathHistory.length > 50) pathHistory.shift();
   if (polyline) polyline.setLatLngs(pathHistory);
-  if (map) map.panTo(newPos);
+
+  const now = Date.now();
+  if (map && (now - lastMapPanTime > 2000)) {
+    let shouldPan = true;
+    if (lastMapPanPos) {
+      const dLat = Math.abs(numLat - lastMapPanPos.lat);
+      const dLng = Math.abs(numLng - lastMapPanPos.lng);
+      if (dLat < 0.00008 && dLng < 0.00008) shouldPan = false;
+    }
+    if (shouldPan) {
+      lastMapPanTime = now;
+      lastMapPanPos = { lat: numLat, lng: numLng };
+      map.panTo(newPos);
+    }
+  }
 }
 
 // ==========================================================================
@@ -3864,25 +3995,50 @@ function downloadCsvFile(filename, records) {
     return;
   }
 
-  const csvLines = ['\uFEFF' + CSV_HEADERS.join(',')];
-  for (const r of records) csvLines.push(buildCsvRow(r));
+  const CHUNK_SIZE = 3000;
+  const chunks = ['\uFEFF' + CSV_HEADERS.join(',') + '\r\n'];
+  let idx = 0;
+  
+  if (recorderStatusText) recorderStatusText.textContent = 'EXPORTING...';
+  
+  function processChunk() {
+    const end = Math.min(records.length, idx + CHUNK_SIZE);
+    const sliceLines = [];
+    for (let i = idx; i < end; i++) {
+      sliceLines.push(buildCsvRow(records[i]));
+    }
+    chunks.push(sliceLines.join('\r\n') + (end < records.length ? '\r\n' : ''));
+    idx = end;
 
-  const blob = new Blob([csvLines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  const outName = filename || `compressed_telemetry_${Date.now()}.csv`;
-  link.style.display = 'none';
-  link.setAttribute('href', url);
-  link.setAttribute('download', outName);
-  document.body.appendChild(link);
-  link.click();
+    if (recorderStatusText) {
+      const pct = Math.round((idx / records.length) * 100);
+      recorderStatusText.textContent = `EXPORTING (${pct}%)...`;
+    }
 
-  setTimeout(() => {
-    if (link.parentNode) link.parentNode.removeChild(link);
-    URL.revokeObjectURL(url);
-  }, 1000);
+    if (idx < records.length) {
+      setTimeout(processChunk, 0); // Yield to browser event loop
+    } else {
+      const blob = new Blob(chunks, { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const outName = filename || `compressed_telemetry_${Date.now()}.csv`;
+      link.style.display = 'none';
+      link.setAttribute('href', url);
+      link.setAttribute('download', outName);
+      document.body.appendChild(link);
+      link.click();
 
-  logToConsole('system', `✓ FILE SAVED & DOWNLOADED: "${outName}" (${records.length} records).`);
+      setTimeout(() => {
+        if (link.parentNode) link.parentNode.removeChild(link);
+        URL.revokeObjectURL(url);
+      }, 1000);
+
+      if (recorderStatusText) recorderStatusText.textContent = isRecording ? 'RECORDING...' : 'REC IDLE';
+      logToConsole('system', `✓ FILE SAVED & DOWNLOADED: "${outName}" (${records.length.toLocaleString()} records).`);
+    }
+  }
+
+  processChunk();
 }
 
 function toggleRecording() {
