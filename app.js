@@ -449,6 +449,24 @@ const activityStateEl = document.getElementById('activityState');
 const packetCountEl = document.getElementById('packetCount');
 const deviceTypeBadge = document.getElementById('deviceTypeBadge');
 
+// Telemetry & Diagnostic Metrics Elements
+const uptimeValueEl = document.getElementById('uptimeValue');
+const tempValueEl = document.getElementById('tempValue');
+const stepsValueEl = document.getElementById('stepsValue');
+const stepDetectPillEl = document.getElementById('stepDetectPill');
+const satCountValueEl = document.getElementById('satCountValue');
+const uartHealthValueEl = document.getElementById('uartHealthValue');
+const lblGpsFix = document.getElementById('lblGpsFix');
+const lblGpsSats = document.getElementById('lblGpsSats');
+
+// Telemetry State
+let latestUartDiagnostics = { chars: 0, sent: 0, cksum_err: 0, frm: 0, brk: 0, ovr: 0, ring_drops: 0 };
+let lastCumulativeSteps = 0;
+let lastKnownChipTemp = null;
+let lastKnownUptimeSec = null;
+let lastKnownSats = { total: 0, used: 0 };
+let lastKnownGpsFix = 0;
+
 // GPS Labels
 const lblLat = document.getElementById('lblLat');
 const lblLng = document.getElementById('lblLng');
@@ -864,9 +882,12 @@ function renderStreamIssues() {
     el.className = `issue-item severity-${item.severity}`;
 
     let tagClass = 'tag-error';
-    if (item.category === 'warn') tagClass = 'tag-warn';
-    else if (item.category === 'sensor') tagClass = 'tag-sensor';
+    if (item.category === 'uart' || item.category === 'error') tagClass = 'tag-uart';
+    else if (item.category === 'gps') tagClass = 'tag-gps';
     else if (item.category === 'battery') tagClass = 'tag-battery';
+    else if (item.category === 'thermal') tagClass = 'tag-thermal';
+    else if (item.category === 'sensor') tagClass = 'tag-sensor';
+    else if (item.category === 'warn') tagClass = 'tag-warn';
 
     el.innerHTML = `
       <span class="issue-time">${item.timeStr}</span>
@@ -1226,7 +1247,7 @@ function update3DOrientation(pitchDeg, rollDeg, yawDeg, totalG = 1.0, isFlat = t
   if (isFullWidth) return;
 
   if (hudPitch) hudPitch.textContent = `${pitchDeg >= 0 ? '+' : ''}${pitchDeg.toFixed(1)}°`;
-  if (hudRoll) hudRoll.textContent = `${rollDeg >= 0 ? '+' : ''}${rollRoll.toFixed(1)}°`;
+  if (hudRoll) hudRoll.textContent = `${rollDeg >= 0 ? '+' : ''}${rollDeg.toFixed(1)}°`;
   if (hudYaw) hudYaw.textContent = `${yawDeg.toFixed(1)}°`;
   if (hudGravity) hudGravity.textContent = `${totalG.toFixed(2)} g (${isFlat ? 'Z+ Normal' : 'Dynamic'})`;
 
@@ -1632,9 +1653,95 @@ function parseAndInitCsvReplay(filename, csvText) {
   }
 
   const rows = [];
-  for (let i = 1; i < lines.length; i++) {
+  const firstLineTokens = parseCsvLineTokens(lines[0]);
+  const isHeaderRow = isNaN(parseFloat(firstLineTokens[0])) || firstLineTokens[0].toLowerCase().includes('time') || firstLineTokens[0].toLowerCase().includes('up');
+  const startIdx = isHeaderRow ? 1 : 0;
+
+  for (let i = startIdx; i < lines.length; i++) {
     const tokens = parseCsvLineTokens(lines[i]);
-    if (tokens.length >= 8) {
+    if (tokens.length < 5) continue;
+
+    // Check if this is the 22-Field Periodic Telemetry Snapshot format (e.g. TELEM-*.csv)
+    if (tokens.length >= 20 && !isNaN(parseFloat(tokens[0])) && !isNaN(parseFloat(tokens[2]))) {
+      const up_s = parseInt(tokens[0], 10) || 0;
+      const gps_fix = parseInt(tokens[1], 10) || 0;
+      const lat_e7 = parseInt(tokens[2], 10) || 0;
+      const lon_e7 = parseInt(tokens[3], 10) || 0;
+      const sat_tot = parseInt(tokens[4], 10) || 0;
+      const sat_used = parseInt(tokens[5], 10) || 0;
+      const ax_mms2 = parseInt(tokens[6], 10) || 0;
+      const ay_mms2 = parseInt(tokens[7], 10) || 0;
+      const az_mms2 = parseInt(tokens[8], 10) || 0;
+      const gx_mdps = parseInt(tokens[9], 10) || 0;
+      const gy_mdps = parseInt(tokens[10], 10) || 0;
+      const gz_mdps = parseInt(tokens[11], 10) || 0;
+      const chars = parseInt(tokens[12], 10) || 0;
+      const sent = parseInt(tokens[13], 10) || 0;
+      const cksum_err = parseInt(tokens[14], 10) || 0;
+      const frm = parseInt(tokens[15], 10) || 0;
+      const brk = parseInt(tokens[16], 10) || 0;
+      const ovr = parseInt(tokens[17], 10) || 0;
+      const ring_drops = parseInt(tokens[18], 10) || 0;
+      const batt_pct = tokens.length >= 20 ? parseInt(tokens[19], 10) : 85;
+      const batt_mv = tokens.length >= 21 ? parseInt(tokens[20], 10) : 3850;
+      const temp_cc = tokens.length >= 22 ? parseInt(tokens[21], 10) : 2500;
+
+      const lat = lat_e7 / 1e7;
+      const lng = lon_e7 / 1e7;
+      const ax_g = ax_mms2 / 9806.65;
+      const ay_g = ay_mms2 / 9806.65;
+      const az_g = az_mms2 / 9806.65;
+      const gx_dps = gx_mdps / 1000.0;
+      const gy_dps = gy_mdps / 1000.0;
+      const gz_dps = gz_mdps / 1000.0;
+      const battV = (batt_mv / 1000.0).toFixed(2);
+      const tempC = temp_cc / 100.0;
+
+      rows.push({
+        iso: new Date(Date.now() - (lines.length - i) * 5600).toISOString(),
+        local: `${up_s}s`,
+        packet: String(i + 1),
+        source: 'TELEM_CSV',
+        tag_id: 'SD-TELEM',
+        type: 'PERIODIC_SNAPSHOT',
+        uptime: up_s,
+        fix: gps_fix,
+        sats_tot: sat_tot,
+        sats_used: sat_used,
+        lat: (!isNaN(lat) && Math.abs(lat) <= 90) ? lat : null,
+        lng: (!isNaN(lng) && Math.abs(lng) <= 180) ? lng : null,
+        ax: ax_g,
+        ay: ay_g,
+        az: az_g,
+        gx: gx_dps,
+        gy: gy_dps,
+        gz: gz_dps,
+        pitch: null,
+        roll: null,
+        yaw: null,
+        steps: 0,
+        temp: tempC,
+        batt: battV,
+        batt_pct: batt_pct,
+        uart_errs: { chars, sent, cksum_err, frm, brk, ovr, ring_drops },
+        mode: `Periodic Telemetry (${up_s}s)`
+      });
+    } else {
+      // Standard Export CSV Format
+      // Headers: Timestamp (ISO), Timestamp (Local), Packet #, Source, Cow Tag ID, Data Type, Uptime (s), Lat, Lng, Fix, Sats, Ax, Ay, Az, Gx, Gy, Gz, Pitch, Roll, Yaw, Steps, Temp, BattV, BattPct, UartErrs, Mode
+      const isNewFormat = tokens.length >= 25;
+      const latVal = parseFloat(isNewFormat ? tokens[7] : tokens[6]);
+      const lngVal = parseFloat(isNewFormat ? tokens[8] : tokens[7]);
+      const axVal = parseFloat(isNewFormat ? tokens[11] : tokens[8]) || 0;
+      const ayVal = parseFloat(isNewFormat ? tokens[12] : tokens[9]) || 0;
+      const azVal = parseFloat(isNewFormat ? tokens[13] : tokens[10]) || 1.0;
+      const gxVal = parseFloat(isNewFormat ? tokens[14] : tokens[11]) || 0;
+      const gyVal = parseFloat(isNewFormat ? tokens[15] : tokens[12]) || 0;
+      const gzVal = parseFloat(isNewFormat ? tokens[16] : tokens[13]) || 0;
+      const pitchVal = parseFloat(isNewFormat ? tokens[17] : tokens[14]);
+      const rollVal = parseFloat(isNewFormat ? tokens[18] : tokens[15]);
+      const yawVal = parseFloat(isNewFormat ? tokens[19] : tokens[16]);
+
       rows.push({
         iso: tokens[0] || '',
         local: tokens[1] || '',
@@ -1642,19 +1749,26 @@ function parseAndInitCsvReplay(filename, csvText) {
         source: tokens[3] || 'CSV_REPLAY',
         tag_id: tokens[4] || 'COW-TAG',
         type: tokens[5] || 'REPLAY',
-        lat: parseFloat(tokens[6]) || null,
-        lng: parseFloat(tokens[7]) || null,
-        ax: parseFloat(tokens[8]) || 0,
-        ay: parseFloat(tokens[9]) || 0,
-        az: parseFloat(tokens[10]) || 1.0,
-        gx: parseFloat(tokens[11]) || 0,
-        gy: parseFloat(tokens[12]) || 0,
-        gz: parseFloat(tokens[13]) || 0,
-        pitch: parseFloat(tokens[14]) || null,
-        roll: parseFloat(tokens[15]) || null,
-        yaw: parseFloat(tokens[16]) || null,
-        batt: tokens[17] || '',
-        mode: tokens[18] || 'CSV Replay'
+        uptime: isNewFormat ? (parseFloat(tokens[6]) || null) : null,
+        lat: !isNaN(latVal) ? latVal : null,
+        lng: !isNaN(lngVal) ? lngVal : null,
+        fix: isNewFormat ? (tokens[9] === '1' ? 1 : 0) : 1,
+        sats_used: 8,
+        sats_tot: 12,
+        ax: axVal,
+        ay: ayVal,
+        az: azVal,
+        gx: gxVal,
+        gy: gyVal,
+        gz: gzVal,
+        pitch: !isNaN(pitchVal) ? pitchVal : null,
+        roll: !isNaN(rollVal) ? rollVal : null,
+        yaw: !isNaN(yawVal) ? yawVal : null,
+        steps: isNewFormat ? (parseInt(tokens[20], 10) || 0) : 0,
+        temp: isNewFormat ? (parseFloat(tokens[21]) || 25.0) : 25.0,
+        batt: isNewFormat ? tokens[22] : tokens[17] || '',
+        batt_pct: isNewFormat ? parseInt(tokens[23], 10) : null,
+        mode: isNewFormat ? tokens[25] || 'CSV Replay' : tokens[18] || 'CSV Replay'
       });
     }
   }
@@ -1776,15 +1890,35 @@ function seekReplayIndex(idx) {
     'CSV Replay', row.mode
   );
 
-  if (row.lat && row.lng) {
+  if (row.lat !== null && row.lng !== null && Math.abs(row.lat) > 0.0001 && Math.abs(row.lng) > 0.0001) {
     updateGPSPosition(row.lat, row.lng, 412, 1.5);
   }
 
   if (row.batt) {
-    updateBatteryDisplay(row.batt);
+    updateBatteryDisplay(row.batt, row.batt_pct);
   }
 
-  const timeLabel = row.local ? row.local.split(',')[1] || row.local : `Row ${replayCurrentIndex}`;
+  if (row.temp !== undefined && row.temp !== null) {
+    updateTemperatureDisplay(row.temp);
+  }
+
+  if (row.steps !== undefined) {
+    updateStepDisplay(row.steps, 0);
+  }
+
+  if (row.uptime !== null && row.uptime !== undefined) {
+    updateUptimeDisplay(row.uptime);
+  }
+
+  if (row.fix !== undefined) {
+    updateGNSSDisplay(row.fix, row.sats_tot || 12, row.sats_used || 8, row.lat, row.lng);
+  }
+
+  if (row.uart_errs) {
+    updateUartHealthDisplay(row.uart_errs);
+  }
+
+  const timeLabel = row.local ? (row.local.split(',')[1] || row.local) : `Row ${replayCurrentIndex}`;
   addChartData(timeLabel, orientation.ax, orientation.ay, orientation.az, orientation.gx, orientation.gy, orientation.gz);
 }
 
@@ -2017,6 +2151,13 @@ function updateDeviceOverview(name, id, connected) {
     batteryVoltageHistory = [];
     zeroGpsCount = 0;
     lastValidGPS = null;
+    lastCumulativeSteps = 0;
+    lastKnownChipTemp = null;
+    lastKnownUptimeSec = null;
+    lastKnownGpsFix = 0;
+    lastKnownSats = { total: 0, used: 0 };
+    latestUartDiagnostics = { chars: 0, sent: 0, cksum_err: 0, frm: 0, brk: 0, ovr: 0, ring_drops: 0 };
+
     if (deviceNameEl) deviceNameEl.textContent = '--';
     if (cowTagIdEl) cowTagIdEl.textContent = '--';
     if (batteryValueEl) batteryValueEl.textContent = '-- V';
@@ -2028,6 +2169,104 @@ function updateDeviceOverview(name, id, connected) {
     if (deviceTypeBadge) {
       deviceTypeBadge.textContent = 'No Tag Connected';
       deviceTypeBadge.className = 'badge';
+    }
+    updateTemperatureDisplay(null);
+    updateStepDisplay(0, 0);
+    updateUptimeDisplay(null);
+    updateGNSSDisplay(0, 0, 0);
+    updateUartHealthDisplay({ chars: 0, sent: 0, cksum_err: 0, frm: 0, brk: 0, ovr: 0, ring_drops: 0 });
+  }
+}
+
+function updateTemperatureDisplay(tempC) {
+  if (tempC === null || tempC === undefined || isNaN(tempC)) {
+    if (tempValueEl) tempValueEl.textContent = '-- °C';
+    return;
+  }
+  const tC = Number(tempC);
+  const tF = (tC * 9.0 / 5.0) + 32.0;
+  lastKnownChipTemp = tC;
+
+  if (tempValueEl) {
+    tempValueEl.textContent = `${tC >= 0 ? '+' : ''}${tC.toFixed(1)} °C (${tF.toFixed(0)} °F)`;
+    if (tC > 50.0) {
+      tempValueEl.className = 'valueHighlight temp-pill hot';
+    } else if (tC < 5.0) {
+      tempValueEl.className = 'valueHighlight temp-pill cold';
+    } else {
+      tempValueEl.className = 'valueHighlight temp-pill';
+    }
+  }
+}
+
+function updateStepDisplay(totalSteps, stepDetected = 0) {
+  if (totalSteps !== undefined && !isNaN(totalSteps)) {
+    lastCumulativeSteps = Number(totalSteps);
+    if (stepsValueEl) stepsValueEl.textContent = `${lastCumulativeSteps.toLocaleString()} steps`;
+  }
+  if (stepDetectPillEl) {
+    if (stepDetected === 1 || stepDetected === true) {
+      stepDetectPillEl.className = 'pill pill-active-step pill-sm';
+      stepDetectPillEl.textContent = 'STEP DETECTED';
+      setTimeout(() => {
+        if (stepDetectPillEl) {
+          stepDetectPillEl.className = 'pill pill-secondary pill-sm';
+          stepDetectPillEl.textContent = 'Active';
+        }
+      }, 1000);
+    } else if (stepDetectPillEl.textContent !== 'STEP DETECTED') {
+      stepDetectPillEl.className = 'pill pill-secondary pill-sm';
+      stepDetectPillEl.textContent = lastCumulativeSteps > 0 ? 'Active' : 'No Step';
+    }
+  }
+}
+
+function updateUptimeDisplay(uptimeSeconds) {
+  if (uptimeSeconds === null || uptimeSeconds === undefined || isNaN(uptimeSeconds)) {
+    if (uptimeValueEl) uptimeValueEl.textContent = '--:--:--';
+    return;
+  }
+  const s = Math.max(0, parseInt(uptimeSeconds, 10));
+  lastKnownUptimeSec = s;
+  const hrs = String(Math.floor(s / 3600)).padStart(2, '0');
+  const mins = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const secs = String(s % 60).padStart(2, '0');
+  if (uptimeValueEl) uptimeValueEl.textContent = `${hrs}:${mins}:${secs} (${s}s)`;
+}
+
+function updateGNSSDisplay(fix, totalSats = 0, usedSats = 0, lat = null, lng = null) {
+  lastKnownGpsFix = fix ? 1 : 0;
+  lastKnownSats = { total: parseInt(totalSats, 10) || 0, used: parseInt(usedSats, 10) || 0 };
+
+  if (lblGpsFix) {
+    lblGpsFix.textContent = fix === 1 ? '3D Fix Locked' : 'Searching Fix...';
+    lblGpsFix.style.color = fix === 1 ? '#38ef7d' : '#ffb703';
+  }
+  if (gpsFixPill) {
+    gpsFixPill.className = fix === 1 ? 'pill pill-success' : 'pill pill-warning';
+    gpsFixPill.textContent = fix === 1 ? 'GPS Locked' : 'No GPS Fix';
+  }
+  if (lblGpsSats) {
+    lblGpsSats.textContent = `${lastKnownSats.used} / ${lastKnownSats.total}`;
+  }
+  if (satCountValueEl) {
+    satCountValueEl.textContent = `${lastKnownSats.total} visible (${lastKnownSats.used} used)`;
+  }
+}
+
+function updateUartHealthDisplay(stats) {
+  if (!stats) return;
+  latestUartDiagnostics = { ...latestUartDiagnostics, ...stats };
+  const { frm = 0, brk = 0, ovr = 0, ring_drops = 0, cksum_err = 0 } = latestUartDiagnostics;
+  const totalErrs = frm + brk + ovr + ring_drops + cksum_err;
+
+  if (uartHealthValueEl) {
+    if (totalErrs === 0) {
+      uartHealthValueEl.textContent = 'Nominal (0 Err)';
+      uartHealthValueEl.style.color = '#38ef7d';
+    } else {
+      uartHealthValueEl.textContent = `${totalErrs} Errs (${frm}F/${ovr}O/${ring_drops}D/${cksum_err}C)`;
+      uartHealthValueEl.style.color = '#ff4d6d';
     }
   }
 }
@@ -2432,7 +2671,8 @@ async function disconnectSerialPort() {
 }
 
 // ==========================================================================
-// Packet Decoders: Binary 20-Byte Frame & Text Telemetry
+// ==========================================================================
+// Packet Decoders: Binary 29-Byte Frame (0xAA) & Periodic CSV Telemetry
 // ==========================================================================
 function decodeAndProcessPacket(dataView, source = 'BLE') {
   packetCounter++;
@@ -2444,55 +2684,84 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
 
   let parsed = {};
 
-  if (dataView.byteLength >= 16) {
+  if (dataView.byteLength >= 29) {
     const header = dataView.getUint8(0);
-    if (header !== 0xCB) {
-      recordStreamIssue('error', 'error', `Invalid Sync Header: 0x${header.toString(16).toUpperCase()} (Expected 0xCB)`, rawHexStr);
+    if (header !== 0xAA) {
+      recordStreamIssue('uart', 'error', `Invalid Sync Header: 0x${header.toString(16).toUpperCase()} (Expected 0xAA)`, rawHexStr);
     }
 
-    const tagIdNum = dataView.getUint16(1, true);
-    const latMicro = dataView.getInt32(3, true);
-    const lngMicro = dataView.getInt32(7, true);
-    
-    const lat = latMicro / 1e7;
-    const lng = lngMicro / 1e7;
+    const sampleIdx = dataView.getUint8(1); // 0 .. 31 sample index within FIFO batch
+    const timestampMs = dataView.getUint32(2, true); // System uptime timestamp in ms
 
-    const rawAxInt = dataView.getInt16(11, true);
-    const rawAyInt = dataView.getInt16(13, true);
-    const rawAzInt = dataView.byteLength >= 17 ? dataView.getInt16(15, true) : Math.round(accelLsbPerG);
+    // Raw 16-bit Accelerometer (X, Y, Z) in LSB
+    const rawAxInt = dataView.getInt16(6, true);
+    const rawAyInt = dataView.getInt16(8, true);
+    const rawAzInt = dataView.getInt16(10, true);
 
+    // Raw 16-bit Gyroscope (X, Y, Z) in LSB
+    const rawGxInt = dataView.getInt16(12, true);
+    const rawGyInt = dataView.getInt16(14, true);
+    const rawGzInt = dataView.getInt16(16, true);
+
+    // Euler angles in centi-degrees (deg * 100)
+    const pitchCd = dataView.getInt16(18, true);
+    const rollCd = dataView.getInt16(20, true);
+    const yawCd = dataView.getInt16(22, true);
+
+    // Pedometer step detection & total cumulative steps
+    const stepDetected = dataView.getUint8(24); // 0 or 1
+    const totalSteps = dataView.getUint16(25, true); // Steps cumulative
+
+    // IMU chip silicon temperature in centi-degrees C
+    const tempCd = dataView.getInt16(27, true);
+
+    // Convert engineering units
     const rawAx = (rawAxInt / accelLsbPerG).toFixed(3);
     const rawAy = (rawAyInt / accelLsbPerG).toFixed(3);
     const rawAz = (rawAzInt / accelLsbPerG).toFixed(3);
 
-    const rawGx = (((rawAxInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
-    const rawGy = (((rawAyInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
-    const rawGz = (((rawAzInt * 7) % 32768) / gyroLsbPerDps).toFixed(1);
+    const rawGx = (rawGxInt / gyroLsbPerDps).toFixed(1);
+    const rawGy = (rawGyInt / gyroLsbPerDps).toFixed(1);
+    const rawGz = (rawGzInt / gyroLsbPerDps).toFixed(1);
 
-    const battMv = dataView.byteLength >= 19 ? dataView.getUint16(17, true) : 3850;
-    const battVolts = (battMv / 1000.0).toFixed(2);
-    const battPct = Math.round(Math.min(100, Math.max(0, ((parseFloat(battVolts) - 3.3) / 0.9) * 100)));
-    const actByte = dataView.byteLength >= 20 ? dataView.getUint8(19) : 1;
+    const pitchDeg = (pitchCd / 100.0).toFixed(2);
+    const rollDeg = (rollCd / 100.0).toFixed(2);
+    const yawDeg = (((yawCd / 100.0) % 360 + 360) % 360).toFixed(2);
 
-    const activities = ['Resting / Lying', 'Grazing Pasture', 'Walking / Moving', 'High Alert / Running'];
-    const actStr = activities[actByte % 4] || 'Grazing';
+    const tempC = tempCd / 100.0;
+    const tempF = (tempC * 9.0 / 5.0) + 32.0;
 
-    const orientation = updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz, null, null, null, 'BLE Tag Frame', actStr);
-    updateBatteryDisplay(battVolts, battPct);
+    // Update real-time UI gauges & states
+    updateTemperatureDisplay(tempC);
+    updateStepDisplay(totalSteps, stepDetected);
+    updateUptimeDisplay(Math.floor(timestampMs / 1000));
+
+    const actStr = stepDetected === 1 ? 'Pedometer Step' : (Math.abs(parseFloat(rawAx)) + Math.abs(parseFloat(rawAy)) > 0.35 ? 'Active Motion' : 'Stationary FIFO');
+    const orientation = updateIMUAndOrientation(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz, pitchDeg, rollDeg, yawDeg, '29-Byte Frame (0xAA)', actStr);
+
+    // Alarms & Safety Thresholds
+    if (tempC > 55.0) {
+      recordStreamIssue('thermal', 'error', `High IMU Chip Temperature Alarm: ${tempC.toFixed(1)}°C exceeds 55°C threshold`, rawHexStr);
+    } else if (tempC < 0.0) {
+      recordStreamIssue('thermal', 'warn', `Sub-Zero Temperature Alert: ${tempC.toFixed(1)}°C is freezing`, rawHexStr);
+    }
+
+    if (orientation.totalG > 2.5) {
+      recordStreamIssue('sensor', 'alert', `High Impact Shock: ${orientation.totalG.toFixed(2)}g detected on sample #${sampleIdx}`, `AX:${rawAx} AY:${rawAy} AZ:${rawAz}`);
+    }
 
     parsed = {
-      'Sync Header': `0x${header.toString(16).toUpperCase()}`,
-      'Ear Tag ID': `COW-${tagIdNum}`,
-      'GPS Lat': `${lat.toFixed(6)}°`,
-      'GPS Lng': `${lng.toFixed(6)}°`,
-      'Accel X/Y/Z': `${orientation.ax.toFixed(2)}g, ${orientation.ay.toFixed(2)}g, ${orientation.az.toFixed(2)}g`,
-      'Gyro X/Y/Z': `${orientation.gx.toFixed(1)}°, ${orientation.gy.toFixed(1)}°, ${orientation.gz.toFixed(1)}°`,
-      'Orientation': `P:${orientation.pitch.toFixed(1)}° R:${orientation.roll.toFixed(1)}° Y:${orientation.yaw.toFixed(1)}°`,
-      'Tag Battery': `${battVolts} V (${battPct}%)`,
-      'Activity Mode': actStr
+      'Magic Marker': `0x${header.toString(16).toUpperCase()}`,
+      'FIFO Sample Index': `#${sampleIdx} / 31 (Batch)`,
+      'Uptime Timestamp': `${timestampMs} ms (${(timestampMs / 1000).toFixed(1)}s)`,
+      'Raw Accel X/Y/Z': `${rawAxInt}, ${rawAyInt}, ${rawAzInt} LSB (${orientation.ax.toFixed(2)}g, ${orientation.ay.toFixed(2)}g, ${orientation.az.toFixed(2)}g)`,
+      'Raw Gyro X/Y/Z': `${rawGxInt}, ${rawGyInt}, ${rawGzInt} LSB (${orientation.gx.toFixed(1)}°/s, ${orientation.gy.toFixed(1)}°/s, ${orientation.gz.toFixed(1)}°/s)`,
+      'Euler Attitude': `Pitch: ${pitchDeg}°, Roll: ${rollDeg}°, Yaw: ${yawDeg}°`,
+      'Step Detector': stepDetected === 1 ? 'STEP DETECTED (1)' : 'None (0)',
+      'Cumulative Steps': `${totalSteps.toLocaleString()} steps`,
+      'IMU Temperature': `${tempC.toFixed(2)} °C (${tempF.toFixed(1)} °F)`
     };
 
-    updateGPSPosition(lat, lng, 412, actByte === 2 ? 3.5 : 1.2);
     const timeStr = new Date().toLocaleTimeString();
     addChartData(timeStr, orientation.ax, orientation.ay, orientation.az, orientation.gx, orientation.gy, orientation.gz);
 
@@ -2502,29 +2771,35 @@ function decodeAndProcessPacket(dataView, source = 'BLE') {
         timestamp_local: new Date().toLocaleString(),
         packet_number: packetCounter,
         source: source,
-        tag_id: `COW-${tagIdNum}`,
-        data_type: 'BINARY_TAG_PACKET',
-        lat: lat.toFixed(6),
-        lng: lng.toFixed(6),
+        tag_id: cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'COMPRESSED-TAG',
+        data_type: 'BINARY_29B_FRAME',
+        uptime_s: (timestampMs / 1000).toFixed(3),
+        lat: lastValidGPS ? lastValidGPS.lat.toFixed(6) : '',
+        lng: lastValidGPS ? lastValidGPS.lng.toFixed(6) : '',
+        gps_fix: lastKnownGpsFix ? '1' : '0',
+        sats: `${lastKnownSats.used}/${lastKnownSats.total}`,
         accel_x: orientation.ax.toFixed(2),
         accel_y: orientation.ay.toFixed(2),
         accel_z: orientation.az.toFixed(2),
         gyro_x: orientation.gx.toFixed(1),
         gyro_y: orientation.gy.toFixed(1),
         gyro_z: orientation.gz.toFixed(1),
-        pitch: orientation.pitch.toFixed(1),
-        roll: orientation.roll.toFixed(1),
-        yaw: orientation.yaw.toFixed(1),
-        battery_v: battVolts,
-        battery_pct: String(battPct),
+        pitch: pitchDeg,
+        roll: rollDeg,
+        yaw: yawDeg,
+        steps: String(totalSteps),
+        temp_c: tempC.toFixed(2),
+        battery_v: batteryValueEl.textContent.replace(' V', '').replace('--', ''),
+        battery_pct: batteryPillEl.textContent.replace('%', '').replace('--', ''),
+        uart_errs: String(latestUartDiagnostics.frm + latestUartDiagnostics.ovr + latestUartDiagnostics.brk + latestUartDiagnostics.ring_drops + latestUartDiagnostics.cksum_err),
         activity_mode: actStr,
-        payload_text: '',
+        payload_text: `idx=${sampleIdx}, t=${timestampMs}ms, steps=${totalSteps}, temp=${tempC.toFixed(2)}C`,
         raw_hex: rawHexStr
       });
     }
   } else {
-    recordStreamIssue('error', 'error', `Truncated Packet: ${dataView.byteLength} bytes (Expected >= 16 bytes)`, rawHexStr);
-    parsed = { 'Raw Hex': rawHexStr, 'Length': `${dataView.byteLength} Bytes` };
+    recordStreamIssue('uart', 'error', `Truncated Binary Packet: ${dataView.byteLength} bytes (Expected >= 29 bytes)`, rawHexStr);
+    parsed = { 'Raw Hex': rawHexStr, 'Length': `${dataView.byteLength} Bytes (Truncated)` };
   }
 
   renderParsedFields(parsed);
@@ -2546,9 +2821,9 @@ function parseTextTelemetry(line) {
 
   // Detect Error & Warning Indicators in Stream Text
   if (/<err>|\[ERR\]|\bERROR\b|\bFAIL\b|\bCRC_ERR\b|\bBAD_FRAME\b|\bTIMEOUT\b|\bCHECKSUM\b/i.test(cleanLine)) {
-    recordStreamIssue('error', 'error', `Stream Error: ${cleanLine}`, cleanLine);
+    recordStreamIssue('uart', 'error', `Stream Error: ${cleanLine}`, cleanLine);
   } else if (/<wrn>|\[WARN\]|\bWARNING\b|\bDROPPED\b|\bSTALE\b/i.test(cleanLine)) {
-    recordStreamIssue('warn', 'warn', `Stream Warning: ${cleanLine}`, cleanLine);
+    recordStreamIssue('uart', 'warn', `Stream Warning: ${cleanLine}`, cleanLine);
   }
 
   cleanLine = cleanLine.replace(/^\[\d{1,2}:\d{2}:\d{2}(?:\s*[AP]M)?\]\s*/i, '');
@@ -2556,6 +2831,136 @@ function parseTextTelemetry(line) {
   cleanLine = cleanLine.replace(/^\[\d{2}:\d{2}:\d{2}\.\d{3},\d{3}\]\s*<(?:inf|wrn|err|dbg)>\s*cowtag_\w+:\s*/i, '');
   cleanLine = cleanLine.trim();
 
+  // Check for 22-Field Periodic Telemetry Snapshot CSV Row
+  // Format: <up_s>,<gps_fix>,<lat_e7>,<lon_e7>,<sat_tot>,<sat_used>,<ax_mms2>,<ay_mms2>,<az_mms2>,<gx_mdps>,<gy_mdps>,<gz_mdps>,<chars>,<sent>,<cksum_err>,<frm>,<brk>,<ovr>,<ring_drops>,<batt_pct>,<batt_mv>,<temp_cc>
+  const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
+  const nums = tokens.map(t => parseFloat(t));
+
+  if (tokens.length >= 20 && !isNaN(nums[0]) && !isNaN(nums[2]) && !isNaN(nums[3])) {
+    const up_s = parseInt(tokens[0], 10) || 0;
+    const gps_fix = parseInt(tokens[1], 10) || 0;
+    const lat_e7 = parseInt(tokens[2], 10) || 0;
+    const lon_e7 = parseInt(tokens[3], 10) || 0;
+    const sat_tot = parseInt(tokens[4], 10) || 0;
+    const sat_used = parseInt(tokens[5], 10) || 0;
+    const ax_mms2 = parseInt(tokens[6], 10) || 0;
+    const ay_mms2 = parseInt(tokens[7], 10) || 0;
+    const az_mms2 = parseInt(tokens[8], 10) || 0;
+    const gx_mdps = parseInt(tokens[9], 10) || 0;
+    const gy_mdps = parseInt(tokens[10], 10) || 0;
+    const gz_mdps = parseInt(tokens[11], 10) || 0;
+    const chars = parseInt(tokens[12], 10) || 0;
+    const sent = parseInt(tokens[13], 10) || 0;
+    const cksum_err = parseInt(tokens[14], 10) || 0;
+    const frm = parseInt(tokens[15], 10) || 0;
+    const brk = parseInt(tokens[16], 10) || 0;
+    const ovr = parseInt(tokens[17], 10) || 0;
+    const ring_drops = parseInt(tokens[18], 10) || 0;
+    const batt_pct = tokens.length >= 20 ? parseInt(tokens[19], 10) : 0;
+    const batt_mv = tokens.length >= 21 ? parseInt(tokens[20], 10) : 3850;
+    const temp_cc = tokens.length >= 22 ? parseInt(tokens[21], 10) : 2500;
+
+    const lat = lat_e7 / 1e7;
+    const lon = lon_e7 / 1e7;
+    const battV = (batt_mv / 1000.0).toFixed(2);
+    const tempC = temp_cc / 100.0;
+    const tempF = (tempC * 9.0 / 5.0) + 32.0;
+
+    const ax_g = (ax_mms2 / 9806.65).toFixed(3);
+    const ay_g = (ay_mms2 / 9806.65).toFixed(3);
+    const az_g = (az_mms2 / 9806.65).toFixed(3);
+    const gx_dps = (gx_mdps / 1000.0).toFixed(1);
+    const gy_dps = (gy_mdps / 1000.0).toFixed(1);
+    const gz_dps = (gz_mdps / 1000.0).toFixed(1);
+
+    // ========================================================================
+    // Real-Time Alarms Matching Inbound UART Transmission Metrics
+    // ========================================================================
+    if (frm > 0 && frm !== latestUartDiagnostics.frm) {
+      recordStreamIssue('uart', 'error', `UART Framing Errors: ${frm} signal integrity / baud rate mismatch errors`, cleanLine);
+    }
+    if (ovr > 0 && ovr !== latestUartDiagnostics.ovr) {
+      recordStreamIssue('uart', 'error', `UART Hardware Overrun: ${ovr} bytes lost in hardware RX FIFO overflow`, cleanLine);
+    }
+    if (brk > 0 && brk !== latestUartDiagnostics.brk) {
+      recordStreamIssue('uart', 'warn', `UART Line Break Detected: ${brk} serial break conditions on RX line`, cleanLine);
+    }
+    if (ring_drops > 0 && ring_drops !== latestUartDiagnostics.ring_drops) {
+      recordStreamIssue('uart', 'error', `Software Ring Buffer Drops: ${ring_drops} bytes dropped by full software buffer`, cleanLine);
+    }
+    if (cksum_err > 0 && cksum_err !== latestUartDiagnostics.cksum_err) {
+      recordStreamIssue('uart', 'warn', `GNSS Checksum Corruption: ${cksum_err} corrupted NMEA sentences dropped`, cleanLine);
+    }
+
+    if (gps_fix === 0) {
+      recordStreamIssue('gps', 'warn', `GNSS Fix Lost: Searching for satellites (${sat_tot} visible, 0 used)`, cleanLine);
+    } else if (sat_used < 4) {
+      recordStreamIssue('gps', 'warn', `Low Satellite Constellation: Only ${sat_used} active satellites in fix`, cleanLine);
+    }
+
+    if (batt_pct <= 20 || batt_mv < 3500) {
+      recordStreamIssue('battery', batt_pct <= 10 || batt_mv < 3400 ? 'error' : 'warn', `Low Battery Alert: ${batt_pct}% (${battV}V / ${batt_mv}mV)`, cleanLine);
+    }
+
+    if (tempC > 55.0) {
+      recordStreamIssue('thermal', 'error', `Board Overheating Alarm: ${tempC.toFixed(2)}°C exceeds threshold`, cleanLine);
+    } else if (tempC < 0.0) {
+      recordStreamIssue('thermal', 'warn', `Board Freezing Alert: ${tempC.toFixed(2)}°C is sub-zero`, cleanLine);
+    }
+
+    const peakShockMms2 = Math.sqrt(ax_mms2 * ax_mms2 + ay_mms2 * ay_mms2 + az_mms2 * az_mms2);
+    if (peakShockMms2 > 24525) { // > 2.5g
+      recordStreamIssue('sensor', 'alert', `Peak Acceleration Shock: ${(peakShockMms2 / 1000).toFixed(1)} m/s² peak g-force`, cleanLine);
+    }
+
+    const peakGyroMdps = Math.max(Math.abs(gx_mdps), Math.abs(gy_mdps), Math.abs(gz_mdps));
+    if (peakGyroMdps > 100000) { // > 100 deg/s
+      recordStreamIssue('sensor', 'warn', `Peak Gyro Thrashing Alert: ${(peakGyroMdps / 1000).toFixed(0)} °/s angular velocity`, cleanLine);
+    }
+
+    // Update UI Status Displays
+    updateUptimeDisplay(up_s);
+    updateGNSSDisplay(gps_fix, sat_tot, sat_used, lat, lon);
+    updateBatteryDisplay(battV, batt_pct);
+    updateTemperatureDisplay(tempC);
+    updateUartHealthDisplay({ chars, sent, cksum_err, frm, brk, ovr, ring_drops });
+
+    if (gps_fix === 1 && !isNaN(lat) && !isNaN(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && (Math.abs(lat) > 0.00001 || Math.abs(lon) > 0.00001)) {
+      res.lat = lat.toFixed(6);
+      res.lng = lon.toFixed(6);
+      updateGPSPosition(lat, lon, 412.0, 1.2);
+    }
+
+    res.accel_x = ax_g;
+    res.accel_y = ay_g;
+    res.accel_z = az_g;
+    res.gyro_x = gx_dps;
+    res.gyro_y = gy_dps;
+    res.gyro_z = gz_dps;
+    res.battery_v = battV;
+    res.battery_pct = String(batt_pct);
+    res.activity_mode = `Periodic Telemetry (${up_s}s)`;
+
+    // Push peak motion to chart
+    const timeStr = new Date().toLocaleTimeString();
+    addChartData(timeStr, res.accel_x, res.accel_y, res.accel_z, res.gyro_x, res.gyro_y, res.gyro_z);
+
+    renderParsedFields({
+      'Snapshot Cadence': `Periodic (~5.6s) • Uptime: ${up_s}s`,
+      'GNSS Position Fix': gps_fix === 1 ? `Valid Fix (${sat_used}/${sat_tot} Sats)` : `Searching (${sat_tot} Visible)`,
+      'Coordinates': `${lat.toFixed(6)}°, ${lon.toFixed(6)}°`,
+      'Peak Accel (5.6s)': `X: ${ax_mms2} Y: ${ay_mms2} Z: ${az_mms2} mm/s² (${ax_g}g, ${ay_g}g, ${az_g}g)`,
+      'Peak Gyro (5.6s)': `X: ${gx_mdps} Y: ${gy_mdps} Z: ${gz_mdps} mdps (${gx_dps}°/s, ${gy_dps}°/s, ${gz_dps}°/s)`,
+      'GPS UART Traffic': `${chars.toLocaleString()} B (${sent} Valid NMEA, ${cksum_err} Checksum Errs)`,
+      'UART Driver Errors': `Framing: ${frm} | Overrun: ${ovr} | Break: ${brk} | Ring Drops: ${ring_drops}`,
+      'Battery Status': `${batt_pct}% (${battV} V / ${batt_mv} mV)`,
+      'Board Temperature': `${tempC.toFixed(2)} °C (${tempF.toFixed(1)} °F)`
+    });
+
+    return res;
+  }
+
+  // Fallback legacy parsers ($IMU, $RPY, $GPS, etc.)
   const battLogMatch = cleanLine.match(/BATTERY\s*:\s*(\d+)\s*%\s*(?:\(\s*(\d+)\s*mV\s*\))?/i);
   if (battLogMatch) {
     const pct = parseInt(battLogMatch[1], 10);
@@ -2589,7 +2994,6 @@ function parseTextTelemetry(line) {
         res.gyro_z = (parseFloat(parts[6]) / gyroLsbPerDps).toFixed(1);
       }
 
-      // Parse battery voltage from $IMU line if present (e.g. parts[14] = 38.94 or 3.89)
       if (parts.length >= 15 && parts[14] !== undefined && parts[14].trim() !== '') {
         const rawB = parseFloat(parts[14]);
         if (!isNaN(rawB) && rawB > 0) {
@@ -2626,73 +3030,9 @@ function parseTextTelemetry(line) {
         updateGPSPosition(lat, lng, alt, speed);
       }
     }
-  } else {
-    const tokens = cleanLine.split(/[,\t|]+/).map(t => t.trim()).filter(t => t.length > 0);
-    const nums = tokens.map(t => parseFloat(t));
-
-  if (tokens.length >= 15 && !isNaN(nums[0]) && !isNaN(nums[2]) && !isNaN(nums[3])) {
-      res.tag_id = `COW-${nums[0]}`;
-      res.is_status_packet = true;
-
-      // Extract GPS Lat & Lng
-      const rawLat = nums[2];
-      const rawLng = nums[3];
-      const lat = Math.abs(rawLat) > 1000000 ? rawLat / 1e7 : rawLat;
-      const lng = Math.abs(rawLng) > 1000000 ? rawLng / 1e7 : rawLng;
-
-      if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
-        res.lat = lat.toFixed(6);
-        res.lng = lng.toFixed(6);
-        const alt = !isNaN(nums[4]) ? nums[4] : 412.0;
-        const speed = !isNaN(nums[5]) ? nums[5] : 1.2;
-        updateGPSPosition(lat, lng, alt, speed);
-      }
-
-      // Extract 6-DOF IMU sensor counts for Motion Chart (tokens 6-8: Accel LSB, tokens 9-11: Gyro LSB)
-      if (tokens.length >= 12 && !isNaN(nums[6]) && !isNaN(nums[7]) && !isNaN(nums[8])) {
-        const scale = Math.abs(nums[8]) > 50 ? accelLsbPerG : 1.0;
-        const gScale = (!isNaN(nums[9]) && Math.abs(nums[9]) > 200) ? gyroLsbPerDps : 1.0;
-        res.accel_x = (nums[6] / scale).toFixed(3);
-        res.accel_y = (nums[7] / scale).toFixed(3);
-        res.accel_z = (nums[8] / scale).toFixed(3);
-        if (!isNaN(nums[9]) && !isNaN(nums[10]) && !isNaN(nums[11])) {
-          res.gyro_x = (nums[9] / gScale).toFixed(1);
-          res.gyro_y = (nums[10] / gScale).toFixed(1);
-          res.gyro_z = (nums[11] / gScale).toFixed(1);
-        }
-        res.activity_mode = 'Tag Status Packet';
-        
-        // Push motion data directly to Amplitude vs Time Motion Chart without touching 3D AHRS orientation
-        const timeStr = new Date().toLocaleTimeString();
-        addChartData(timeStr, res.accel_x, res.accel_y, res.accel_z, res.gyro_x, res.gyro_y, res.gyro_z);
-      }
-
-      // Extract Battery % and mV (tokens 19 and 20 if present)
-      if (tokens.length >= 20 && !isNaN(nums[19])) {
-        const pct = Math.round(nums[19]);
-        const mv = !isNaN(nums[20]) ? nums[20] : null;
-        res.battery_pct = String(pct);
-        res.battery_v = mv ? (mv / 1000.0).toFixed(2) : (3.3 + (pct / 100.0) * 0.9).toFixed(2);
-        updateBatteryDisplay(res.battery_v, pct);
-      }
-    }
-    // Case B: Standard 6-DOF IMU CSV line (6 to 12 numbers, where nums[0..1] are NOT huge GPS values > 100000)
-    else if (nums.length >= 6 && !isNaN(nums[0]) && Math.abs(nums[0]) < 100000 && Math.abs(nums[1]) < 100000) {
-      const scale = Math.abs(nums[2]) > 50 ? accelLsbPerG : 1.0;
-      const gScale = Math.abs(nums[3]) > 200 ? gyroLsbPerDps : 1.0;
-      res.accel_x = (nums[0] / scale).toFixed(3);
-      res.accel_y = (nums[1] / scale).toFixed(3);
-      res.accel_z = (nums[2] / scale).toFixed(3);
-      res.gyro_x = (nums[3] / gScale).toFixed(1);
-      res.gyro_y = (nums[4] / gScale).toFixed(1);
-      res.gyro_z = (nums[5] / gScale).toFixed(1);
-      res.activity_mode = '6-DOF Raw';
-      res.has_imu_data = true;
-    }
   }
 
-  // Only call updateIMUAndOrientation for genuine high-rate IMU streams ($IMU, $RPY, 6-DOF Raw), NOT status packets!
-  if (res.has_imu_data && !res.is_status_packet) {
+  if (res.has_imu_data) {
     const orientation = updateIMUAndOrientation(
       res.accel_x || currentImuState.filtAx,
       res.accel_y || currentImuState.filtAy,
@@ -2748,6 +3088,7 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
   const rawHexStr = hexBytes.join(' ');
   const displayFormat = streamFormatSelect ? streamFormatSelect.value : 'text';
 
+  // Process text lines (e.g. Periodic Telemetry CSV, NMEA, or debug logs)
   if (textChunk) {
     serialLineBuffer += textChunk;
     const lines = serialLineBuffer.split(/\r?\n/);
@@ -2768,9 +3109,12 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
             packet_number: packetCounter,
             source: source,
             tag_id: extracted.tag_id || (cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UART-FEED'),
-            data_type: 'UART_TEXT',
+            data_type: 'UART_PERIODIC_CSV',
+            uptime_s: String(lastKnownUptimeSec || ''),
             lat: extracted.lat || '',
             lng: extracted.lng || '',
+            gps_fix: lastKnownGpsFix ? '1' : '0',
+            sats: `${lastKnownSats.used}/${lastKnownSats.total}`,
             accel_x: extracted.accel_x || '',
             accel_y: extracted.accel_y || '',
             accel_z: extracted.accel_z || '',
@@ -2780,9 +3124,12 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
             pitch: extracted.pitch || '',
             roll: extracted.roll || '',
             yaw: extracted.yaw || '',
+            steps: String(lastCumulativeSteps || 0),
+            temp_c: lastKnownChipTemp !== null ? lastKnownChipTemp.toFixed(2) : '',
             battery_v: extracted.battery_v || '',
             battery_pct: extracted.battery_pct || '',
-            activity_mode: extracted.activity_mode || 'UART Serial',
+            uart_errs: String(latestUartDiagnostics.frm + latestUartDiagnostics.ovr + latestUartDiagnostics.brk + latestUartDiagnostics.ring_drops + latestUartDiagnostics.cksum_err),
+            activity_mode: extracted.activity_mode || 'Periodic Telemetry',
             payload_text: trimmed,
             raw_hex: rawHexStr
           });
@@ -2791,26 +3138,28 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
     }
   }
 
+  // Process 29-Byte Binary Frames (0xAA Header Magic Byte)
   if (uint8Array && uint8Array.length > 0) {
     const newBuf = new Uint8Array(uartByteRingBuffer.length + uint8Array.length);
     newBuf.set(uartByteRingBuffer);
     newBuf.set(uint8Array, uartByteRingBuffer.length);
     uartByteRingBuffer = newBuf;
 
-    while (uartByteRingBuffer.length >= 20) {
+    while (uartByteRingBuffer.length >= 29) {
       let syncIdx = -1;
-      for (let i = 0; i <= uartByteRingBuffer.length - 20; i++) {
-        if (uartByteRingBuffer[i] === 0xCB) { syncIdx = i; break; }
+      for (let i = 0; i <= uartByteRingBuffer.length - 29; i++) {
+        if (uartByteRingBuffer[i] === 0xAA) { syncIdx = i; break; }
       }
       if (syncIdx === -1) {
-        recordStreamIssue('error', 'warn', `Missing 0xCB Sync in ${uartByteRingBuffer.length} incoming bytes`);
-        uartByteRingBuffer = uartByteRingBuffer.slice(Math.max(0, uartByteRingBuffer.length - 19));
+        // If 0xAA not found, keep trailing bytes to avoid breaking boundary sync
+        recordStreamIssue('uart', 'warn', `Missing 0xAA Sync Marker in ${uartByteRingBuffer.length} incoming bytes`);
+        uartByteRingBuffer = uartByteRingBuffer.slice(Math.max(0, uartByteRingBuffer.length - 28));
         break;
       }
-      const packetSlice = uartByteRingBuffer.slice(syncIdx, syncIdx + 20);
+      const packetSlice = uartByteRingBuffer.slice(syncIdx, syncIdx + 29);
       const packetView = new DataView(packetSlice.buffer, packetSlice.byteOffset, packetSlice.byteLength);
       decodeAndProcessPacket(packetView, source);
-      uartByteRingBuffer = uartByteRingBuffer.slice(syncIdx + 20);
+      uartByteRingBuffer = uartByteRingBuffer.slice(syncIdx + 29);
     }
   }
 }
@@ -3058,10 +3407,13 @@ function toggleAutoScroll() {
 // Telemetry Stream CSV Recorder
 // ==========================================================================
 const CSV_HEADERS = [
-  'Timestamp (ISO)', 'Timestamp (Local)', 'Packet #', 'Source', 'Cow Tag ID', 'Data Type',
-  'Latitude (°)', 'Longitude (°)', 'Accel X (g)', 'Accel Y (g)', 'Accel Z (g)',
-  'Gyro X (°/s)', 'Gyro Y (°/s)', 'Gyro Z (°/s)', 'Pitch (°)', 'Roll (°)', 'Yaw (°)',
-  'Battery (V)', 'Activity Mode', 'Payload Text', 'Raw Hex'
+  'Timestamp (ISO)', 'Timestamp (Local)', 'Packet #', 'Source', 'Cow Tag ID', 'Data Type', 'Uptime (s)',
+  'Latitude (°)', 'Longitude (°)', 'GNSS Fix', 'GNSS Sats',
+  'Accel X (g)', 'Accel Y (g)', 'Accel Z (g)',
+  'Gyro X (°/s)', 'Gyro Y (°/s)', 'Gyro Z (°/s)',
+  'Pitch (°)', 'Roll (°)', 'Yaw (°)',
+  'Pedometer Steps', 'Temp (°C)', 'Battery (V)', 'Battery (%)', 'UART Errors',
+  'Activity Mode', 'Payload Text', 'Raw Hex'
 ];
 
 function escapeCsvField(field) {
@@ -3075,10 +3427,13 @@ function buildCsvRow(p) {
     escapeCsvField(p.timestamp_local || new Date().toLocaleString()),
     p.packet_number !== undefined ? p.packet_number : '',
     escapeCsvField(p.source || 'UART'),
-    escapeCsvField(p.tag_id || 'COW-TAG'),
+    escapeCsvField(p.tag_id || 'COMPRESSED-TAG'),
     escapeCsvField(p.data_type || 'TELEMETRY'),
+    p.uptime_s !== undefined ? p.uptime_s : '',
     p.lat !== undefined ? p.lat : '',
     p.lng !== undefined ? p.lng : '',
+    escapeCsvField(p.gps_fix !== undefined ? p.gps_fix : ''),
+    escapeCsvField(p.sats || ''),
     p.accel_x !== undefined ? p.accel_x : '',
     p.accel_y !== undefined ? p.accel_y : '',
     p.accel_z !== undefined ? p.accel_z : '',
@@ -3088,7 +3443,11 @@ function buildCsvRow(p) {
     p.pitch !== undefined ? p.pitch : '',
     p.roll !== undefined ? p.roll : '',
     p.yaw !== undefined ? p.yaw : '',
+    p.steps !== undefined ? p.steps : '',
+    p.temp_c !== undefined ? p.temp_c : '',
     p.battery_v !== undefined ? p.battery_v : '',
+    p.battery_pct !== undefined ? p.battery_pct : '',
+    p.uart_errs !== undefined ? p.uart_errs : '',
     escapeCsvField(p.activity_mode || ''),
     escapeCsvField(p.payload_text || ''),
     escapeCsvField(p.raw_hex || '')
@@ -3107,7 +3466,7 @@ function downloadCsvFile(filename, records) {
   const blob = new Blob([csvLines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
-  const outName = filename || `ranchbot_telemetry_${Date.now()}.csv`;
+  const outName = filename || `compressed_telemetry_${Date.now()}.csv`;
   link.style.display = 'none';
   link.setAttribute('href', url);
   link.setAttribute('download', outName);
@@ -3176,9 +3535,12 @@ function stopRecording() {
       packet_number: ++packetCounter,
       source: 'UART',
       tag_id: extracted.tag_id || (cowTagIdEl && cowTagIdEl.textContent !== '--' ? cowTagIdEl.textContent : 'UART-FEED'),
-      data_type: 'UART_TEXT',
+      data_type: 'UART_PERIODIC_CSV',
+      uptime_s: String(lastKnownUptimeSec || ''),
       lat: extracted.lat || '',
       lng: extracted.lng || '',
+      gps_fix: lastKnownGpsFix ? '1' : '0',
+      sats: `${lastKnownSats.used}/${lastKnownSats.total}`,
       accel_x: extracted.accel_x || '',
       accel_y: extracted.accel_y || '',
       accel_z: extracted.accel_z || '',
@@ -3188,9 +3550,12 @@ function stopRecording() {
       pitch: extracted.pitch || '',
       roll: extracted.roll || '',
       yaw: extracted.yaw || '',
+      steps: String(lastCumulativeSteps || 0),
+      temp_c: lastKnownChipTemp !== null ? lastKnownChipTemp.toFixed(2) : '',
       battery_v: extracted.battery_v || '',
       battery_pct: extracted.battery_pct || '',
-      activity_mode: extracted.activity_mode || 'UART Serial',
+      uart_errs: String(latestUartDiagnostics.frm + latestUartDiagnostics.ovr + latestUartDiagnostics.brk + latestUartDiagnostics.ring_drops + latestUartDiagnostics.cksum_err),
+      activity_mode: extracted.activity_mode || 'Periodic Telemetry',
       payload_text: trimmed,
       raw_hex: ''
     });
@@ -3261,26 +3626,40 @@ function clearCsvBuffer() {
 }
 
 // ==========================================================================
-// Simulator Stream Generator (20 Hz Live Stream)
+// Simulator Stream Generator (20 Hz Live Compressed Stream & 5.6s Snapshots)
 // ==========================================================================
 function toggleSimulatorStream() {
   isSimulatorRunning = !isSimulatorRunning;
   if (isSimulatorRunning) {
     btnSimulateStream.classList.add('btn-primary');
     btnSimulateStream.innerHTML = '<i class="fa-solid fa-stop"></i> Stop Test';
-    logToConsole('system', '[SIMULATOR] High-Speed 6-DOF IMU Stream Generator STARTED (20 Hz).');
+    logToConsole('system', '[SIMULATOR] Compressed 29-Byte IMU (0xAA) & Periodic Telemetry Generator STARTED (20 Hz).');
 
     let simLat = 31.968600;
     let simLng = -99.901800;
     let count = 0;
+    let simSteps = 142;
+    let simTempC = 24.50;
+    let simChars = 45820;
+    let simSent = 890;
+    let simCksumErr = 0;
+    let simFrm = 0;
+    let simBrk = 0;
+    let simOvr = 0;
+    let simRingDrops = 0;
+    const simStartMs = Date.now();
 
     simulatorInterval = setInterval(() => {
       count++;
-      simLat += (Math.random() - 0.5) * 0.00005;
-      simLng += (Math.random() - 0.5) * 0.00005;
+      simLat += (Math.random() - 0.5) * 0.00004;
+      simLng += (Math.random() - 0.5) * 0.00004;
+      simTempC += (Math.random() - 0.49) * 0.05;
 
       const t = count * 0.08;
-      const ax = (Math.sin(t * 1.5) * 0.85).toFixed(3);
+      const isStep = count % 28 === 0;
+      if (isStep) simSteps++;
+
+      const ax = (Math.sin(t * 1.5) * 0.85 + (isStep ? 0.4 : 0.0)).toFixed(3);
       const ay = (Math.cos(t * 1.2) * 0.65).toFixed(3);
       const az = (0.98 + Math.sin(t * 0.8) * 0.25).toFixed(3);
 
@@ -3288,10 +3667,11 @@ function toggleSimulatorStream() {
       const gy = (Math.sin(t * 1.5) * 55.0).toFixed(1);
       const gz = (Math.sin(t * 0.9) * 25.0).toFixed(1);
 
-      const pitch = (Math.sin(t * 1.5) * 35.0).toFixed(2);
-      const roll = (Math.cos(t * 1.2) * 28.0).toFixed(2);
-      const yaw = ((t * 20.0) % 360).toFixed(2);
-      const battMv = Math.max(3400, Math.round(4120 - (count * 0.05)));
+      const pitch = (Math.sin(t * 1.5) * 32.0).toFixed(2);
+      const roll = (Math.cos(t * 1.2) * 24.0).toFixed(2);
+      const yaw = ((t * 18.0) % 360).toFixed(2);
+      const battMv = Math.max(3400, Math.round(3850 - (count * 0.02)));
+      const battPct = Math.round(Math.min(100, Math.max(0, ((battMv / 1000.0 - 3.3) / 0.9) * 100)));
 
       const rawAx = Math.round(parseFloat(ax) * accelLsbPerG);
       const rawAy = Math.round(parseFloat(ay) * accelLsbPerG);
@@ -3300,50 +3680,63 @@ function toggleSimulatorStream() {
       const rawGy = Math.round(parseFloat(gy) * gyroLsbPerDps);
       const rawGz = Math.round(parseFloat(gz) * gyroLsbPerDps);
 
-      const mode = count % 6;
-      if (mode === 0) {
-        const textMsg = `$IMU,${280 + count},${482000 + count * 20},${rawAx},${rawAy},${rawAz},${rawGx},${rawGy},${rawGz},${pitch},${roll},${yaw}\n`;
-        processRawUartChunk(textMsg, 'SIM_UART');
-      } else if (mode === 1) {
-        const textMsg = `$RPY,${roll},${pitch},${yaw}\n`;
-        processRawUartChunk(textMsg, 'SIM_UART');
-      } else if (mode === 2) {
-        const textMsg = `ACCEL: ${ax}, ${ay}, ${az}\nGYRO: ${gx}, ${gy}, ${gz}\n`;
-        processRawUartChunk(textMsg, 'SIM_UART');
-      } else if (mode === 3) {
-        // Simulated stream error/warning
-        if (count % 30 === 0) {
-          processRawUartChunk(`[${new Date().toLocaleTimeString()}] <err> cowtag_uart: CRC_ERR frame dropped at pkt #${count}\n`, 'SIM_UART');
-        } else if (count % 45 === 0) {
-          processRawUartChunk(`[${new Date().toLocaleTimeString()}] <wrn> cowtag_pwr: BATTERY : 18 % ( 3380 mV ) Low Threshold\n`, 'SIM_UART');
-        } else {
-          const buffer = new ArrayBuffer(20);
-          const view = new DataView(buffer);
-          view.setUint8(0, 0xCB);
-          view.setUint16(1, 8492, true);
-          view.setInt32(3, Math.round(simLat * 1e7), true);
-          view.setInt32(7, Math.round(simLng * 1e7), true);
-          view.setInt16(11, rawAx, true);
-          view.setInt16(13, rawAy, true);
-          view.setInt16(15, rawAz, true);
-          view.setUint16(17, battMv, true);
-          view.setUint8(19, 1);
-          processRawUartChunk(view, 'SIM_BLE');
+      const timestampMs = count * 50;
+      const sampleIdx = count % 32;
+
+      // Periodic Telemetry Snapshot every ~5.6s (112 samples at 20 Hz)
+      if (count % 112 === 0) {
+        const up_s = Math.floor(count * 0.05);
+        simChars += 280;
+        simSent += 6;
+
+        // Occasional simulated alarm conditions
+        let testGpsFix = 1;
+        let testSatsTot = 12;
+        let testSatsUsed = 9;
+
+        if (count === 336) {
+          simFrm += 1;
+          logToConsole('warn', '[SIMULATOR] Simulating 1x UART framing error for alarm validation.');
+        } else if (count === 560) {
+          testGpsFix = 0;
+          testSatsUsed = 0;
+          logToConsole('warn', '[SIMULATOR] Simulating GNSS Fix Drop for alarm validation.');
         }
-      } else {
-        const buffer = new ArrayBuffer(20);
-        const view = new DataView(buffer);
-        view.setUint8(0, 0xCB);
-        view.setUint16(1, 8492, true);
-        view.setInt32(3, Math.round(simLat * 1e7), true);
-        view.setInt32(7, Math.round(simLng * 1e7), true);
-        view.setInt16(11, rawAx, true);
-        view.setInt16(13, rawAy, true);
-        view.setInt16(15, rawAz, true);
-        view.setUint16(17, battMv, true);
-        view.setUint8(19, 1);
-        processRawUartChunk(view, 'SIM_BLE');
+
+        const ax_mms2 = Math.round(parseFloat(ax) * 9806.65);
+        const ay_mms2 = Math.round(parseFloat(ay) * 9806.65);
+        const az_mms2 = Math.round(parseFloat(az) * 9806.65);
+        const gx_mdps = Math.round(parseFloat(gx) * 1000);
+        const gy_mdps = Math.round(parseFloat(gy) * 1000);
+        const gz_mdps = Math.round(parseFloat(gz) * 1000);
+        const lat_e7 = Math.round(simLat * 1e7);
+        const lon_e7 = Math.round(simLng * 1e7);
+        const temp_cc = Math.round(simTempC * 100);
+
+        const periodicCsvLine = `${up_s},${testGpsFix},${lat_e7},${lon_e7},${testSatsTot},${testSatsUsed},${ax_mms2},${ay_mms2},${az_mms2},${gx_mdps},${gy_mdps},${gz_mdps},${simChars},${simSent},${simCksumErr},${simFrm},${simBrk},${simOvr},${simRingDrops},${battPct},${battMv},${temp_cc}\n`;
+        processRawUartChunk(periodicCsvLine, 'SIM_UART');
       }
+
+      // Generate 29-Byte Binary Frame (0xAA)
+      const buffer = new ArrayBuffer(29);
+      const view = new DataView(buffer);
+      view.setUint8(0, 0xAA);
+      view.setUint8(1, sampleIdx);
+      view.setUint32(2, timestampMs, true);
+      view.setInt16(6, rawAx, true);
+      view.setInt16(8, rawAy, true);
+      view.setInt16(10, rawAz, true);
+      view.setInt16(12, rawGx, true);
+      view.setInt16(14, rawGy, true);
+      view.setInt16(16, rawGz, true);
+      view.setInt16(18, Math.round(parseFloat(pitch) * 100), true);
+      view.setInt16(20, Math.round(parseFloat(roll) * 100), true);
+      view.setInt16(22, Math.round(parseFloat(yaw) * 100), true);
+      view.setUint8(24, isStep ? 1 : 0);
+      view.setUint16(25, simSteps, true);
+      view.setInt16(27, Math.round(simTempC * 100), true);
+
+      processRawUartChunk(view, 'SIM_BLE');
     }, 50);
   } else {
     clearInterval(simulatorInterval);

@@ -107,6 +107,29 @@
             <div class="battery-bar-fill" id="batteryLevelFill" style="width: 0%;"></div>
           </div>
           <div class="info-row">
+            <span class="label"><i class="fa-solid fa-stopwatch"></i> System Uptime</span>
+            <span class="value" id="uptimeValue">--:--:--</span>
+          </div>
+          <div class="info-row">
+            <span class="label"><i class="fa-solid fa-temperature-half"></i> Board / IMU Temp</span>
+            <span class="valueHighlight temp-pill" id="tempValue">-- °C</span>
+          </div>
+          <div class="info-row">
+            <span class="label"><i class="fa-solid fa-shoe-prints"></i> Pedometer Steps</span>
+            <div class="step-val-container">
+              <span class="value" id="stepsValue">0 steps</span>
+              <span class="pill pill-secondary pill-sm" id="stepDetectPill">No Step</span>
+            </div>
+          </div>
+          <div class="info-row">
+            <span class="label"><i class="fa-solid fa-satellite"></i> GNSS Satellites</span>
+            <span class="value" id="satCountValue">-- visible</span>
+          </div>
+          <div class="info-row">
+            <span class="label"><i class="fa-solid fa-microchip"></i> UART Health</span>
+            <span class="value" id="uartHealthValue">0 Errors</span>
+          </div>
+          <div class="info-row">
             <span class="label">Signal (RSSI)</span>
             <span class="value" id="rssiValue">-- dBm</span>
           </div>
@@ -137,14 +160,15 @@
             <select id="streamFormatSelect" class="form-control">
               <option value="text" selected>Raw ASCII / Text Stream</option>
               <option value="hex">Raw Hex Bytes Inspector</option>
-              <option value="decoded">Decoded Binary Payload</option>
+              <option value="decoded">Decoded Payload Fields</option>
             </select>
           </div>
           <div class="form-group">
-            <label for="decoderSelect">BLE Payload Unpacker</label>
+            <label for="decoderSelect">Telemetry Payload Decoder</label>
             <select id="decoderSelect" class="form-control">
-              <option value="cow_tag_full" selected>Ranchbot Cow Tag (GPS + IMU 6-DOF)</option>
-              <option value="imu_only">IMU Motion Only (Accel/Gyro Raw)</option>
+              <option value="binary_0xaa" selected>Compressed Binary Frame (0xAA / 29-Byte)</option>
+              <option value="periodic_csv">Periodic CSV Snapshot (22-Field / 5.6s)</option>
+              <option value="auto_detect">Auto-Detect Format</option>
               <option value="raw_hex">Raw Byte Inspector</option>
             </select>
           </div>
@@ -191,6 +215,8 @@
                 <div class="gps-coord-item"><span class="gps-label">Lng:</span> <strong id="lblLng">-99.901800</strong>°</div>
                 <div class="gps-coord-item"><span class="gps-label">Alt:</span> <strong id="lblAlt">412 m</strong></div>
                 <div class="gps-coord-item"><span class="gps-label">Speed:</span> <strong id="lblSpeed">0.0 km/h</strong></div>
+                <div class="gps-coord-item"><span class="gps-label">Fix:</span> <strong id="lblGpsFix">Active Fix</strong></div>
+                <div class="gps-coord-item"><span class="gps-label">GNSS Sats:</span> <strong id="lblGpsSats">-- / --</strong></div>
               </div>
             </div>
           </div>
@@ -638,10 +664,11 @@
               <div class="issue-controls">
                 <div class="btn-group issue-filter-group" id="issueFilterGroup">
                   <button class="btn btn-sm active" data-filter="all">All Issues</button>
-                  <button class="btn btn-sm" data-filter="error">Errors</button>
-                  <button class="btn btn-sm" data-filter="warn">Warnings</button>
-                  <button class="btn btn-sm" data-filter="sensor">Sensor Shocks</button>
+                  <button class="btn btn-sm" data-filter="uart">UART Errors</button>
+                  <button class="btn btn-sm" data-filter="gps">GPS &amp; Sats</button>
                   <button class="btn btn-sm" data-filter="battery">Battery</button>
+                  <button class="btn btn-sm" data-filter="thermal">Thermal</button>
+                  <button class="btn btn-sm" data-filter="sensor">Sensor/Shock</button>
                 </div>
                 <div class="btn-group" id="issueSortGroup">
                   <button class="btn btn-sm active" id="btnSortIssuesDesc" title="Sort Newest First"><i class="fa-solid fa-arrow-down-short-wide"></i> Newest</button>
