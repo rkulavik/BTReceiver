@@ -641,24 +641,24 @@ const dashboardGrid = document.querySelector('.dashboard-grid');
 // Application Initialization
 // ==========================================================================
 document.addEventListener('DOMContentLoaded', () => {
-  loadSavedTareBiases();
-  initStreamDisplayMode();
-  initDspWorker();
-  initMap();
-  initChart();
-  init3DImuViewer();
-  setupEventListeners();
-  setupCenterViewTabs();
-  setupFilterEventListeners();
-  setupTareEventListeners();
-  setupModelSwitcherListeners();
-  setupReplayEventListeners();
-  setupIssueEventListeners();
-  setupMobileTabs();
-  setupResponsiveHandlers();
-  setupPageVisibilityOptimization();
-  checkLastConnectedDevice();
-  startFftRenderLoop();
+  try { setupEventListeners(); } catch (e) { console.error('setupEventListeners error:', e); }
+  try { setupCenterViewTabs(); } catch (e) { console.error('setupCenterViewTabs error:', e); }
+  try { setupFilterEventListeners(); } catch (e) { console.error('setupFilterEventListeners error:', e); }
+  try { setupTareEventListeners(); } catch (e) { console.error('setupTareEventListeners error:', e); }
+  try { setupModelSwitcherListeners(); } catch (e) { console.error('setupModelSwitcherListeners error:', e); }
+  try { setupReplayEventListeners(); } catch (e) { console.error('setupReplayEventListeners error:', e); }
+  try { setupIssueEventListeners(); } catch (e) { console.error('setupIssueEventListeners error:', e); }
+  try { setupMobileTabs(); } catch (e) { console.error('setupMobileTabs error:', e); }
+  try { setupResponsiveHandlers(); } catch (e) { console.error('setupResponsiveHandlers error:', e); }
+  try { setupPageVisibilityOptimization(); } catch (e) { console.error('setupPageVisibilityOptimization error:', e); }
+  try { loadSavedTareBiases(); } catch (e) { console.error('loadSavedTareBiases error:', e); }
+  try { initStreamDisplayMode(); } catch (e) { console.error('initStreamDisplayMode error:', e); }
+  try { initDspWorker(); } catch (e) { console.error('initDspWorker error:', e); }
+  try { initMap(); } catch (e) { console.error('initMap error:', e); }
+  try { initChart(); } catch (e) { console.error('initChart error:', e); }
+  try { init3DImuViewer(); } catch (e) { console.error('init3DImuViewer error:', e); }
+  try { checkLastConnectedDevice(); } catch (e) { console.error('checkLastConnectedDevice error:', e); }
+  try { startFftRenderLoop(); } catch (e) { console.error('startFftRenderLoop error:', e); }
   
   updateDeviceOverview('--', '--', false);
   updateIMUAndOrientation(0.00, 0.00, 1.00, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 'Default Position', 'At Rest');
@@ -1663,9 +1663,6 @@ function renderGaugesFromState() {
       motionPill.textContent = isFlat ? 'AT REST (DESK)' : 'NORMAL REST';
     }
   }
-}
-
-  return { pitch: numPitch, roll: numRoll, yaw: numYaw, ax, ay, az, gx, gy, gz, totalG };
 }
 
 function applyProcessedImuData(data) {
@@ -3427,6 +3424,8 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
   } else if (chunkData instanceof ArrayBuffer || ArrayBuffer.isView(chunkData)) {
     uint8Array = new Uint8Array(chunkData.buffer || chunkData, chunkData.byteOffset || 0, chunkData.byteLength);
     textChunk = new TextDecoder('utf-8', { fatal: false }).decode(uint8Array);
+  }
+
   let rawHexStr = '';
   if (uint8Array && (streamDisplayMode === 'hex' || isRecording)) {
     for (let i = 0; i < uint8Array.length; i++) hexBytes.push(uint8Array[i].toString(16).padStart(2, '0').toUpperCase());
@@ -4426,12 +4425,14 @@ function toggleFullWidthStream() {
 function checkLastConnectedDevice() {
   const lastBleName = localStorage.getItem('ranchbot_last_ble_name');
   const lastBleId = localStorage.getItem('ranchbot_last_ble_id');
-  if (lastBleName || lastBleId) {
-    const displayName = lastBleName || 'Saved Ear Tag';
-    if (btnLastDevice && lastDeviceNameText) {
+  if (btnLastDevice && lastDeviceNameText) {
+    if (lastBleName || lastBleId) {
+      const displayName = lastBleName || 'Saved Ear Tag';
       lastDeviceNameText.textContent = `Reconnect "${displayName}"`;
-      btnLastDevice.style.display = 'inline-flex';
+    } else {
+      lastDeviceNameText.textContent = 'Reconnect Ear Tag';
     }
+    btnLastDevice.style.display = 'inline-flex';
   }
 }
 
