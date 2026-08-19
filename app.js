@@ -55,6 +55,12 @@ const MAX_STREAM_ISSUES = 250;
 let isSimulatorRunning = false;
 let simulatorInterval = null;
 let uartByteRingBuffer = new Uint8Array(0);
+// CowTag BLE characteristic UUIDs (tag firmware: feat/ble-split-telemetry-characteristic).
+// The ~5.6 s telemetry CSV line rides its OWN characteristic; the 52 Hz binary
+// IMU frame stream stays on the NUS TX characteristic. Routing on these UUIDs keeps
+// ASCII telemetry and binary IMU frames from ever being parsed on the same pipe.
+const COWTAG_TELEM_CHAR_UUID = 'e2e90002-8f4a-4c2b-9d3e-1a2b3c4d5e6f';
+const NUS_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
 // Leaflet Map State
 let map = null;
@@ -2896,7 +2902,8 @@ async function startBleAutoReconnect() {
 }
 
 function handleCharacteristicValueChanged(event) {
-  processRawUartChunk(event.target.value, 'BLE');
+  const uuid = (event.target && event.target.uuid) ? event.target.uuid.toLowerCase() : '';
+  processRawUartChunk(event.target.value, 'BLE', uuid);
 }
 
 // ==========================================================================
@@ -3395,8 +3402,15 @@ function parseTextTelemetry(line) {
   return res;
 }
 
-function processRawUartChunk(chunkData, source = 'SERIAL') {
+function processRawUartChunk(chunkData, source = 'SERIAL', charUuid = '') {
   if (isStreamPaused) return;
+
+  // Route by source characteristic so ASCII telemetry and binary IMU frames are
+  // never parsed on the same pipe. Telemetry char -> TEXT only; NUS/IMU char ->
+  // BINARY only. Serial and simulator feeds carry no UUID -> keep legacy "both".
+  const uuid = (charUuid || '').toLowerCase();
+  const allowText = uuid !== NUS_TX_CHAR_UUID;
+  const allowBinary = uuid !== COWTAG_TELEM_CHAR_UUID;
 
   let textChunk = '';
   let hexBytes = [];
@@ -3420,7 +3434,7 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
   }
 
   // Process text lines (e.g. Periodic Telemetry CSV, NMEA, or debug logs)
-  if (textChunk) {
+  if (textChunk && allowText) {
     serialLineBuffer += textChunk;
     const lines = serialLineBuffer.split(/\r?\n/);
     serialLineBuffer = lines.pop();
@@ -3489,7 +3503,7 @@ function processRawUartChunk(chunkData, source = 'SERIAL') {
   }
 
   // Process 29-Byte Binary Frames (0xAA Header Magic Byte)
-  if (uint8Array && uint8Array.length > 0) {
+  if (uint8Array && uint8Array.length > 0 && allowBinary) {
     const newBuf = new Uint8Array(uartByteRingBuffer.length + uint8Array.length);
     newBuf.set(uartByteRingBuffer);
     newBuf.set(uint8Array, uartByteRingBuffer.length);
